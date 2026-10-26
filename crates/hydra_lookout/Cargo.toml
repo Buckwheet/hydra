@@ -1,0 +1,4 @@
+[package]
+name = "hydra_lookout"
+version = "0.0.0"
+edition = "2021"

@@ -27,17 +27,24 @@
 //! * only then are the day files removed (`remove_file`) and the manifest
 //!   renamed into place (`rename`).
 //!
-//! **std-only departure**: `flate2` is not available, so the archives this
-//! crate writes are plain tar-less concatenations with the same `{name}\t{size}`
-//! manifest.  They round-trip through [`read_archive`] and are verified the
-//! same way; they are simply not compressed.  The file extension stays `.gz` so
-//! the on-disk layout matches the recovered one, and `NOTES.md` records the
-//! departure.
+//! **std-only departure** (removed in Phase 1): this used to write plain
+//! tar-less concatenations because `flate2` was not available.  The archive is
+//! now **real gzip**: every member is written as its own gzip member
+//! (`flate2::write::GzEncoder`) which is appended to `<period>.gz`, and the
+//! sidecar `<period>.manifest` still records `name<TAB>size` with the
+//! *uncompressed* size of each member in the order the members were appended.
+//! Reading goes through `flate2::read::MultiGzDecoder`, so a multi-member
+//! archive decompresses to exactly the concatenation the old writer produced;
+//! an archive that is not gzip (one written before Phase 1) is still read as a
+//! plain concatenation, which keeps old logs readable.
 
 use super::writer;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The extension every archive file carries.
@@ -171,26 +178,73 @@ pub fn manifest(archive: &Path) -> std::io::Result<BTreeMap<String, u64>> {
     Ok(out)
 }
 
+/// The two bytes every gzip stream starts with.
+pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
 /// Read one member out of an archive.
+///
+/// **ESTABLISHED** shape: the member is looked up in the manifest and its
+/// bytes are read back.  **Phase 1**: the body is gzip, so it is decompressed
+/// with `MultiGzDecoder` (one gzip member per archived day file) and sliced by
+/// the manifest's uncompressed sizes; an archive whose body is not gzip — one
+/// written before Phase 1 — is sliced from the raw bytes, which is the plain
+/// concatenation the old writer produced.
 pub fn read_archive(archive: &Path, name: &str) -> std::io::Result<Option<String>> {
     let manifest = manifest(archive)?;
     let Some(size) = manifest.get(name).copied() else {
         return Ok(None);
     };
-    let mut file = fs::File::open(archive)?;
+    let body = body_of(archive)?;
     // The members are stored back to back in manifest order.
-    let mut offset = 0u64;
+    let mut offset = 0usize;
     for (member, len) in &manifest {
         if member == name {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; *len as usize];
-            file.read_exact(&mut buf)?;
-            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            let start = offset.min(body.len());
+            let end = (start + *len as usize).min(body.len());
+            return Ok(Some(String::from_utf8_lossy(&body[start..end]).into_owned()));
         }
-        offset += *len;
+        offset += *len as usize;
     }
     let _ = size;
     Ok(None)
+}
+
+/// Is this archive's body gzip?
+pub fn is_gzip(archive: &Path) -> std::io::Result<bool> {
+    let mut head = [0u8; 2];
+    let mut file = fs::File::open(archive)?;
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head == GZIP_MAGIC),
+        // An archive shorter than the magic is empty, not corrupt.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The decompressed body of an archive, or its raw bytes when it is not gzip.
+fn body_of(archive: &Path) -> std::io::Result<Vec<u8>> {
+    if !is_gzip(archive)? {
+        return fs::read(archive);
+    }
+    let file = fs::File::open(archive)?;
+    let mut body = Vec::new();
+    MultiGzDecoder::new(file).read_to_end(&mut body)?;
+    Ok(body)
+}
+
+/// Append one member to the archive as its own gzip member.
+///
+/// **ESTABLISHED**: the original wrote through a `BufWriter`, `sync_data`-ed
+/// the file and recorded the stream position of every member; this writes
+/// through `flate2`'s `GzEncoder` instead, and the manifest records the
+/// uncompressed size so a member can be found again.
+fn append_member(file: &mut fs::File, text: &[u8]) -> std::io::Result<()> {
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    encoder.write_all(text)?;
+    // `finish` writes the gzip trailer; the inner `&mut File` is released
+    // afterwards so the caller can `sync_data` it.
+    encoder.finish()?;
+    Ok(())
 }
 
 /// Fold every day file in `dir` into archives of `how`.
@@ -211,26 +265,28 @@ pub fn sweep(dir: &Path, how: Archive) -> Result<Vec<PathBuf>, String> {
             continue;
         }
         let archive = path(dir, &period);
-        let mut body = Vec::new();
         let mut manifest = manifest(&archive).unwrap_or_default();
         let mut used = Vec::new();
-        for (_day, member) in &members {
-            let name = member
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let text = fs::read_to_string(member).map_err(|e| format!("{}: {e}", member.display()))?;
-            manifest.insert(name.clone(), text.len() as u64);
-            body.extend_from_slice(text.as_bytes());
-            used.push(member.clone());
-        }
         {
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&archive)
                 .map_err(|e| format!("{}: {e}", archive.display()))?;
-            file.write_all(&body).map_err(|e| format!("{}: {e}", archive.display()))?;
+            for (_day, member) in &members {
+                let name = member
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let text =
+                    fs::read_to_string(member).map_err(|e| format!("{}: {e}", member.display()))?;
+                // One gzip member per day file, appended to the archive; the
+                // manifest keeps the uncompressed size.
+                append_member(&mut file, text.as_bytes())
+                    .map_err(|e| format!("{}: {e}", archive.display()))?;
+                manifest.insert(name, text.len() as u64);
+                used.push(member.clone());
+            }
             file.sync_data().map_err(|e| format!("{}: {e}", archive.display()))?;
         }
         // Record the manifest, then read every member back before deleting
@@ -381,6 +437,120 @@ mod tests {
         let (live, archived) = usage(&dir);
         assert_eq!(live, 0);
         assert!(archived > 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_archive_is_real_gzip_with_one_member_per_day() {
+        let root = std::env::temp_dir().join(format!("hydra-gz-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut w = PlayerWriter::new(&root, "Aelith");
+        w.write_at("2024-04-29", "10:00", "speech", "monday").unwrap();
+        w.write_at("2024-04-30", "10:00", "speech", "tuesday").unwrap();
+        w.flush().unwrap();
+        let dir = w.directory().to_path_buf();
+        let source: usize = writer::days(&dir)
+            .iter()
+            .filter_map(|(_, p)| fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .sum();
+        let written = sweep(&dir, Archive::Week).unwrap();
+        let archive = &written[0];
+        // The body starts with the gzip magic, and decompresses back to the
+        // source bytes (a two-line day file is too small for the per-member
+        // gzip header to pay for itself, so the file itself may grow).
+        assert!(is_gzip(archive).unwrap(), "the archive is gzip");
+        let raw = fs::read(archive).unwrap();
+        assert_eq!(&raw[..2], &GZIP_MAGIC);
+        assert!(source > 0);
+        // `MultiGzDecoder` over the whole file gives the plain concatenation,
+        // in manifest (name) order.
+        let manifest = manifest(archive).unwrap();
+        let file = fs::File::open(archive).unwrap();
+        let mut body = Vec::new();
+        MultiGzDecoder::new(file).read_to_end(&mut body).unwrap();
+        let mut expected = Vec::new();
+        let mut offset = 0;
+        for (name, size) in &manifest {
+            let member = &body[offset..offset + *size as usize];
+            expected.extend_from_slice(member);
+            offset += *size as usize;
+            let text = read_archive(archive, name).unwrap().unwrap();
+            assert_eq!(text.as_bytes(), member, "{name}");
+        }
+        assert_eq!(offset, body.len(), "the manifest covers the whole body");
+        assert!(!expected.is_empty());
+        // A name that is not in the manifest is `None`, not an error.
+        assert!(read_archive(archive, "nope.log").unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plain_concatenation_written_before_phase_1_still_reads() {
+        // Backwards compatibility: an archive body that is not gzip is read as
+        // the plain concatenation the old writer produced.
+        let dir = std::env::temp_dir().join(format!("hydra-plain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let archive = path(&dir, "week-2024-04-29");
+        let first = "one\n";
+        let second = "two\n";
+        fs::write(&archive, format!("{first}{second}")).unwrap();
+        fs::write(
+            archive.with_extension("manifest"),
+            format!("a.log\t{}\nb.log\t{}\n", first.len(), second.len()),
+        )
+        .unwrap();
+        assert!(!is_gzip(&archive).unwrap());
+        assert_eq!(read_archive(&archive, "a.log").unwrap().unwrap(), first);
+        assert_eq!(read_archive(&archive, "b.log").unwrap().unwrap(), second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_archive_or_missing_member_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("hydra-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let archive = path(&dir, "month-2024-05-01");
+        fs::write(&archive, b"").unwrap();
+        assert!(!is_gzip(&archive).unwrap(), "a short file is not gzip");
+        assert!(read_archive(&archive, "x").unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_sweep_appends_to_the_same_gzip_archive() {
+        let root = std::env::temp_dir().join(format!("hydra-gz2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut w = PlayerWriter::new(&root, "Aelith");
+        w.write_at("2024-04-29", "10:00", "speech", "monday").unwrap();
+        w.write_at("2024-04-30", "10:00", "speech", "tuesday").unwrap();
+        w.flush().unwrap();
+        let dir = w.directory().to_path_buf();
+        let first = sweep(&dir, Archive::Week).unwrap();
+        assert_eq!(first.len(), 1);
+        // Two more days in the same week, swept later.
+        w.write_at("2024-05-01", "10:00", "speech", "wednesday")
+            .unwrap();
+        w.write_at("2024-05-02", "10:00", "speech", "thursday")
+            .unwrap();
+        w.flush().unwrap();
+        let second = sweep(&dir, Archive::Week).unwrap();
+        assert_eq!(second, first, "the same period is extended, not replaced");
+        assert!(is_gzip(&second[0]).unwrap());
+        let names = names(&second[0]).unwrap();
+        assert_eq!(names.len(), 4);
+        let mut seen = Vec::new();
+        for name in &names {
+            seen.push(read_archive(&second[0], name).unwrap().unwrap());
+        }
+        for word in ["monday", "tuesday", "wednesday", "thursday"] {
+            assert!(
+                seen.iter().any(|text| text.contains(word)),
+                "{word} is missing from {seen:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -6,6 +6,12 @@ Source: arm64 Mach-O `/Users/cpmbpro/Code/hydra-inspect/hydra`, symbols at
 `tokio_util`, `serde`/`serde_json`, `toml`/`toml_edit`/`toml_writer`, `regex`,
 `flate2`, `zlib_rs`, `getrandom` and `hydra_model`/`hydra_net`/`hydra_protocol`.
 
+> **Phase 1 (reconnection)**: `serde`/`serde_json`, `toml`/`toml_edit` (and
+> `toml_writer` through `toml`'s `display` feature), `regex`, `flate2` with the
+> `zlib-rs` backend, `tokio` and `tokio-util` are now the real crates at the
+> workspace pins.  See §4 for the departures that are gone and the ones that
+> stay, with the reason for each.
+
 Legend:
 
 * **ESTABLISHED** — directly visible in the disassembly, the string literals, or
@@ -104,7 +110,7 @@ module, so the reconstruction is a documented equivalent.
 | `player_log::reader` | `Pattern::{literal, regex, matches}` / `Streams::admits` | `0x101a5d9d0`…`0x101a5dc84` | full |
 | `player_log::links` | `add` / `once` / `read` / `written` / `Does::of` | `0x101a50418`…`0x101a50bc0` | partly (JSON member names UNKNOWN) |
 | `player_log::archive` | `path` / `names` / `manifest` / `archives` / `usage` / `period` / `from_word` | `0x101a64140`…`0x101a671f0` | full / partly |
-| `player_log::archive` | `sweep` | `0x101a649c4` | partly (no `flate2`) |
+| `player_log::archive` | `sweep` | `0x101a649c4` | partly (Phase 1: real gzip via `flate2`) |
 | `player_log::retention` | `doomed` / `preview` / `prune` | `0x101aa09f4` / `0x101aa1558` / `0x101aa06b8` | full |
 | `player_log::channel` | `PlayerLog::{new, with_capacity, typed, notice, close, dropped, redact}` / `LogSink::{dropped, try_recv}` | `0x101a873c8`…`0x101a87f20` | full |
 | `player_log::feed` | `Feed::{frame, command, set_rules, take_noticed, watch, write_to, close}` | `0x101a86790`…`0x101a84dec` | partly |
@@ -119,8 +125,8 @@ New modules that have no stub of their own:
 
 | module | why |
 | --- | --- |
-| `textfmt` | the JSON/TOML reader+writer that replaces `serde_json`/`toml` |
-| `pattern` | the small regex engine that replaces the `regex` crate |
+| `textfmt` | the document type the file stores share (`serde` drives the actual JSON/TOML) |
+| `pattern` | the compiled-pattern facade over `regex` (`Pattern`'s API predates the reconnection) |
 | `password` | the `HYDRA_PASSWORD_*` / `Password for account {}: ` helpers, recovered from `hydra_table::account` |
 
 ## 2. Recovered APIs
@@ -155,7 +161,7 @@ temporary file when the rename fails.
 | `links.json` | JSON | `schema` + `links` (`name`, `day`, `line`) |
 | `menu.tsv` | text | `version<TAB>verb<TAB>noun<TAB>confirmed` per line |
 | `<character>/<YYYY-MM-DD>_<character>.log` | text | `[HH:MM][stream] text` per line |
-| `<period>.gz` + `<period>.manifest` | binary + text | `name<TAB>size` manifest lines |
+| `<period>.gz` + `<period>.manifest` | gzip + text | one gzip member per day file; `name<TAB>uncompressed-size` manifest lines (Phase 1; a pre-Phase-1 archive is a plain concatenation and is still read) |
 | `rules.toml` | TOML | `[[rules]]` with `name`, `stream`, `class`, `regex`, `fighting` |
 
 Only `notes.json`, `.settings.json`, `{}_{}.log`, `{}_to_{}`, `{}.{}.partial`,
@@ -413,49 +419,122 @@ stored password into Lich's stdin without being prompted.
 
 ## 4. std-only departures
 
-| original | reconstruction | why |
+### 4.1 Phase 1 reconnection — what is real again
+
+Every crate below is the workspace pin, declared as `x = { workspace = true }`
+in this crate's `Cargo.toml`, and used through `cargo --offline`.
+
+| real crate (pin) | replaces | where | notes |
+| --- | --- | --- | --- |
+| `serde` 1.0.229 (derive) | the hand JSON shape readers | `textfmt`, `settings_store`, `player_log::links`, `stream_rules` | `Value` implements `Serialize`/`Deserialize` by hand so document key order survives (see 4.3) |
+| `serde_json` 1.0.151 | `textfmt::{parse_json, to_json}` body | all JSON file stores | pretty printer is the same two-space form; errors now carry line/column instead of a byte offset |
+| `toml` 1.1.6 | `textfmt::parse_toml`, `stream_rules::Rules::parse` | settings/stream rules | `Rules::parse` deserialises derived `RulesDoc`/`RuleDoc`; `toml_writer` 1.1.3 comes in through `toml`'s `display` feature |
+| `toml_edit` 0.25.15 | `textfmt::to_toml`, `stream_rules::Rules::to_toml` | as above | one `[[rules]]` table per rule, nested rules as inline tables |
+| `regex` 1.13.1 | `pattern::Pattern`'s hand engine | `pattern`, `stream_rules`, `player_log::reader` | `regex::escape` is the binary's own `escape` |
+| `flate2` 1.1.10 + `zlib-rs` 0.6.8 backend | plain-concatenation archives | `player_log::archive` | real gzip, one gzip member per day file; the `zlib-rs` feature makes flate2 use the same backend version the binary linked |
+| `tokio` 1.53.1 (`full`) | — | `command`, `queue`, `lich`, `supervisor` | `broadcast`, `oneshot`, `mpsc`, `time`, `#[tokio::test]` |
+| `tokio-util` 0.7.19 | `AtomicBool` `stopping` | `command::SessionHandle::{stopping, stop, stop_token}` | a real `CancellationToken` |
+
+### 4.2 Departures that remain
+
+| original | reconstruction | why it stays |
 | --- | --- | --- |
-| `tokio::sync::broadcast::Sender<Event>` | `Arc<Mutex<EventLog>>` + `Listener` cursors | no tokio; each subscriber still sees every event once, with a 1024-event backlog |
-| `tokio::sync::mpsc::{channel, oneshot}` | `std::sync::mpsc::{sync_channel, channel}` | no tokio |
-| `tokio::sync::Mutex`/`RwLock`/`watch` | `std::sync::Mutex` + `AtomicBool` | no tokio |
-| `tokio_util::sync::CancellationToken` | `AtomicBool` (`stopping`) | no `tokio_util` |
-| `tokio::time::{Instant, sleep}` | `std::time::{Instant, Duration}` | no tokio |
-| `serde_json` | `textfmt::parse_json` / `to_json` | no `serde` |
-| `toml` / `toml_edit` / `toml_writer` | `textfmt::parse_toml` / `to_toml` | no `toml` |
-| `regex` / `regex_automata` | `pattern::Pattern` (literals, `.`, classes, `\w\d\s`, `*+?`, `^$`, `|`, groups) | no `regex` |
-| `flate2` / `zlib_rs` | archives are plain concatenations with the same manifest | no `flate2` |
-| `hydra_net::eastern::{now, date, parse, format, week_start, days_from_civil, civil_from_days}` | `notes::{days_from_civil, civil_from_days}` + `writer::civil` + `archive::week_start` (UTC, `YYYY-MM-DD`) | sibling crates are stubs |
-| `hydra_net::sink::config::{log_dir, moment}` | `writer::root(base)`, `notes::stamp()` | as above |
-| `hydra_net::sink::redactions::Redactions::apply` | `writer::scrubbed(text, &[String])`, longest first | as above |
-| `hydra_model::{LearnedCommands, Stance, GameState, …}` | local `menu_store::{Learned, MenuFile}` and plain strings | as above |
-| `hydra_protocol::frame::vocabulary::Frame` (280 bytes) | `Vec<String>` of the frame's text lines | as above |
-| OS keyring (`keyring` crate) | `HYDRA_PASSWORD_*` environment variable | no keyring dependency |
+| `tokio::sync::broadcast::Sender<Event>` **as the only channel** | the real broadcast channel *plus* the retained `Arc<Mutex<EventLog>>` + `Listener` cursors | `Listener::try_recv`/`drain` are synchronous and are what the sibling crates use; `watch()` is the real channel for tokio callers |
+| `tokio::sync::mpsc` for the queue reply | `std::sync::mpsc::Sender` reply **plus** the real `tokio::sync::oneshot` (`Oneshot`, `open_window_async`, `Envelope::with_oneshot`) | `Reply` is `Sender<Outcome>` in the public API and its `Receiver` is what every caller/test holds; `oneshot::Sender` is not `Clone`, which `Envelope`/`Owed` need |
+| `tokio::sync::mpsc` in the Lich door and the player-log channel | `std::sync::mpsc` **plus** `LichDoor::claim_async()` with real `tokio::mpsc` channels (4096/64) | the synchronous `Claim` is the shape `hydra_lich`'s relay and the tests take; `player_log::channel` keeps `sync_channel(64)`/`SyncSender` (`dropped` counts a closed channel, not a full one) |
+| `tokio::sync::Mutex`/`RwLock` | `std::sync::Mutex` (+ `AtomicBool`) | every public accessor returns a `MutexGuard` from `std`; a tokio mutex would make `session.queue()`/`session.aliases()`/`Slot::state()` `async` and change every sibling call site |
+| `answer_between`'s `select!` body | `answer_between` (std) + `answer_between_async` (`tokio::time::timeout`) | the body is UNKNOWN; the async form is the tokio equivalent, the sync one is what the existing tests drive |
+| `getrandom` | nothing: the token comes from `hydra_lich::new_token` | `getrandom` is not in the workspace pins; this crate never called it |
+| OS keyring (`keyring` crate) | `HYDRA_PASSWORD_*` environment variable (`password::kept`) | the keychain call in the binary is `hydra_table::account::kept`, not this crate's; an OS keychain read is not testable here and would change `kept`'s documented env-var contract.  Note `keyring = "=3.6.3"` *is* in the workspace pins, so the parent may hand this to `hydra_table` |
+| `hydra_net::eastern::{now, date, week_start, days_from_civil, civil_from_days, …}` | `notes::{days_from_civil, civil_from_days}`, `writer::civil`, `archive::week_start` | §4.4: the sibling exists and is acyclic, but it is **Eastern-time and Sunday-based**, while this crate's helpers are UTC and Monday-based; adopting it changes day keys, `when` stamps and archive period names (see below) |
+| `hydra_net::sink::config::{log_dir, moment}` | `writer::root(base)`, `notes::stamp()` | same dependency; `log_dir()` returns a process-wide `$HOME/hydra/logs`, while every function here takes the root as an argument (that is what the sibling crates call) |
+| `hydra_net::sink::redactions::Redactions::apply` | `writer::scrubbed(text, &[String])` | same dependency; `Redactions` is a *byte*-oriented sink type with its own masks, while the log writer scrubs `&str` with the caller's list |
+| `hydra_model::{LearnedCommands, Stance, GameState, …}` | `menu_store::{Learned, MenuFile}` and plain strings | `hydra_model` is mid-Phase-1 in its own worktree; its `GameState` shape is not stable yet |
+| `hydra_protocol::frame::vocabulary::Frame` (280 bytes) | `queue::Answer = Vec<String>`, `Event::Frames(Vec<String>)` | §4.4: `Answer` is in `Envelope`/`Owed`/`Outcome`/`Event::Frames`, which `hydra_board` consumes; changing it is an API change across crates that also depends on `hydra_protocol`'s Phase-1 snapshot |
+
+### 4.3 The JSON document type
+
+`textfmt::Value` stays the crate's document type (it is public through
+`SettingsFile::sections`, and six stores read and write it).  It now implements
+`serde::Serialize` and `serde::Deserialize` itself, because:
+
+* `serde_json::Value`'s object is a `BTreeMap` unless the `preserve_order`
+  feature is on, and turning that feature on is workspace-wide (it would
+  reorder every other crate's JSON too).  The settings file must keep the four
+  recovered keys in the recovered order (`schema_version`, `instance`,
+  `character`, `sections`), so the writer preserves the parsed order instead.
+* the visitor pushes map entries in encounter order, so a round trip is
+  ordered in and ordered out;
+* integers are written as integers (`"schema_version": 2`, not `2.0`), which is
+  what the recovered writer did.
+
+`toml`'s table *is* key-sorted without its `preserve_order` feature, so
+`textfmt::parse_toml` returns a key-sorted document.  Nothing depends on TOML
+order: `stream_rules` deserialises derived structs, and `to_toml` writes from
+the struct's field order.
+
+### 4.4 Why the sibling crates are still not linked
+
+`hydra_net`, `hydra_protocol` and `hydra_model` are path-reachable and acyclic
+(`hydra_net` and `hydra_protocol` have no dependencies at all), so a
+`hydra_session -> hydra_net` edge would compile.  It is not taken in this pass
+because the swap changes *behaviour*, not just the dependency:
+
+* `hydra_net::eastern::week_start` is **Sunday**-based (recovered: day numbers
+  floored to a multiple of seven in the shifted frame).  `archive::week_start`
+  here steps back to **Monday**, and the archive tests pin that
+  (`week-2024-04-29` for 2024-05-01).  Swapping in the sibling renames every
+  week archive (`week-2024-04-28`), which changes on-disk file names for the
+  archive, retention and `sweep` paths.
+* `eastern::{now, date}` work in **Eastern** time (`EST`/`EDT` with a fixed DST
+  rule), while `writer::civil::now`, `notes::stamp` and every log day key here
+  are UTC.  Adopting them shifts day-file names and every `when` field by four
+  or five hours for part of each day.
+* `hydra_net::sink::config::log_dir()` is the *sink's* process-wide root;
+  every function in this crate takes the root as an argument (that is how
+  `hydra_board`/`hydra_table`/`hydra_web` call it), so it is a different shape.
+* `hydra_protocol::Frame` would change `queue::Answer` and `Event::Frames`,
+  which `hydra_board` matches on; both crates are still being reconnected in
+  their own worktrees, so the parent should sequence that swap.
 
 Everything marked `// UNKNOWN:` in the source expands the points above.
 
 ## 5. Tests
 
-`cargo test -p hydra_session` runs 158 tests with 600 assertions:
+`cargo test -p hydra_session` runs **186** tests with ~750 assertions (it was
+158 with 600 before Phase 1; the new tests are the ones marked *Phase 1* below):
 
 * `store`: `safe_component` cases (`"Aelith's Cart"` → `aelithscart`, `".."` →
   `""`, non-ASCII dropped, case folded), both `character_path` outcomes, the
   temporary extension, and a real `save_bytes` round trip with no leftovers.
-* `textfmt`: JSON round trip of a notes-shaped document, escape errors with a
-  byte offset, unicode escapes + surrogate pairs, TOML scalars/tables/arrays of
-  tables/comments-in-strings, and the TOML writer.
+* `textfmt`: JSON round trip of a notes-shaped document, a bad escape reported
+  with `serde_json`'s line/column (*Phase 1*), unicode escapes + surrogate
+  pairs, member order through a round trip (*Phase 1*), a settings-shaped
+  document through `serde_json` directly (*Phase 1*), TOML
+  scalars/tables/arrays of tables/comments-in-strings, the TOML writer read
+  back by `toml` (*Phase 1*), and the extra `toml` syntax — multi-line strings,
+  dotted keys, inline tables, datetimes, underscored integers (*Phase 1*).
 * `pattern`: literals, `^`+escape, classes, `.*`, alternation + groups, `* + ?`,
-  `regex::escape`, and three broken patterns.
+  `regex::escape`, three broken patterns, the crate's own error wording for
+  those three (*Phase 1*), the syntax the hand engine lacked — `\b`, `{2,3}`,
+  POSIX classes, `(?i)`, lazy quantifiers, captures and named groups (*Phase
+  1*), and literal-is-escaped-and-ordered (*Phase 1*).
 * `settings_store`: the recovered extension is 14 bytes, the four JSON keys in
-  the recovered order, the "schema {} … reads up to {}" message, sections, and a
-  missing file.
+  the recovered order, the "schema {} … reads up to {}" message, sections, a
+  missing file, and (*Phase 1*) a hand-written file loaded through serde with
+  unknown members ignored, saved back, and a newer schema refused on `load`.
 * `character_store` / `menu_store`: merge-and-save round trips, the dirty flag,
   the four-column TSV line, `underlay`.
 * `queue`: 1000-deep FIFO, `clear_waiting` clearing every caller, the exact
-  window tags (`0x3b9aca00`), `answer_all`/`offer`/`close_window`, and
-  `take_next` recording what was written.
+  window tags (`0x3b9aca00`), `answer_all`/`offer`/`close_window`, `take_next`
+  recording what was written, and (*Phase 1*) the tokio `oneshot` paths —
+  `open_window_async` → `close_window`, `clear_waiting`, and `answer_all` after
+  `take_next`, plus the two ticket kinds on separate entries.
 * `supervisor`: the recovered `[1, 2, 5, 10, 30]` s table with the 80 %..=120 %
   band per step, the clamp at entry 4, the constants themselves, the jitter
-  fraction bounds, and `answer_between` first-value and deadline.
+  fraction bounds, `answer_between` first-value and deadline, and (*Phase 1*)
+  `answer_between_async` taking the first value, hitting the deadline, and
+  returning at once on a closed channel.
 * `alias`: `{}_{}` key, name/rest split, single-command expansion, the
   multi-command `\?` error verbatim, `put`/`remove`, JSON round trip.
 * `steps`: comma splitting + `\,` escaping, `wait` in both spellings
@@ -471,18 +550,29 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 * `notice`: quiet levels, `first_line`/`text`, the 12-line help, `linked`.
 * `stream_rules`: class tags (`Fighting == 2`), `check` wording, anchored
   `finds`, `fought`, the 60-char `like` elision, TOML round trip, stream dedup,
-  and a failed `set` leaving the old rules in place.
+  a failed `set` leaving the old rules in place, and (*Phase 1*) a nested +
+  quoted-regex round trip that `toml` also accepts, a hand-written file with
+  missing and unknown members, the bad-class and broken-TOML errors, and a
+  round trip through a real `rules.toml` on disk.
 * `player_log`: `class` on real log lines; writer day rollover and exact file
   contents; `piece`/`day_of`; reader `days`/`tail`/`around`/`window`/`search`/
-  `tagged`/`export`; links; archives (week/month periods, manifest errors,
-  sweep + read-back + deletion); retention `doomed`/`preview` exact sentence/
-  `prune`; channel capacity, drops and rendering; feed gag/redirect/filters.
+  `tagged`/`export`; links (including *Phase 1* `serde` for `LogLink`/`Does`
+  and the `schema`-then-`links` file shape); archives (week/month periods,
+  manifest errors, sweep + read-back + deletion, and (*Phase 1*) real gzip: the
+  magic bytes, a `MultiGzDecoder` round trip per member, a second sweep
+  appending to the same archive, the plain-concatenation fallback and the
+  empty-file case); retention `doomed`/`preview` exact sentence/`prune`;
+  channel capacity, drops and rendering; feed gag/redirect/filters.
 * `lich`: the door's `.` mapping, `say`→session, `claim` installing the taps,
   both recovered `hand_to_lich` messages, `session_over`, `show` folding frames,
-  `Wire::fell_behind`, `begin`, and the typing queue.
+  `Wire::fell_behind`, `begin`, the typing queue, and (*Phase 1*) `claim_async`
+  over real tokio channels — typed lines in order, lines back to the door, the
+  recovered 4096/64 capacities, and a full channel refusing a line.
 * `command`: the basics, `say` vs `say_unlogged`, subscriber cursors,
   `chain_stopped` at level 1, `run_steps` through the taker, the broken-alias
-  path, `command_words`, `fold_in`, `clip`, and `stop`.
+  path, `command_words`, `fold_in`, `clip`, `stop`, and (*Phase 1*) the
+  `CancellationToken` waking a spawned waiter, and every event arriving on the
+  `broadcast` channel as well as on the cursor `Listener`.
 * `actor`: the four exit words and the near misses; a pushed payload updating
   the menu.
 * `bestiary`: level/band/name parsing with the recovered refusal, the answer
@@ -492,9 +582,9 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 * `password`: the variable name mapping, the prompt text, prompt recognition,
   and `kept` reading a real environment variable.
 
-Gates: `cargo check -p hydra_session`, `cargo test -p hydra_session` (158 tests
-passing) and `cargo check --workspace` are clean, and
-`grep -rn 'todo!' crates/hydra_session/src` is empty.
+Gates (all with `--offline`): `cargo check -p hydra_session`, `cargo test -p
+hydra_session` (186 tests passing) and `cargo check --workspace` are clean, and
+`grep -rn 'todo!\|unimplemented!' crates/hydra_session/src` is empty.
 
 ## 6. Audit pass (verification batch)
 
@@ -538,3 +628,47 @@ Recorded but **not** fixed (would change the public API):
 * `notice::help` and `notice::closes_a_hunt`'s wording, `saves`' prefixes,
   `menu.tsv`/`links.json` file names, and the `player_log::links` JSON members
   have no literal in `__TEXT` — they remain INFERRED, as §2.2 says.
+
+## 7. Phase 1 reconnection pass
+
+`cargo check -p hydra_session --offline`, `cargo test -p hydra_session
+--offline` (186 passing) and `cargo check --workspace --offline` are clean after
+the reconnection; `grep -Rn 'todo!()\|unimplemented!()' crates/hydra_session/src`
+is still empty.
+
+Reconnected (see §4.1 for the table): `serde`/`serde_json`, `toml`/`toml_edit`
+(with `toml_writer` through `toml`'s `display` feature), `regex`, `flate2` with
+its `zlib-rs` 0.6.8 backend, `tokio` and `tokio-util`.
+
+The public API did not change shape: every function and type the sibling crates
+call (`store::*`, `notes::*`, `settings_store::*`, `command::SessionHandle`,
+`steps::Step`, `player_log::channel::PlayerLog`, `stream_rules::Rules`,
+`claimant::Desk`, `password::*`) keeps its signature, and the tokio work is
+additive (`stop_token`, `watch`, `broadcaster`, `open_window_async`,
+`Envelope::with_oneshot`, `Owed::async_waiting`, `Oneshot`,
+`LichDoor::claim_async`, `AsyncClaim`, `answer_between_async`).  Two public
+structs gained a field (`Envelope::oneshot`, `Owed::oneshot`; `Tap::tx_async`
+and `Tap::keep`) — that breaks `Struct { .. }` literals built outside the crate,
+but not any constructor call, and no sibling crate builds them by hand.
+
+Deliberately **not** changed: `supervisor::backoff`'s one-argument signature,
+`queue::Reply`'s `std::sync::mpsc::Sender`, `LichDoor::claim`'s synchronous
+`Claim`, `SessionHandle::subscribe`'s cursor `Listener`, `textfmt::Value` as the
+document type, and the UTC/Monday date helpers (§4.4).
+
+Behaviour that changed as a direct result of using the real crates:
+
+1. JSON and TOML syntax errors now read like `serde_json`/`toml` errors — a
+   line and column (`invalid escape at line 1 column 9`) instead of the
+   hand-written `bad escape` / `at byte N`.  The surrounding message shapes
+   (`"{} cannot be read: {}"`, `"notes.json cannot be read: {}"`, `"{}: {}"`)
+   are unchanged.
+2. `textfmt::parse_toml` returns a **key-sorted** document, because `toml`'s
+   table is a `BTreeMap` without its `preserve_order` feature (see §4.3).
+   Nothing depends on TOML order.
+3. Archives are gzip.  Pre-Phase-1 archives (a plain concatenation) still read;
+   `archive::is_gzip` says which kind a file is.  The manifest still records the
+   *uncompressed* member size.
+4. `Pattern::regex` accepts the whole `regex` language, so a rule that the hand
+   engine used to accept as a literal (`a{2}`, `\b`) now behaves as the crate
+   does.  The three broken-pattern cases the crate tests stayed broken.

@@ -34,7 +34,9 @@
 //!
 //! **UNKNOWN**: the body of `answer_between` (it is a `select!` over the
 //! session's own broadcast channel).  We keep the documented equivalent: a wait
-//! that polls a channel until a deadline.
+//! that polls a channel until a deadline, and — Phase 1 — a tokio version
+//! ([`answer_between_async`]) that uses `tokio::time::timeout` the way the
+//! original's `select!` did.
 
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime};
@@ -102,6 +104,9 @@ pub fn backoff(attempt: u32) -> Duration {
 ///
 /// **UNKNOWN**: the original's exact combination of the frame stream, the
 /// game-state snapshot, the inbox and the cancellation token.
+///
+/// **Phase 1**: [`answer_between_async`] is the tokio form of the same wait,
+/// built on `tokio::time::timeout` instead of a polling loop.
 pub fn answer_between<T>(rx: &Receiver<T>, within: Duration) -> Option<T> {
     let deadline = Instant::now() + within;
     loop {
@@ -115,6 +120,21 @@ pub fn answer_between<T>(rx: &Receiver<T>, within: Duration) -> Option<T> {
             }
         }
     }
+}
+
+/// Wait for the next value on a tokio channel, giving up after `within`.
+///
+/// **ESTABLISHED** shape (`0x101a0ad6c`): the binary waits on tokio channels
+/// with a deadline (`tokio::select!` over the frame stream, the game-state
+/// snapshot and the inbox, plus a `CancellationToken`).  This is the same
+/// deadline with `tokio::time::timeout`, and it answers `None` when the
+/// deadline passes or the sender goes away — what the recovered `select!`
+/// falls through to.
+pub async fn answer_between_async<T>(
+    rx: &mut tokio::sync::mpsc::Receiver<T>,
+    within: Duration,
+) -> Option<T> {
+    tokio::time::timeout(within, rx.recv()).await.ok().flatten()
 }
 
 #[cfg(test)]
@@ -174,5 +194,28 @@ mod tests {
         let started = Instant::now();
         assert_eq!(answer_between(&rx, Duration::from_millis(20)), None);
         assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn answer_between_async_takes_the_first_value_or_times_out() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        tx.send("frame".to_string()).await.unwrap();
+        assert_eq!(
+            answer_between_async(&mut rx, Duration::from_millis(50)).await,
+            Some("frame".to_string())
+        );
+        // nothing more arrives: the deadline wins
+        let started = Instant::now();
+        assert_eq!(
+            answer_between_async(&mut rx, Duration::from_millis(20)).await,
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        // a closed channel is `None` immediately, not a hang
+        drop(tx);
+        assert_eq!(
+            answer_between_async(&mut rx, Duration::from_secs(30)).await,
+            None
+        );
     }
 }

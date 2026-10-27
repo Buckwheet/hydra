@@ -1,22 +1,33 @@
-//! A very small JSON / TOML reader and writer.
+//! The JSON / TOML document type the file stores share.
 //!
 //! The original crate used `serde_json` (its `__Visitor` impls are still in
 //! the symbol table, e.g.
 //! `<hydra_session::notes::_::<impl Deserialize for notes::File>::deserialize::__Visitor
 //! as Visitor>::expecting @0x101a54fb4`) and `toml` / `toml_edit` for the
-//! settings and stream rules.  This crate is std-only, so this module
-//! implements the small subset of both formats the recovered files actually
-//! use:
+//! settings and stream rules.  **Phase 1** reconnected both:
 //!
-//! * JSON: objects, arrays, strings (with `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
-//!   `\r`, `\t`, `\uXXXX`), integers, floats, `true`, `false`, `null`.
-//! * TOML: `key = value` lines, `[table]` headers, `[[array-of-tables]]`
-//!   headers, basic strings, booleans, integers and single-line arrays of
-//!   scalars, plus `#` comments.
+//! * [`parse_json`] / [`to_json`] are `serde_json::from_str` /
+//!   `serde_json::to_string_pretty` over [`Value`], which implements
+//!   [`serde::Serialize`] and [`serde::Deserialize`] itself so that the key
+//!   *order* of a document survives a round trip (`serde_json::Value`'s map is
+//!   a `BTreeMap` unless `preserve_order` is on, and turning that feature on
+//!   would reorder every other crate's output);
+//! * [`parse_toml`] is `toml::from_str` over `toml::Value`, converted into
+//!   [`Value`]; [`to_toml`] renders a flat table (the shape the settings use)
+//!   and `stream_rules` writes its `[[rules]]` documents with `toml_edit`.
 //!
-//! Nothing here is a general-purpose implementation; unknown keys are kept but
-//! never interpreted, which mirrors how the original ignored fields it did not
-//! know about.  Departures from `serde` are recorded in `NOTES.md`.
+//! [`Value`] is the crate's own document type, not `serde_json::Value`: every
+//! file store in this crate (`notes`, `alias`, `character_store`,
+//! `settings_store`, `player_log::links`, `actor`) reads and writes it, and
+//! several of them expose it in their public API (`SettingsFile::sections`).
+//! Unknown keys are kept but never interpreted, which mirrors how the original
+//! ignored fields it did not know about.  Departures are recorded in
+//! `NOTES.md` §"Phase 1 reconnection".
+
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 /// A parsed JSON or TOML value.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,215 +110,134 @@ impl Value {
     }
 }
 
+
 // ---------------------------------------------------------------------------
-// JSON
+// JSON — `serde_json`, over this crate's own document type
 // ---------------------------------------------------------------------------
 
-/// Parse a JSON document.  The error is a short human-readable message with
-/// the byte offset, which is what the `Refused` error type carries.
+/// Parse a JSON document with `serde_json`.
+///
+/// The error is serde's own message, which carries the line and column
+/// (`expected `,` or `}` at line 3 column 7`) instead of the byte offset the
+/// hand-written parser used to report.  Callers wrap it in their own
+/// `"{} cannot be read: {}"` shape, as before.
 pub fn parse_json(text: &str) -> Result<Value, String> {
-    let mut p = Parser {
-        b: text.as_bytes(),
-        i: 0,
-    };
-    p.ws();
-    let v = p.value()?;
-    p.ws();
-    if p.i != p.b.len() {
-        return Err(format!("trailing text at byte {}", p.i));
-    }
-    Ok(v)
+    serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
+/// Render a value as JSON with `serde_json`, pretty-printed with two spaces.
+pub fn to_json(v: &Value) -> String {
+    // `Value`'s `Serialize` impl cannot fail for a finite document, and a
+    // non-finite float is written as `null`; an empty string keeps `to_json`
+    // total, which is what every caller assumes.
+    serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-impl<'a> Parser<'a> {
-    fn ws(&mut self) {
-        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
-            self.i += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn eat(&mut self, c: u8) -> Result<(), String> {
-        if self.peek() == Some(c) {
-            self.i += 1;
-            Ok(())
-        } else {
-            Err(format!("expected `{}` at byte {}", c as char, self.i))
-        }
-    }
-
-    fn value(&mut self) -> Result<Value, String> {
-        match self.peek() {
-            None => Err("unexpected end of input".to_string()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Value::Str(self.string()?)),
-            Some(b't') => self.word("true", Value::Bool(true)),
-            Some(b'f') => self.word("false", Value::Bool(false)),
-            Some(b'n') => self.word("null", Value::Null),
-            Some(_) => self.number(),
-        }
-    }
-
-    fn word(&mut self, w: &str, v: Value) -> Result<Value, String> {
-        if self.b[self.i..].starts_with(w.as_bytes()) {
-            self.i += w.len();
-            Ok(v)
-        } else {
-            Err(format!("expected `{w}` at byte {}", self.i))
-        }
-    }
-
-    fn number(&mut self) -> Result<Value, String> {
-        let start = self.i;
-        while self.i < self.b.len()
-            && matches!(self.b[self.i],
-                b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-        {
-            self.i += 1;
-        }
-        let s = std::str::from_utf8(&self.b[start..self.i]).map_err(|e| e.to_string())?;
-        s.parse::<f64>()
-            .map(Value::Num)
-            .map_err(|e| format!("bad number `{s}`: {e}"))
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.eat(b'"')?;
-        let mut out = String::new();
-        loop {
-            match self.peek() {
-                None => return Err("unterminated string".to_string()),
-                Some(b'"') => {
-                    self.i += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.i += 1;
-                    let c = self.peek().ok_or("dangling escape")?;
-                    self.i += 1;
-                    match c {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let ch = if (0xd800..0xdc00).contains(&hi) {
-                                // surrogate pair
-                                self.eat(b'\\')?;
-                                self.eat(b'u')?;
-                                let lo = self.hex4()?;
-                                let cp =
-                                    0x1_0000 + ((hi - 0xd800) << 10) + (lo.wrapping_sub(0xdc00));
-                                char::from_u32(cp).unwrap_or('\u{fffd}')
-                            } else {
-                                char::from_u32(hi).unwrap_or('\u{fffd}')
-                            };
-                            out.push(ch);
-                        }
-                        other => return Err(format!("bad escape \\{}", other as char)),
-                    }
-                }
-                Some(_) => {
-                    // Copy one UTF-8 scalar.
-                    let start = self.i;
-                    let len = utf8_len(self.b[self.i]);
-                    self.i = (self.i + len).min(self.b.len());
-                    let chunk = std::str::from_utf8(&self.b[start..self.i])
-                        .map_err(|e| e.to_string())?;
-                    out.push_str(chunk);
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::Null => s.serialize_unit(),
+            Value::Bool(b) => s.serialize_bool(*b),
+            Value::Num(n) => {
+                // JSON has one number type; the original wrote whole numbers
+                // without a fractional part (`"schema_version": 2`), which is
+                // also what `serde_json` does for integers, so an integral
+                // `f64` is emitted through the integer path.
+                if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.0e15 {
+                    s.serialize_i64(*n as i64)
+                } else {
+                    s.serialize_f64(*n)
                 }
             }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        if self.i + 4 > self.b.len() {
-            return Err("short \\u escape".to_string());
-        }
-        let s = std::str::from_utf8(&self.b[self.i..self.i + 4]).map_err(|e| e.to_string())?;
-        self.i += 4;
-        u32::from_str_radix(s, 16).map_err(|e| format!("bad \\u escape: {e}"))
-    }
-
-    fn array(&mut self) -> Result<Value, String> {
-        self.eat(b'[')?;
-        let mut items = Vec::new();
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.i += 1;
-            return Ok(Value::Arr(items));
-        }
-        loop {
-            self.ws();
-            items.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.i += 1;
+            Value::Str(text) => s.serialize_str(text),
+            Value::Arr(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
                 }
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(Value::Arr(items));
-                }
-                _ => return Err(format!("expected `,` or `]` at byte {}", self.i)),
+                seq.end()
             }
-        }
-    }
-
-    fn object(&mut self) -> Result<Value, String> {
-        self.eat(b'{')?;
-        let mut pairs = Vec::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.i += 1;
-            return Ok(Value::Obj(pairs));
-        }
-        loop {
-            self.ws();
-            let k = self.string()?;
-            self.ws();
-            self.eat(b':')?;
-            self.ws();
-            let v = self.value()?;
-            pairs.push((k, v));
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.i += 1;
+            Value::Obj(pairs) => {
+                let mut map = s.serialize_map(Some(pairs.len()))?;
+                for (key, item) in pairs {
+                    map.serialize_entry(key, item)?;
                 }
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(Value::Obj(pairs));
-                }
-                _ => return Err(format!("expected `,` or `}}` at byte {}", self.i)),
+                map.end()
             }
         }
     }
 }
 
-fn utf8_len(b: u8) -> usize {
-    match b {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        _ => 4,
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(Document)
     }
 }
 
+/// The visitor behind `Value::deserialize`: it keeps object members in the
+/// order the document lists them, which `serde_json::Value` does not (its map
+/// is a `BTreeMap` unless the `preserve_order` feature is on).
+struct Document;
+
+impl<'de> Visitor<'de> for Document {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+        Ok(Value::Bool(b))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+        Ok(Value::Num(n as f64))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+        Ok(Value::Num(n as f64))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+        Ok(Value::Num(n))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+        Ok(Value::Str(s.to_string()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Value, E> {
+        Ok(Value::Str(s))
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        Value::deserialize(d)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(item) = seq.next_element::<Value>()? {
+            items.push(item);
+        }
+        Ok(Value::Arr(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some((key, item)) = map.next_entry::<String, Value>()? {
+            pairs.push((key, item));
+        }
+        Ok(Value::Obj(pairs))
+    }
+}
 /// Escape a string for JSON output.
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -327,348 +257,90 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
-/// Render a value as JSON, pretty-printed with two spaces.
-pub fn to_json(v: &Value) -> String {
-    let mut out = String::new();
-    write_json(&mut out, v, 0);
-    out
-}
-
-fn write_json(out: &mut String, v: &Value, depth: usize) {
-    let pad = |out: &mut String, d: usize| {
-        out.push('\n');
-        for _ in 0..d {
-            out.push_str("  ");
-        }
-    };
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(n) => {
-            if n.fract() == 0.0 && n.abs() < 9.0e15 {
-                out.push_str(&format!("{}", *n as i64));
-            } else {
-                out.push_str(&format!("{n}"));
-            }
-        }
-        Value::Str(s) => {
-            out.push('"');
-            out.push_str(&json_escape(s));
-            out.push('"');
-        }
-        Value::Arr(items) => {
-            if items.is_empty() {
-                out.push_str("[]");
-                return;
-            }
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                pad(out, depth + 1);
-                write_json(out, item, depth + 1);
-            }
-            pad(out, depth);
-            out.push(']');
-        }
-        Value::Obj(pairs) => {
-            if pairs.is_empty() {
-                out.push_str("{}");
-                return;
-            }
-            out.push('{');
-            for (i, (k, item)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                pad(out, depth + 1);
-                out.push('"');
-                out.push_str(&json_escape(k));
-                out.push_str("\": ");
-                write_json(out, item, depth + 1);
-            }
-            pad(out, depth);
-            out.push('}');
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// TOML (the small subset the settings and stream rules use)
+// TOML — the `toml` crate for reading, `toml_edit` for writing
 // ---------------------------------------------------------------------------
 
-/// Parse the TOML subset: scalars, single-line arrays, `[table]` and
-/// `[[array of tables]]`, with `#` comments.  Trailing `\r` from CRLF files is
-/// stripped.  Later duplicate keys win, which matches `serde`'s behaviour of
-/// taking the last value it is handed for a field.
+/// Parse a TOML document with the `toml` crate.
+///
+/// The document is converted into [`Value`] so that the file stores keep one
+/// document type: tables become [`Value::Obj`], arrays [`Value::Arr`], integers
+/// and floats [`Value::Num`], and a TOML datetime is kept as its rendered
+/// [`Value::Str`] (no store in this crate reads a datetime back).
 pub fn parse_toml(text: &str) -> Result<Value, String> {
-    let mut root: Vec<(String, Value)> = Vec::new();
-    // Path of the table we are currently filling.
-    let mut path: Vec<String> = Vec::new();
-
-    for (n, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("[[") {
-            let name = line
-                .strip_prefix("[[")
-                .and_then(|r| r.strip_suffix("]]"))
-                .ok_or_else(|| format!("line {}: bad array-of-tables header", n + 1))?
-                .trim();
-            let name = unquote_key(name);
-            path = vec![name.clone()];
-            // Push a fresh table onto the array at `path`.
-            let parent = table_of(&mut root, &[]);
-            let idx = match parent.iter().position(|(k, _)| *k == name) {
-                Some(i) => i,
-                None => {
-                    parent.push((name, Value::Arr(Vec::new())));
-                    parent.len() - 1
-                }
-            };
-            match &mut parent[idx].1 {
-                Value::Arr(items) => items.push(Value::Obj(Vec::new())),
-                other => *other = Value::Arr(vec![Value::Obj(Vec::new())]),
-            }
-            continue;
-        }
-        if line.starts_with('[') {
-            let name = line
-                .strip_prefix('[')
-                .and_then(|r| r.strip_suffix(']'))
-                .ok_or_else(|| format!("line {}: bad table header", n + 1))?
-                .trim()
-                .to_string();
-            path = name.split('.').map(|s| unquote_key(s.trim())).collect();
-            let (parent, last) = match path.split_last() {
-                Some((last, rest)) => (rest.to_vec(), last.clone()),
-                None => (Vec::new(), String::new()),
-            };
-            let table = table_of(&mut root, &parent);
-            if !table.iter().any(|(k, _)| *k == last) {
-                table.push((last, Value::Obj(Vec::new())));
-            }
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {}: not a `key = value` line", n + 1))?;
-        let key = unquote_key(key.trim());
-        let value = parse_toml_value(value.trim()).map_err(|e| format!("line {}: {e}", n + 1))?;
-        let table = table_of(&mut root, &path);
-        match table.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, existing)) => *existing = value,
-            None => table.push((key, value)),
-        }
-    }
-    Ok(Value::Obj(root))
+    let doc: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(from_toml(doc))
 }
 
-/// Walk to the table at `path`, creating tables as needed.  Descending into an
-/// array of tables goes to its last element, which is what `[[name]]` opens.
-fn table_of<'a>(
-    root: &'a mut Vec<(String, Value)>,
-    path: &[String],
-) -> &'a mut Vec<(String, Value)> {
-    let Some((seg, rest)) = path.split_first() else {
-        return root;
-    };
-    let idx = match root.iter().position(|(k, _)| k == seg) {
-        Some(i) => i,
-        None => {
-            root.push((seg.clone(), Value::Obj(Vec::new())));
-            root.len() - 1
-        }
-    };
-    match &mut root[idx].1 {
-        Value::Obj(pairs) => table_of(pairs, rest),
-        Value::Arr(items) => {
-            if !matches!(items.last(), Some(Value::Obj(_))) {
-                items.push(Value::Obj(Vec::new()));
-            }
-            match items.last_mut() {
-                Some(Value::Obj(pairs)) => table_of(pairs, rest),
-                _ => unreachable!(),
-            }
-        }
-        other => {
-            *other = Value::Obj(Vec::new());
-            match other {
-                Value::Obj(pairs) => table_of(pairs, rest),
-                _ => unreachable!(),
-            }
+fn from_toml(v: toml::Value) -> Value {
+    match v {
+        toml::Value::String(s) => Value::Str(s),
+        toml::Value::Integer(i) => Value::Num(i as f64),
+        toml::Value::Float(f) => Value::Num(f),
+        toml::Value::Boolean(b) => Value::Bool(b),
+        toml::Value::Datetime(d) => Value::Str(d.to_string()),
+        toml::Value::Array(items) => Value::Arr(items.into_iter().map(from_toml).collect()),
+        toml::Value::Table(table) => {
+            Value::Obj(table.into_iter().map(|(k, v)| (k, from_toml(v))).collect())
         }
     }
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_str = false;
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' if i == 0 || bytes[i - 1] != b'\\' => in_str = !in_str,
-            b'#' if !in_str => return &line[..i],
-            _ => {}
-        }
-        i += 1;
-    }
-    line
-}
-
-fn unquote_key(k: &str) -> String {
-    let k = k.trim();
-    if k.len() >= 2 && k.starts_with('"') && k.ends_with('"') {
-        parse_toml_string(k).unwrap_or_else(|_| k[1..k.len() - 1].to_string())
-    } else {
-        k.to_string()
-    }
-}
-
-fn parse_toml_value(s: &str) -> Result<Value, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty value".to_string());
-    }
-    if s.starts_with('"') {
-        return parse_toml_string(s).map(Value::Str);
-    }
-    if s == "true" {
-        return Ok(Value::Bool(true));
-    }
-    if s == "false" {
-        return Ok(Value::Bool(false));
-    }
-    if s.starts_with('[') {
-        let inner = s
-            .strip_prefix('[')
-            .and_then(|r| r.strip_suffix(']'))
-            .ok_or("unterminated array")?;
-        let mut items = Vec::new();
-        for piece in split_array(inner) {
-            let piece = piece.trim();
-            if piece.is_empty() {
-                continue;
-            }
-            items.push(parse_toml_value(piece)?);
-        }
-        return Ok(Value::Arr(items));
-    }
-    let cleaned = s.replace('_', "");
-    if let Ok(i) = cleaned.parse::<i64>() {
-        return Ok(Value::Num(i as f64));
-    }
-    if let Ok(f) = cleaned.parse::<f64>() {
-        return Ok(Value::Num(f));
-    }
-    Err(format!("`{s}` is not a value"))
-}
-
-fn split_array(inner: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    let mut depth = 0i32;
-    let mut escaped = false;
-    for c in inner.chars() {
-        match c {
-            '"' if !escaped => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '[' if !in_str => {
-                depth += 1;
-                cur.push(c);
-            }
-            ']' if !in_str => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if !in_str && depth == 0 => {
-                out.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
-        }
-        escaped = c == '\\' && !escaped;
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-fn parse_toml_string(s: &str) -> Result<String, String> {
-    let inner = s
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .ok_or("unterminated string")?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => return Err("dangling escape".to_string()),
-        }
-    }
-    Ok(out)
 }
 
 /// Escape a string for a TOML basic string.
+///
+/// `toml_edit` escapes what it writes itself (see [`to_toml`]); this helper is
+/// kept for callers that render a single TOML scalar by hand, and escapes the
+/// same set of characters `serde_json` does.
 pub fn toml_escape(s: &str) -> String {
     json_escape(s)
 }
 
-/// Render a flat table (scalars and arrays of scalars only) as TOML.
+/// Render a flat table (scalars and arrays of scalars only) as TOML with
+/// `toml_edit`.
+///
+/// Nested tables and arrays of tables are skipped, as before: they are the
+/// shapes `stream_rules` renders itself, and the settings file is JSON.
 pub fn to_toml(obj: &Value) -> String {
-    let mut out = String::new();
+    let mut doc = toml_edit::DocumentMut::new();
     if let Value::Obj(pairs) = obj {
         for (k, v) in pairs {
             match v {
-                Value::Obj(_) | Value::Arr(_) if is_table_array(v) => continue,
                 Value::Obj(_) => continue,
                 Value::Arr(items) => {
-                    let rendered: Vec<String> = items.iter().map(toml_scalar).collect();
-                    out.push_str(&format!("{k} = [{}]\n", rendered.join(", ")));
+                    if is_table_array(v) {
+                        continue;
+                    }
+                    let mut arr = toml_edit::Array::new();
+                    for item in items {
+                        arr.push(toml_value(item));
+                    }
+                    doc[k] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
                 }
-                other => out.push_str(&format!("{k} = {}\n", toml_scalar(other))),
+                other => {
+                    doc[k] = toml_edit::Item::Value(toml_value(other));
+                }
             }
         }
     }
-    out
+    doc.to_string()
 }
 
 fn is_table_array(v: &Value) -> bool {
     matches!(v, Value::Arr(items) if items.iter().any(|i| matches!(i, Value::Obj(_))))
 }
 
-fn toml_scalar(v: &Value) -> String {
+/// One scalar as a `toml_edit` value.  An integral `f64` becomes a TOML
+/// integer, which is how the crate has always written `window = 30`.
+fn toml_value(v: &Value) -> toml_edit::Value {
     match v {
-        Value::Null => "\"\"".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Num(n) => {
-            if n.fract() == 0.0 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{n}")
-            }
+        Value::Null => toml_edit::Value::from(""),
+        Value::Bool(b) => toml_edit::Value::from(*b),
+        Value::Num(n) if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.0e15 => {
+            toml_edit::Value::from(*n as i64)
         }
-        Value::Str(s) => format!("\"{}\"", toml_escape(s)),
-        Value::Arr(_) | Value::Obj(_) => "\"\"".to_string(),
+        Value::Num(n) => toml_edit::Value::from(*n),
+        Value::Str(s) => toml_edit::Value::from(s.as_str()),
+        Value::Arr(_) | Value::Obj(_) => toml_edit::Value::from(""),
     }
 }
 
@@ -695,9 +367,51 @@ mod tests {
     }
 
     #[test]
-    fn json_reports_the_byte_offset_of_a_bad_escape() {
+    fn json_reports_a_bad_escape_with_serde_s_position() {
+        // The hand-written parser reported a byte offset; `serde_json` reports
+        // a line and column.  The stored message shape is unchanged.
         let e = parse_json(r#"{"a": "\q"}"#).unwrap_err();
-        assert!(e.contains("bad escape"), "{e}");
+        assert!(e.contains("invalid escape"), "{e}");
+        assert!(e.contains("line 1 column 9"), "{e}");
+        // A truncated document is refused with a position too, not a panic.
+        let e = parse_json(r#"{"a": "b"#).unwrap_err();
+        assert!(e.contains("line 1"), "{e}");
+    }
+
+    #[test]
+    fn serde_keeps_member_order_through_a_round_trip() {
+        // This is the property `serde_json::Value` does not have without the
+        // `preserve_order` feature, and the settings file depends on it.
+        let v = parse_json(r#"{"zeta": 1, "alpha": 2, "mu": 3}"#).unwrap();
+        let keys: Vec<&str> = match &v {
+            Value::Obj(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(keys, ["zeta", "alpha", "mu"]);
+        assert_eq!(parse_json(&to_json(&v)).unwrap(), v);
+    }
+
+    #[test]
+    fn serde_json_parses_real_documents_the_store_writes() {
+        // A whole settings-shaped document, through `serde_json` directly: the
+        // wrapper is a paper-thin delegation now.
+        let text = r#"{
+          "schema_version": 1,
+          "instance": "gemstone",
+          "character": "Aelith",
+          "sections": {"lich": {"path": "/usr/bin/ruby"}, "symbol": "."}
+        }"#;
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v.u64_of("schema_version"), Some(1));
+        let sections = v.get("sections").unwrap();
+        assert_eq!(sections.str_of("symbol"), ".");
+        assert_eq!(sections.get("lich").unwrap().str_of("path"), "/usr/bin/ruby");
+        // Whole numbers stay integral on the way out, as the original wrote
+        // them, and nested tables are indented two spaces.
+        let written = to_json(&v);
+        assert!(written.contains("\"schema_version\": 1"), "{written}");
+        assert!(written.contains("\n  \"sections\": {"), "{written}");
+        assert_eq!(parse_json(&written).unwrap(), v);
     }
 
     #[test]
@@ -763,5 +477,32 @@ mod tests {
             ),
         ]);
         assert_eq!(to_toml(&v), "sym = \".\"\nn = 3\nb = false\narr = [\"a\", \"b\"]\n");
+        // and the toml crate reads back what toml_edit wrote.  `toml`'s table is
+        // a `BTreeMap` (its `preserve_order` feature is off in the workspace
+        // pins), so the re-read document is key-sorted: compare by key.
+        let back = parse_toml(&to_toml(&v)).unwrap();
+        assert_eq!(back.str_of("sym"), ".");
+        assert_eq!(back.u64_of("n"), Some(3));
+        assert!(!back.bool_of("b"));
+        assert_eq!(back.strings_of("arr"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_toml_crate_brings_the_rest_of_the_syntax() {
+        // Multi-line strings, dotted keys, inline tables, dates and
+        // underscores in integers — none of which the hand parser read.
+        let text = "title = \"\"\"\nline one\nline two\n\"\"\"\na.b.c = 1\ninline = { x = 1, y = \"two\" }\nwhen = 2024-05-01T10:00:00Z\nbig = 1_000_000\n";
+        let v = parse_toml(text).unwrap();
+        assert_eq!(v.str_of("title"), "line one\nline two\n");
+        assert_eq!(
+            v.get("a").unwrap().get("b").unwrap().get("c").unwrap().as_u64(),
+            Some(1)
+        );
+        assert_eq!(v.get("inline").unwrap().str_of("y"), "two");
+        assert_eq!(v.str_of("when"), "2024-05-01T10:00:00Z");
+        assert_eq!(v.u64_of("big"), Some(1_000_000));
+        // A syntax error carries the crate's own line/column message.
+        let e = parse_toml("a = \n").unwrap_err();
+        assert!(e.contains("line 1"), "{e}");
     }
 }

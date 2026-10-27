@@ -21,8 +21,13 @@
 //! **UNKNOWN**: the JSON member names, and what the third `written` argument
 //! is.  We model a link as `{name, day, line}` and write `<name><day><line>`
 //! as the recovered three-argument id.
+//!
+//! **Phase 1**: `LogLink` and `Does` carry the `serde::Serialize` /
+//! `serde::Deserialize` impls the symbol table lists
+//! (`<impl Deserialize for links::LogLink>` and `<impl Deserialize for
+//! links::Does>`, each with its own `__FieldVisitor`), and the file itself is
+//! read and written by `serde_json`.
 
-use crate::textfmt::{self, Value};
 use std::path::{Path, PathBuf};
 
 /// The links file name.
@@ -31,13 +36,18 @@ pub const LINKS_FILE: &str = "links.json";
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// One link: a name (usually a note's key) pointing at a log line.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// **ESTABLISHED**: the binary has a `Deserialize` impl for this struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogLink {
     /// what the link is called
+    #[serde(default)]
     pub name: String,
     /// the day key, e.g. `2024-05-01`
+    #[serde(default)]
     pub day: String,
     /// the 1-based line number in that day file
+    #[serde(default)]
     pub line: u64,
 }
 
@@ -59,7 +69,14 @@ impl LogLink {
 }
 
 /// What a link link does: add or drop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// **ESTABLISHED**: the binary has its own `Deserialize` impl for `Does`, with
+/// a `__FieldVisitor` of its own, so it is a field-bearing JSON value; the
+/// derived impl reads the same `add` / `remove` words as [`Does::of`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Does {
     /// record the link
     #[default]
@@ -96,6 +113,7 @@ pub fn path(root: &Path) -> PathBuf {
 /// Read every link, sorted by `(day, line, name)`.
 ///
 /// **ESTABLISHED** shape (`0x101a50a6c`): read the file, parse, sort.
+/// **Phase 1**: the parse is `serde_json` over [`LinksFile`].
 pub fn read(root: &Path) -> Result<Vec<LogLink>, String> {
     let path = path(root);
     let text = match std::fs::read_to_string(&path) {
@@ -103,39 +121,34 @@ pub fn read(root: &Path) -> Result<Vec<LogLink>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let v = textfmt::parse_json(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut links = Vec::new();
-    if let Some(Value::Arr(items)) = v.get("links") {
-        for item in items {
-            links.push(LogLink {
-                name: item.str_of("name"),
-                day: item.str_of("day"),
-                line: item.u64_of("line").unwrap_or(0),
-            });
-        }
-    }
+    let file: LinksFile =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut links = file.links;
     links.sort_by(|a, b| (&a.day, a.line, &a.name).cmp(&(&b.day, b.line, &b.name)));
     Ok(links)
 }
 
+/// The document `links.json` holds: `schema` plus the links.
+///
+/// **UNKNOWN**: the member names (see the module note).  Both members are
+/// optional on read, so a file that only has one of them still loads.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct LinksFile {
+    #[serde(default)]
+    schema: u32,
+    #[serde(default)]
+    links: Vec<LogLink>,
+}
+
 /// Write the whole list.
 fn write_all(root: &Path, links: &[LogLink]) -> Result<(), String> {
-    let items: Vec<Value> = links
-        .iter()
-        .map(|l| {
-            Value::Obj(vec![
-                ("name".to_string(), Value::Str(l.name.clone())),
-                ("day".to_string(), Value::Str(l.day.clone())),
-                ("line".to_string(), Value::Num(l.line as f64)),
-            ])
-        })
-        .collect();
-    let doc = Value::Obj(vec![
-        ("schema".to_string(), Value::Num(SCHEMA_VERSION as f64)),
-        ("links".to_string(), Value::Arr(items)),
-    ]);
+    let doc = LinksFile {
+        schema: SCHEMA_VERSION,
+        links: links.to_vec(),
+    };
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
-    crate::store::save_bytes(root, &path(root), textfmt::to_json(&doc).as_bytes())
+    crate::store::save_bytes(root, &path(root), text.as_bytes())
         .map_err(|e| format!("{}: {e}", path(root).display()))
 }
 
@@ -213,6 +226,39 @@ mod tests {
         assert_eq!(Does::of("REMOVE"), Some(Does::Remove));
         assert_eq!(Does::of("maybe"), None);
         assert_eq!(Does::Add.word(), "add");
+    }
+
+    #[test]
+    fn serde_reads_and_writes_the_recovered_members() {
+        // The `Deserialize` impls the binary carries for `LogLink` and `Does`.
+        let link: LogLink = serde_json::from_str(r#"{"name":"cart","day":"2024-05-01"}"#).unwrap();
+        assert_eq!(link, LogLink::new("cart", "2024-05-01", 0), "line defaults");
+        assert_eq!(serde_json::from_str::<Does>(r#""add""#).unwrap(), Does::Add);
+        assert_eq!(
+            serde_json::from_str::<Does>(r#""remove""#).unwrap(),
+            Does::Remove
+        );
+        assert!(serde_json::from_str::<Does>(r#""maybe""#).is_err());
+        assert_eq!(serde_json::to_string(&Does::Remove).unwrap(), r#""remove""#);
+        assert_eq!(
+            serde_json::to_string(&LogLink::new("cart", "2024-05-01", 12)).unwrap(),
+            r#"{"name":"cart","day":"2024-05-01","line":12}"#
+        );
+    }
+
+    #[test]
+    fn the_file_shape_is_schema_then_links() {
+        let root = std::env::temp_dir().join(format!("hydra-links-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        add(&root, LogLink::new("a", "2024-05-01", 9)).unwrap();
+        let text = std::fs::read_to_string(path(&root)).unwrap();
+        let schema = text.find("\"schema\"").unwrap();
+        let links = text.find("\"links\"").unwrap();
+        assert!(schema < links, "{text}");
+        let doc: LinksFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc.schema, SCHEMA_VERSION);
+        assert_eq!(doc.links, vec![LogLink::new("a", "2024-05-01", 9)]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -46,9 +46,9 @@
 //! * `retention::doomed`/`preview` implement "keep N days": the preview text is
 //!   the recovered sentence above.
 //!
-//! **std-only departures**: no `flate2` (archives are plain concatenations —
-//! see [`archive`]), no `regex` (see [`crate::pattern`]), no `chrono` or
-//! `time` (see [`writer::civil`] and [`crate::notes::days_from_civil`]).
+//! **Phase 1**: `flate2` is back (archives are real gzip, see [`archive`]) and
+//! `regex` is back (see [`crate::pattern`]).  There is still no `chrono` or
+//! `time`: [`writer::civil`] and [`crate::notes::days_from_civil`] stay.
 
 pub mod archive;
 pub mod channel;

@@ -1067,4 +1067,46 @@ mod tests {
         assert_eq!(plain(&frames), vec!["second line"]);
         assert!(parser.finish().is_empty());
     }
+
+    #[test]
+    fn push_bytes_lines_groups_frames_by_input_line() {
+        let mut parser = Parser::new();
+        // Two input lines in one chunk, the second one still incomplete.
+        let lines = parser.push_bytes_lines(b"one\r\n<b>two</b>\r\nthree");
+        assert_eq!(lines.len(), 2, "only the completed lines are returned");
+        assert_eq!(plain(&lines[0]), vec!["one"]);
+        assert_eq!(
+            lines[1].iter().map(Frame::kind).collect::<Vec<_>>(),
+            vec!["Structural", "Text", "Structural"]
+        );
+        // The incomplete line is still buffered and comes out of the next call.
+        let lines = parser.push_bytes_lines(b" and more\r\n");
+        assert_eq!(plain(&lines[0]), vec!["three and more"]);
+        // A blank line is still a line: it produces the one empty `Text` frame
+        // the reference build produces for `"\n"`, so it gets its own group.
+        let lines = parser.push_bytes_lines(b"\r\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(plain(&lines[0]), vec![""]);
+        // A `<settings …>` line produces no frame, so it has no group at all.
+        assert!(parser.push_bytes_lines(b"<settings></settings>\r\n").is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn the_grouped_and_flat_feeds_agree() {
+        let wire = b"one\r\n<b>two</b>\r\n<prompt>&gt;</prompt>\r\nthree";
+        let mut flat = Parser::new();
+        let mut grouped = Parser::new();
+        let mut a = flat.push_bytes(&wire[..7]);
+        a.extend(flat.push_bytes(&wire[7..]));
+        a.extend(flat.finish());
+        let mut b: Vec<Frame> = grouped
+            .push_bytes_lines(&wire[..7])
+            .into_iter()
+            .flatten()
+            .collect();
+        b.extend(grouped.push_bytes_lines(&wire[7..]).into_iter().flatten());
+        b.extend(grouped.finish());
+        assert_eq!(a, b);
+    }
 }

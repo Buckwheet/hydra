@@ -365,6 +365,16 @@ Behaviour, byte by byte:
 Both are implemented in `parser/read.rs` in exactly this shape, including the
 `0x40000` boundary, the `</settings>` window and the `<prompt` escape.
 
+**Line grouping (phase 5a, part 2).** `read::push_bytes_lines` is the same state
+machine, returning `Vec<Vec<Frame>>`: one group per *completed input line* that
+produced at least one frame. `push_bytes` is now its flattened form, so the flat
+stream the rest of the tree consumes is unchanged. The grouping exists because
+the reference build's `--text` renderer coalesces the `Text` frames of one input
+line into a line buffer and breaks it when the input line ends (see
+`crates/hydra/NOTES.md` §7.2); a line that produces no frame — a `<settings …>`
+block line, the tail of an over-long line — has no group, and neither has a line
+that is still incomplete when the chunk ends (`finish` returns that one).
+
 ### Line decoding
 
 `parser::wire::decode_wire_line` (276 bytes) keeps valid UTF-8 as-is and maps

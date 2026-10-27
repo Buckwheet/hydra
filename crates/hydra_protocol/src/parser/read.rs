@@ -37,6 +37,22 @@ impl Parser {
     /// an XML tag or a `<settings>` block; the parser buffers until a newline
     /// (or [`Self::finish`]).
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Frame> {
+        self.push_bytes_lines(bytes).into_iter().flatten().collect()
+    }
+
+    /// Feed a chunk of bytes and return the frames **per completed input line**.
+    ///
+    /// This is the same state machine as [`Self::push_bytes`] (which is this
+    /// method flattened); only the grouping is new.  The reference build's
+    /// `--text` renderer coalesces the `Text` frames of one input line into a
+    /// line buffer and breaks the line when the input line ends, so the
+    /// grouping has to survive the flat `Frame` stream.  Every returned group
+    /// is one line that produced at least one frame; a line that produced none
+    /// (a `<settings …>` block line, the tail of an over-long line) has no
+    /// group, and neither has a line that is still incomplete at the end of the
+    /// chunk — [`Self::finish`] returns that one.
+    pub fn push_bytes_lines(&mut self, bytes: &[u8]) -> Vec<Vec<Frame>> {
+        let mut lines: Vec<Vec<Frame>> = Vec::new();
         let mut frames = Vec::new();
         for &byte in bytes {
             if self.skip_until_newline {
@@ -58,6 +74,9 @@ impl Parser {
                     &data[..]
                 };
                 self.frames_for_line(data, &mut frames);
+                if !frames.is_empty() {
+                    lines.push(std::mem::take(&mut frames));
+                }
                 continue;
             }
 
@@ -89,7 +108,10 @@ impl Parser {
                 self.skip_until_newline = true;
             }
         }
-        frames
+        if !frames.is_empty() {
+            lines.push(frames);
+        }
+        lines
     }
 
     /// Flush any unterminated final line.

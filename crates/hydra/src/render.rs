@@ -24,6 +24,11 @@
 //! [`crate::render::frame_line`]) because the reference build prints
 //! `Display for Frame`, which the reconstruction does not implement; the
 //! histogram after it is the recovered one.
+//!
+//! `--text` is [`TextRender`]: the readable text of the recording, line
+//! buffered the way the reference build's `hydra::render::Renderer::frame`
+//! (`0x1002593ec`) buffers it, and byte-identical to it on every fixture.  See
+//! `NOTES.md` §7.2.
 
 use hydra_protocol::Frame;
 
@@ -124,19 +129,140 @@ pub fn frame_line(index: usize, frame: &Frame) -> String {
     )
 }
 
-/// The `--text` line for one frame: the readable text, or `None` when the frame
-/// carries none.
+/// The `--text` renderer: the readable text of a recording, one line buffer at
+/// a time.
 ///
-/// This is **not** `hydra::render::Renderer::frame` (`0x1002593ec`): that
-/// renderer also breaks paragraphs (the `'\n'` it pushes at `0x100259474`/
-/// `0x100259558`) and brackets `death`/`group` frames, and it was not ported.
-/// See `NOTES.md`.
-pub fn text_line(frame: &Frame) -> Option<String> {
-    let text = frame.plain();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
+/// Only two frame kinds print anything: `Text` contributes its plain text and
+/// `Prompt` its prompt string.  Everything else — `Structural`, `Component`,
+/// `DialogWidgets`, `MalformedTag`, `ClientCommand`, `UnknownTag`, … —
+/// contributes the empty string, and `UnknownTag` does *not* print its raw tag.
+/// `Text` frames are **not** one line each: within one input line they coalesce
+/// into the buffer, and the buffer is broken only when
+///
+/// * the input line ends after visible text ([`Self::end_line`]),
+/// * a `Prompt` frame arrives ([`Self::frame`] flushes first, even a previous
+///   prompt), or
+/// * the recording ends ([`Self::finish`]).
+///
+/// A prompt's buffer therefore survives across input lines until the next
+/// `Text`/`Prompt`, and a prompt pending at the very end is left
+/// **unterminated**: the report footer's leading `'\n'` terminates it.
+///
+/// One more rule, derived from the reference build: a `Text` frame produced
+/// while a stream is open (`<stream …>`/`<pushStream …>` not yet popped) is not
+/// printed at all and does not touch the buffer — that is why the `inv`/stream
+/// dumps in a recording never show up in `--text`.  Prompts are always printed
+/// (the parser emits its `StreamPopForced` frames before one).  The stream
+/// depth is tracked from the frame sequence itself.
+///
+/// The return value of each method is the exact bytes to append to stdout (a
+/// complete line, terminator included), or `None` when nothing is written.
+#[derive(Clone, Debug, Default)]
+pub struct TextRender {
+    buf: String,
+    pending: Pending,
+    /// Open streams, tracked from the frames (`StreamPush` opens one,
+    /// `StreamPop` closes one, `StreamPopForced` empties the stack).
+    streams: usize,
+}
+
+/// What [`TextRender::buf`] currently holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Pending {
+    /// Nothing buffered.
+    #[default]
+    Empty,
+    /// Coalesced text of the current input line.
+    Text,
+    /// Prompt text, which survives across input lines.
+    Prompt,
+}
+
+impl TextRender {
+    /// A renderer with an empty buffer.
+    pub fn new() -> Self {
+        TextRender::default()
+    }
+
+    /// Feed one frame; returns the line it completed, if any.
+    pub fn frame(&mut self, frame: &Frame) -> Option<String> {
+        match frame {
+            Frame::Text(runs) => {
+                if self.streams > 0 {
+                    // A stream dump: displayed nowhere, and it does not even
+                    // break the pending line.
+                    return None;
+                }
+                // Text ending a prompt breaks the prompt line first.
+                let out = if self.pending == Pending::Prompt {
+                    self.break_line()
+                } else {
+                    None
+                };
+                self.buf.push_str(&runs.plain());
+                self.pending = Pending::Text;
+                out
+            }
+            Frame::Prompt(text) => {
+                // A prompt always starts a new line — even after a prompt.
+                let out = self.break_line();
+                self.buf.push_str(text);
+                self.pending = Pending::Prompt;
+                out
+            }
+            _ => {
+                self.track_streams(frame);
+                None
+            }
+        }
+    }
+
+    /// Break the line at the end of an input line that produced visible text.
+    ///
+    /// A pending prompt is *not* broken here: it survives until the next
+    /// `Text`/`Prompt`, or until [`Self::finish`].
+    pub fn end_line(&mut self) -> Option<String> {
+        if self.pending == Pending::Text {
+            self.break_line()
+        } else {
+            None
+        }
+    }
+
+    /// End of recording: a pending text line is broken, and a pending prompt is
+    /// written **without** a terminator — the report footer's leading `'\n'`
+    /// terminates it.
+    pub fn finish(&mut self) -> Option<String> {
+        match self.pending {
+            Pending::Empty => None,
+            Pending::Text => self.break_line(),
+            Pending::Prompt => {
+                self.pending = Pending::Empty;
+                Some(std::mem::take(&mut self.buf))
+            }
+        }
+    }
+
+    /// `buf` plus the line terminator, or `None` when nothing is buffered.
+    fn break_line(&mut self) -> Option<String> {
+        if self.pending == Pending::Empty {
+            return None;
+        }
+        let mut line = std::mem::take(&mut self.buf);
+        line.push('\n');
+        self.pending = Pending::Empty;
+        Some(line)
+    }
+
+    /// Follow the stream stack through the frame sequence.
+    fn track_streams(&mut self, frame: &Frame) {
+        match frame.kind() {
+            "StreamPush" => self.streams += 1,
+            "StreamPop" => self.streams = self.streams.saturating_sub(1),
+            // `<prompt>` empties the stack (one frame per open stream).
+            "StreamPopForced" => self.streams = 0,
+            _ => {}
+        }
     }
 }
 
@@ -275,19 +401,152 @@ mod tests {
         );
     }
 
+    /// Feed one input line's frames, then break the line like a recording line
+    /// end does; returns everything written.
+    fn render_line(render: &mut TextRender, frames: &[Frame]) -> String {
+        let mut out = String::new();
+        for frame in frames {
+            if let Some(line) = render.frame(frame) {
+                out.push_str(&line);
+            }
+        }
+        if let Some(line) = render.end_line() {
+            out.push_str(&line);
+        }
+        out
+    }
+
     #[test]
-    fn text_lines_skip_empty_frames() {
-        assert_eq!(text_line(&text_frame("hi")).as_deref(), Some("hi"));
+    fn text_frames_coalesce_within_one_input_line() {
+        let mut render = TextRender::new();
+        // `A<b>B</b>C` -> Text, Structural, Text, Structural, Text: one line.
+        let line = render_line(
+            &mut render,
+            &[
+                text_frame("A"),
+                Frame::structural("b", "<b>"),
+                text_frame("B"),
+                Frame::structural("b", "</b>"),
+                text_frame("C"),
+            ],
+        );
+        assert_eq!(line, "ABC\n");
+        // The next input line starts a fresh buffer.
+        assert_eq!(render_line(&mut render, &[text_frame("next")]), "next\n");
+        assert_eq!(render.finish(), None);
+    }
+
+    #[test]
+    fn a_prompt_breaks_the_pending_line_and_persists_until_text() {
+        let mut render = TextRender::new();
+        // `A<prompt>&gt;</prompt>`: the text line breaks, the prompt stays open.
         assert_eq!(
-            text_line(&Frame::Unknown {
+            render_line(&mut render, &[text_frame("A"), Frame::Prompt(">".into())]),
+            "A\n"
+        );
+        // A prompt does not survive its own line end...
+        assert_eq!(render_line(&mut render, &[]), "");
+        // ... but the *next* prompt breaks it, just like text does.
+        assert_eq!(
+            render_line(&mut render, &[Frame::Prompt("#".into())]),
+            ">\n"
+        );
+        // Text after a prompt breaks the prompt line first, and its own line
+        // ends with the input line.
+        assert_eq!(render_line(&mut render, &[text_frame("B")]), "#\nB\n");
+        assert_eq!(render.finish(), None);
+    }
+
+    #[test]
+    fn a_prompt_pending_at_the_end_is_left_unterminated() {
+        let mut render = TextRender::new();
+        assert_eq!(render_line(&mut render, &[Frame::Prompt(">".into())]), "");
+        // No `"\n"`: the report footer's leading newline terminates the prompt.
+        assert_eq!(render.finish().as_deref(), Some(">"));
+        assert_eq!(render.finish(), None);
+    }
+
+    #[test]
+    fn a_blank_input_line_writes_a_blank_line() {
+        let mut render = TextRender::new();
+        // `"\n"` is one empty `Text` frame, which still breaks the line.
+        assert_eq!(render_line(&mut render, &[text_frame("")]), "\n");
+        assert_eq!(render_line(&mut render, &[text_frame("")]), "\n");
+        // An empty line after a prompt breaks the prompt, then writes a blank.
+        let mut render = TextRender::new();
+        assert_eq!(render_line(&mut render, &[Frame::Prompt(">".into())]), "");
+        assert_eq!(render_line(&mut render, &[text_frame("")]), ">\n\n");
+    }
+
+    #[test]
+    fn only_text_and_prompt_frames_print_anything() {
+        let mut render = TextRender::new();
+        let frames = [
+            Frame::Unknown {
                 tag: "room".into(),
                 raw: "<room/>".into(),
-                text: String::new()
-            }),
-            None
+                text: "leaked".into(),
+            },
+            Frame::structural("b", "<b>"),
+            Frame::event("Component"),
+            Frame::ClientText("look".into()),
+            Frame::ClientRegion,
+            Frame::Raw("raw".into()),
+        ];
+        assert_eq!(render_line(&mut render, &frames), "");
+        assert_eq!(render.finish(), None, "nothing was buffered");
+    }
+
+    #[test]
+    fn text_produced_while_a_stream_is_open_is_hidden() {
+        let mut render = TextRender::new();
+        // `<stream id="s">hid</stream>shown`: the dump is dropped, and it does
+        // not even break the line, so `A` and `shown` coalesce.
+        let line = render_line(
+            &mut render,
+            &[
+                text_frame("A"),
+                Frame::event("StreamPush"),
+                text_frame("hid"),
+                Frame::event("StreamPop"),
+                text_frame("shown"),
+            ],
         );
-        assert_eq!(text_line(&Frame::Raw(String::new())), None);
-        assert_eq!(text_line(&Frame::event("Component")), None);
+        assert_eq!(line, "Ashown\n", "the stream text is not displayed");
+        // A stream left open across input lines hides everything after it.
+        let line = render_line(
+            &mut render,
+            &[
+                Frame::event("StreamPush"),
+                text_frame("one"),
+                Frame::event("StreamPush"),
+                text_frame("two"),
+            ],
+        );
+        assert_eq!(line, "");
+        // `<prompt>` empties the stream stack (`StreamPopForced`), so the
+        // prompt is always displayed and text after it is visible again.
+        assert_eq!(
+            render_line(
+                &mut render,
+                &[
+                    Frame::event("StreamPopForced"),
+                    Frame::event("StreamPopForced"),
+                    Frame::Prompt(">".into()),
+                    text_frame("visible"),
+                ]
+            ),
+            ">\nvisible\n"
+        );
+    }
+
+    #[test]
+    fn a_stream_pop_without_a_push_does_not_underflow() {
+        let mut render = TextRender::new();
+        assert_eq!(
+            render_line(&mut render, &[Frame::event("StreamPop"), text_frame("shown")]),
+            "shown\n"
+        );
     }
 
     #[test]

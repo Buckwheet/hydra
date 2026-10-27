@@ -43,7 +43,7 @@ use std::io::{self, Write};
 use hydra_protocol::Parser;
 
 use crate::render::{self, Counts};
-use crate::source::{pump, Replay};
+use crate::source::{pump_groups, Replay};
 
 /// What `hydra replay` was asked to show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,37 +115,60 @@ pub fn replay_show(file: &str, show: Show) -> Result<Summary, String> {
 /// write the report to `out`.
 ///
 /// Split out from [`replay_show`] so tests can drive it without a file or a
-/// terminal.  Per-frame lines are written as they are decoded (the default and
-/// `--text` modes); the footer — the recovered `\n== {frames} frames from
-/// {bytes} bytes`, the per-kind histogram and the unknown-tag block — is
-/// written in every mode, exactly as the reference build does.
+/// terminal.  The default mode writes one line per frame as it is decoded; the
+/// `--text` mode writes the readable text through [`render::TextRender`], which
+/// needs the frames grouped per input line (hence [`pump_groups`]).  The footer
+/// — the recovered `\n== {frames} frames from {bytes} bytes`, the per-kind
+/// histogram and the unknown-tag block — is written in every mode, exactly as
+/// the reference build does.
 pub fn replay_bytes<W: Write>(data: &[u8], show: Show, out: &mut W) -> io::Result<Summary> {
     let mut parser = Parser::new();
     let mut source = Replay::new(data.to_vec());
     let mut counts = Counts::default();
     let mut index = 0usize;
     let mut broken = false;
+    let mut text = render::TextRender::new();
 
-    let frames = pump(&mut source, &mut parser, |frame| {
-        index += 1;
-        counts.add(&frame);
-        if broken {
-            return;
+    // One input line at a time: the `--text` renderer breaks its line buffer
+    // when an input line that produced visible text ends.
+    let frames = pump_groups(&mut source, &mut parser, |group| {
+        for frame in &group {
+            index += 1;
+            counts.add(frame);
+            if broken {
+                continue;
+            }
+            let written = match show {
+                Show::Default => writeln!(out, "{}", render::frame_line(index, frame)),
+                Show::Text => match text.frame(frame) {
+                    Some(line) => out.write_all(line.as_bytes()),
+                    None => Ok(()),
+                },
+                Show::Summary => Ok(()),
+            };
+            // A failing stdout stops the per-frame lines but is not an error:
+            // the reference build drops the `io::Error` (0x1002067fc /
+            // 0x1002068fc).
+            if written.is_err() {
+                broken = true;
+            }
         }
-        let written = match show {
-            Show::Default => writeln!(out, "{}", render::frame_line(index, &frame)),
-            Show::Text => match render::text_line(&frame) {
-                Some(text) => writeln!(out, "{text}"),
-                None => Ok(()),
-            },
-            Show::Summary => Ok(()),
-        };
-        // A failing stdout stops the per-frame lines but is not an error: the
-        // reference build drops the `io::Error` (0x1002067fc / 0x1002068fc).
-        if written.is_err() {
-            broken = true;
+        if !broken && show == Show::Text {
+            if let Some(line) = text.end_line() {
+                if out.write_all(line.as_bytes()).is_err() {
+                    broken = true;
+                }
+            }
         }
     });
+
+    // A prompt still pending at the end is written without a terminator; the
+    // footer below starts with the `'\n'` that closes it.
+    if !broken && show == Show::Text {
+        if let Some(line) = text.finish() {
+            let _ = out.write_all(line.as_bytes());
+        }
+    }
 
     let unknown = parser.unknown_tags().clone();
     // The footer is best-effort for the same reason.
@@ -287,14 +310,111 @@ mod tests {
             text,
             concat!(
                 "bold words\n",
-                ">\n",
-                "\n== 4 frames from 54 bytes\n",
+                // The prompt is left unterminated; the footer's leading newline
+                // closes it.
+                ">\n== 4 frames from 54 bytes\n",
                 "       1  Prompt\n",
                 "       2  Structural\n",
                 "       1  Text\n",
                 "== no unknown tags\n"
             )
         );
+    }
+
+    #[test]
+    fn the_text_mode_coalesces_per_input_line_and_ends_with_the_footer() {
+        // Two lines; the second is one line split by inline markup, and the
+        // first ends with a prompt, which the next line's text breaks.
+        let data = b"first line<prompt>&gt;</prompt>\nA<b>B</b>C\n";
+        let mut out = Vec::new();
+        let summary = replay_bytes(data, Show::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "first line\n",
+                ">\n",
+                "ABC\n",
+                "\n== 7 frames from 43 bytes\n",
+                "       1  Prompt\n",
+                "       2  Structural\n",
+                "       4  Text\n",
+                "== no unknown tags\n"
+            ),
+            "text lines first, then the very same summary block"
+        );
+        assert_eq!(summary.frames, 7);
+    }
+
+    #[test]
+    fn text_from_an_open_stream_is_not_printed() {
+        let data = b"<stream id=\"s\">dump</stream>shown\n";
+        let mut out = Vec::new();
+        let summary = replay_bytes(data, Show::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "shown\n",
+                "\n== 4 frames from 34 bytes\n",
+                "       1  StreamPop\n",
+                "       1  StreamPush\n",
+                "       2  Text\n",
+                "== no unknown tags\n"
+            )
+        );
+        // The frame is still counted: only the rendering drops it.
+        assert_eq!(summary.counts.of("Text"), 2);
+    }
+
+    #[test]
+    fn a_prompt_at_the_end_is_terminated_by_the_footer() {
+        let data = b"<prompt>&gt;</prompt>\n";
+        let mut out = Vec::new();
+        replay_bytes(data, Show::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                ">",
+                "\n== 1 frames from 22 bytes\n",
+                "       1  Prompt\n",
+                "== no unknown tags\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_blank_input_line_is_one_blank_text_line() {
+        let mut out = Vec::new();
+        replay_bytes(b"one\n\ntwo\n", Show::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "one\n",
+                "\n",
+                "two\n",
+                "\n== 3 frames from 9 bytes\n",
+                "       3  Text\n",
+                "== no unknown tags\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_text_report_is_line_chunking_independent() {
+        // The line grouping must survive the 4 KiB replay chunking: one input
+        // line much longer than a chunk is still one text line.
+        let mut data = vec![b'a'; REPLAY_CHUNK * 2];
+        data.extend_from_slice(b"<b>b</b>\n");
+        let mut out = Vec::new();
+        replay_bytes(&data, Show::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let line = text.lines().next().unwrap();
+        assert!(line.starts_with("aaa"), "{:?}", &line[..8]);
+        assert!(line.ends_with("aaab"), "{:?}", &line[line.len() - 4..]);
+        assert!(!line.contains('\n'));
     }
 
     #[test]

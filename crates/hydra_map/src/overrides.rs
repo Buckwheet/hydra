@@ -17,13 +17,19 @@
 //! `overrides::written` (`0x1015be258`) is the durable write: `process::id`,
 //! `Path::with_extension` for a `*.{pid}.tmp`, `OpenOptions`, `write_all`,
 //! `File::sync_all`, `fs::rename`, then `fs::remove_file` on the failure path.
+//!
+//! **Phase 1.** The three documents are real `serde` derives now (`serde`
+//! 1.0.229 with `derive`) read and written by `serde_json` 1.0.151, both
+//! `x = { workspace = true }`. Declaration order *is* the recovered
+//! `serialize_entry` order, so the files keep their byte-for-byte shape.
 
 use std::fs;
 use std::io::Result;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::cena::{Map, Room, RoomId};
-use crate::json::{self, Value};
 
 /// The overrides file's name (`0x10245c017`).
 pub const NAME: &str = "map-overrides.json";
@@ -36,7 +42,8 @@ pub const EXPORT: &str = "map-overrides-export.json";
 /// The four keys and their order are `Exported::serialize`'s; the types come
 /// from the four `serialize_entry` monomorphizations it calls (a `u32`, a `u64`
 /// and two strings).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Exported {
     /// The map's room id (`u32`).
     pub id: RoomId,
@@ -47,39 +54,20 @@ pub struct Exported {
 }
 
 impl Exported {
-    pub fn write(&self, w: &mut json::Writer) {
-        w.begin_object();
-        w.key("id");
-        w.u32(self.id);
-        w.key("uid");
-        w.u64(self.uid);
-        w.key("title");
-        w.str(&self.title);
-        w.key("area");
-        w.str(&self.area);
-        w.end_object();
+    /// The four recovered keys, in the recovered order.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("an override always serialises")
     }
 
-    pub fn from_json(v: &Value) -> std::result::Result<Exported, json::Error> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| json::Error("invalid type: expected a map".into()))?;
-        let mut e = Exported::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "id" => e.id = num_u32(value)?,
-                "uid" => e.uid = num_u64(value)?,
-                "title" => e.title = want_str(value)?.to_string(),
-                "area" => e.area = want_str(value)?.to_string(),
-                _ => {}
-            }
-        }
-        Ok(e)
+    /// The `Deserialize` side of one element.
+    pub fn from_value(v: &serde_json::Value) -> serde_json::Result<Exported> {
+        serde_json::from_value(v.clone())
     }
 }
 
 /// One area's worth of corrections: the area's name and the rooms in it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Area {
     pub area: String,
     pub rooms: Vec<Exported>,
@@ -93,7 +81,8 @@ pub struct Area {
 /// `cena_map::Map` from the result (`Map::from_rooms`, `0x1015bf4d8`) and
 /// `filed_in` (`0x1015be424`) rewrites one `cena_map::Room`'s `Vec<String>`
 /// fields, which is why an area groups its rooms here.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Overrides {
     pub areas: Vec<Area>,
 }
@@ -112,46 +101,13 @@ impl Overrides {
     }
 
     /// The `Deserialize` side of the document.
-    pub fn from_json(text: &str) -> std::result::Result<Overrides, json::Error> {
-        let v = json::parse(text)?;
-        let Some(obj) = v.as_object() else {
-            return Err(json::Error("invalid type: expected a map".into()));
-        };
-        let mut out = Overrides::default();
-        for (key, value) in obj {
-            if key == "areas" {
-                let Some(items) = value.as_array() else {
-                    return Err(json::Error("invalid type: expected a sequence".into()));
-                };
-                for item in items {
-                    out.areas.push(Area::from_json(item)?);
-                }
-            }
-        }
-        Ok(out)
+    pub fn from_json(text: &str) -> serde_json::Result<Overrides> {
+        serde_json::from_str(text)
     }
 
     /// The `Serialize` side: exactly what `Overrides::save` writes.
     pub fn to_json(&self) -> String {
-        let mut w = json::Writer::new();
-        w.begin_object();
-        w.key("areas");
-        w.begin_array();
-        for a in &self.areas {
-            w.begin_object();
-            w.key("area");
-            w.str(&a.area);
-            w.key("rooms");
-            w.begin_array();
-            for r in &a.rooms {
-                r.write(&mut w);
-            }
-            w.end_array();
-            w.end_object();
-        }
-        w.end_array();
-        w.end_object();
-        w.into_string()
+        serde_json::to_string(self).expect("an overrides document always serialises")
     }
 
     /// @0x1015bebc4 — write `dir/map-overrides.json`.
@@ -163,15 +119,9 @@ impl Overrides {
     /// overrides mention, flattened into one sequence (`Serializer::collect_seq`
     /// at `0x1015bf130`).
     pub fn export(&self, dir: &Path) -> Result<()> {
-        let mut w = json::Writer::new();
-        w.begin_array();
-        for area in &self.areas {
-            for room in &area.rooms {
-                room.write(&mut w);
-            }
-        }
-        w.end_array();
-        written(&dir.join(EXPORT), w.into_string().as_bytes())
+        let rooms: Vec<&Exported> = self.areas.iter().flat_map(|a| a.rooms.iter()).collect();
+        let text = serde_json::to_string(&rooms).expect("an override always serialises");
+        written(&dir.join(EXPORT), text.as_bytes())
     }
 
     /// @0x1015bf4d8 — the map with these corrections applied.
@@ -193,30 +143,6 @@ impl Overrides {
             }
         }
         Map::from_rooms(rooms)
-    }
-}
-
-impl Area {
-    fn from_json(v: &Value) -> std::result::Result<Area, json::Error> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| json::Error("invalid type: expected a map".into()))?;
-        let mut a = Area::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "area" => a.area = want_str(value)?.to_string(),
-                "rooms" => {
-                    let Some(items) = value.as_array() else {
-                        return Err(json::Error("invalid type: expected a sequence".into()));
-                    };
-                    for item in items {
-                        a.rooms.push(Exported::from_json(item)?);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(a)
     }
 }
 
@@ -290,23 +216,6 @@ pub fn written(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn want_str(v: &Value) -> std::result::Result<&str, json::Error> {
-    v.as_str()
-        .ok_or_else(|| json::Error("invalid type: expected a string".into()))
-}
-
-fn num_u32(v: &Value) -> std::result::Result<u32, json::Error> {
-    v.as_i64()
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| json::Error("invalid type: expected u32".into()))
-}
-
-fn num_u64(v: &Value) -> std::result::Result<u64, json::Error> {
-    v.as_i64()
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| json::Error("invalid type: expected u64".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,9 +259,14 @@ mod tests {
             document()
         );
         assert_eq!(Overrides::from_json("{}").unwrap(), Overrides::default());
-        assert_eq!(
-            Overrides::from_json("[]").unwrap_err().0,
-            "invalid type: expected a map"
+        // serde's derive also accepts the *sequence* spelling of a struct, so
+        // `[]` is now `Overrides { areas: [] }` where the hand-written reader
+        // refused it. A wrong type inside still reports serde_json's wording.
+        assert_eq!(Overrides::from_json("[]").unwrap(), Overrides::default());
+        let err = Overrides::from_json(r#"{"areas":{}}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type: map, expected a sequence"),
+            "{err}"
         );
     }
 
@@ -440,5 +354,72 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["thing.json".to_string()]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Phase 1: what the real derives now provide -------------------------
+
+    #[test]
+    fn the_derive_round_trips_through_values_and_tolerates_absent_or_extra_keys() {
+        let doc = document();
+        // Struct → value → struct, the path `serde_json` itself takes.
+        let value = serde_json::to_value(&doc).unwrap();
+        assert_eq!(serde_json::from_value::<Overrides>(value).unwrap(), doc);
+        // Known keys, a misspelt one and an absent one: the absent keys default
+        // (`#[serde(default)]`) and the unknown one is ignored, which is what
+        // the previous hand-written reader did.
+        let doc = Overrides::from_json(
+            r#"{"areas":[{"rooms":[{"id":1,"uid":2,"title":"t","area":"a","note":9}],"extra":true}],"uid":7}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.areas.len(), 1);
+        assert_eq!(doc.areas[0].area, "");
+        assert_eq!(doc.areas[0].rooms[0].id, 1);
+        assert_eq!(doc.areas[0].rooms[0].title, "t");
+        // A single override element stands alone too.
+        let one = Exported::from_value(
+            &serde_json::from_str(r#"{"id":3,"uid":4,"title":"T","area":"A"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(one.to_json(), r#"{"id":3,"uid":4,"title":"T","area":"A"}"#);
+    }
+
+    #[test]
+    fn a_broken_document_loads_as_the_empty_one() {
+        // `load` swallows every error into the empty document, exactly as the
+        // recovered sret write at `0x1015beb24` does — including serde's
+        // wording, which never reaches the caller.
+        let dir = scratch("broken");
+        fs::write(dir.join(NAME), "{not json").unwrap();
+        assert_eq!(Overrides::load(&dir), Overrides::default());
+        fs::write(dir.join(NAME), r#"{"areas":{}}"#).unwrap();
+        assert_eq!(Overrides::load(&dir), Overrides::default());
+        // But `from_json` reports what serde_json saw, with its line/column.
+        let err = Overrides::from_json("{not json").unwrap_err();
+        assert!(err.to_string().contains("line 1 column 2"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn strings_are_escaped_by_serde_json() {
+        let doc = Overrides {
+            areas: vec![Area {
+                area: "a\"b\\c\nd\u{1}é".into(),
+                rooms: vec![Exported {
+                    id: 1,
+                    uid: 2,
+                    title: "t".into(),
+                    area: String::new(),
+                }],
+            }],
+        };
+        let text = doc.to_json();
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"areas":[{"area":"a\"b\\c\nd\u0001é","rooms":["#,
+                r#"{"id":1,"uid":2,"title":"t","area":""}]}]}"#
+            )
+        );
+        assert_eq!(Overrides::from_json(&text).unwrap(), doc);
     }
 }

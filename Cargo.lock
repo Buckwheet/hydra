@@ -1194,9 +1194,11 @@ name = "gs_render"
 version = "0.0.0"
 dependencies = [
  "egui",
+ "egui-wgpu",
  "epaint",
  "gs_base",
  "gs_puppet",
+ "wgpu",
 ]
 
 [[package]]

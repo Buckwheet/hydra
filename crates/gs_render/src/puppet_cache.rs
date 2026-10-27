@@ -1815,6 +1815,34 @@ pub const FIGURE_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 /// `Color32::WHITE`, the tint `mov w5, #-1` passes.
 pub const FIGURE_TINT: u32 = 0xffff_ffff;
 
+impl FigureQuad {
+    /// The quad as an `egui::Rect` — `min`/`max` are exactly what
+    /// `Painter::image` receives (`stp d1, d0, [x29, #-0x18]` at `0x1008feb30`
+    /// builds the `Rect` in place).
+    pub fn rect(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.min[0], self.min[1]),
+            egui::pos2(self.max[0], self.max[1]),
+        )
+    }
+
+    /// The uv rect: the four floats at `0x102073df0`, as
+    /// `Rect { min: (uv[0], uv[1]), max: (uv[2], uv[3]) }`.
+    pub fn uv_rect(&self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.uv[0], self.uv[1]),
+            egui::pos2(self.uv[2], self.uv[3]),
+        )
+    }
+
+    /// The tint as an `egui::Color32` (`0xffff_ffff` = `Color32::WHITE`; `Color32`
+    /// is `r, g, b, a` in memory, so the little-endian bytes are the channels).
+    pub fn color(&self) -> egui::Color32 {
+        let [r, g, b, a] = self.tint.to_le_bytes();
+        egui::Color32::from_rgba_premultiplied(r, g, b, a)
+    }
+}
+
 impl PuppetPlacement {
     /// `PuppetPlacement::paint_figure` @0x1008feac0 — the quad to paint.
     ///
@@ -1839,6 +1867,34 @@ impl PuppetPlacement {
             uv: FIGURE_UV,
             tint: FIGURE_TINT,
         })
+    }
+
+    /// `PuppetPlacement::paint_figure` @0x1008feac0 — the egui half.
+    ///
+    /// The recovered body draws the placement as
+    /// `egui::Painter::image(texture_id, rect, uv, tint)` (`bl
+    /// 0x100ef00e0` at `0x1008feb44`, with `w5 = -1` for the tint), and when any
+    /// of the three guards fires it replays a cached shape list instead with
+    /// `egui::Painter::extend` (`bl 0x10094d608` at `0x1008feb68`, fed the
+    /// `(ptr, end)` slice iterator built at `0x1008feb4c..0x1008feb58`).
+    ///
+    /// `texture` is the cached `epaint::TextureHandle`'s id (`ldp x1, x2, [x10,
+    /// #0x18]` — the `TextureId` is passed to `Painter::image` as its 16-byte
+    /// enum in `x1:x2`), and `cached` is that `Vec<Shape>` fallback. Returns the
+    /// painted quad, or `None` when the fallback path was taken.
+    pub fn paint_figure_in(
+        &self,
+        painter: &egui::Painter,
+        ctx: &FigureCtx,
+        texture: egui::TextureId,
+        cached: &[epaint::Shape],
+    ) -> Option<FigureQuad> {
+        let Some(quad) = self.paint_figure(ctx) else {
+            painter.extend(cached.iter().cloned());
+            return None;
+        };
+        painter.image(texture, quad.rect(), quad.uv_rect(), quad.color());
+        Some(quad)
     }
 }
 
@@ -2558,6 +2614,168 @@ mod tests {
         assert_eq!(part_from_index(14), Some(BodyPart::Nsys));
         assert_eq!(part_from_index(0), None);
         assert_eq!(part_from_index(15), None);
+    }
+
+    /// The quad helpers must hand `Painter::image` exactly the recovered values.
+    #[test]
+    fn figure_quad_converts_to_egui_types() {
+        let p = PuppetPlacement {
+            pos: [10.0, 20.0],
+            scale: 2.0,
+        };
+        let ctx = FigureCtx {
+            offset: [1.0, -1.0],
+            width: 30,
+            height: 40,
+        };
+        let q = p.paint_figure(&ctx).unwrap();
+        let rect = egui::Rect::from_min_max(egui::pos2(12.0, 18.0), egui::pos2(72.0, 98.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        assert_eq!(q.rect(), rect);
+        assert_eq!(q.uv_rect(), uv);
+        assert_eq!(q.color(), egui::Color32::WHITE);
+        // The uv constant is the 16 bytes at 0x102073df0.
+        assert_eq!(FIGURE_UV, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(FIGURE_TINT, u32::MAX);
+    }
+
+    /// One headless egui frame, then inspect the painted `Shape::Mesh`.
+    #[test]
+    fn paint_figure_in_paints_one_textured_quad() {
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "doll",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        let id = tex.id();
+        let p = PuppetPlacement {
+            pos: [10.0, 20.0],
+            scale: 2.0,
+        };
+        let fig = FigureCtx {
+            offset: [1.0, -1.0],
+            width: 30,
+            height: 40,
+        };
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        ));
+        let mut got = None;
+        let out = ctx.run_ui(input, |ui| {
+            got = p.paint_figure_in(ui.painter(), &fig, id, &[]);
+        });
+        assert_eq!(got, p.paint_figure(&fig));
+        let quad = got.unwrap();
+
+        let meshes: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                epaint::Shape::Mesh(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes.len(), 1);
+        let m = &meshes[0];
+        assert_eq!(m.texture_id, id);
+        assert_eq!(m.vertices.len(), 4);
+        assert_eq!(m.indices, vec![0, 1, 2, 2, 1, 3]);
+        // Bounding box == the recovered quad.
+        assert_eq!(m.calc_bounds(), quad.rect());
+        assert_eq!(
+            m.calc_bounds(),
+            egui::Rect::from_min_max(egui::pos2(12.0, 18.0), egui::pos2(72.0, 98.0))
+        );
+        // Vertex order and uv corners: left_top, right_top, left_bottom, right_bottom.
+        let uv = quad.uv_rect();
+        let r = quad.rect();
+        assert_eq!(m.vertices[0].pos, r.left_top());
+        assert_eq!(m.vertices[0].uv, uv.left_top());
+        assert_eq!(m.vertices[1].pos, r.right_top());
+        assert_eq!(m.vertices[1].uv, uv.right_top());
+        assert_eq!(m.vertices[2].pos, r.left_bottom());
+        assert_eq!(m.vertices[2].uv, uv.left_bottom());
+        assert_eq!(m.vertices[3].pos, r.right_bottom());
+        assert_eq!(m.vertices[3].uv, uv.right_bottom());
+        assert_eq!(uv.min, egui::pos2(0.0, 0.0));
+        assert_eq!(uv.max, egui::pos2(1.0, 1.0));
+        // `mov w5, #-1`: every vertex is white.
+        assert!(m.vertices.iter().all(|v| v.color == egui::Color32::WHITE));
+
+        // A second frame is not needed for the shape, but the texture upload does
+        // arrive with the first one.
+        assert!(out.textures_delta.set.iter().any(|(tid, _)| *tid == id));
+    }
+
+    /// The `cbz` guards take the cached-shape path instead of an image.
+    #[test]
+    fn paint_figure_in_falls_back_to_the_cached_shapes() {
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "doll",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        let id = tex.id();
+        let p = PuppetPlacement {
+            pos: [10.0, 20.0],
+            scale: 1.0,
+        };
+        // width == 0 is one of the three guards.
+        let fig = FigureCtx {
+            offset: [0.0, 0.0],
+            width: 0,
+            height: 40,
+        };
+        let cached = vec![
+            epaint::Shape::circle_filled(egui::pos2(1.0, 2.0), 3.0, egui::Color32::BLUE),
+            epaint::Shape::circle_filled(egui::pos2(4.0, 5.0), 6.0, egui::Color32::GREEN),
+        ];
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        ));
+        let mut got = Some(FigureQuad {
+            min: [0.0; 2],
+            max: [0.0; 2],
+            uv: FIGURE_UV,
+            tint: FIGURE_TINT,
+        });
+        let out = ctx.run_ui(input, |ui| {
+            got = p.paint_figure_in(ui.painter(), &fig, id, &cached);
+        });
+        assert_eq!(got, None);
+        let meshes = out
+            .shapes
+            .iter()
+            .filter(|cs| matches!(&cs.shape, epaint::Shape::Mesh(_)))
+            .count();
+        assert_eq!(meshes, 0, "the image path must not run");
+        let circles = out
+            .shapes
+            .iter()
+            .filter(|cs| matches!(&cs.shape, epaint::Shape::Circle(_)))
+            .count();
+        assert_eq!(circles, 2, "the cached shapes are replayed");
+        let centres: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                epaint::Shape::Circle(c) => Some((c.center, c.radius)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            centres,
+            vec![
+                (egui::pos2(1.0, 2.0), 3.0),
+                (egui::pos2(4.0, 5.0), 6.0)
+            ]
+        );
     }
 
     #[test]

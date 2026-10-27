@@ -23,14 +23,26 @@
 //! (`RelightGpu::new/run/copy/measure/light_pass` at `0x10096d838` ...); it is
 //! not part of the stub set and is therefore not reconstructed here.
 //!
-//! ## Standard-library-only departure
+//! ## Real `egui` / `egui-wgpu` wiring
 //!
-//! The original depended on `wgpu`, `egui`/`egui_wgpu`, `image`, `tracing`,
-//! `parking_lot`, `toml_edit` and (through `gs_puppet`) a mesh/pose model.
-//! None of those are available here (no network, no vendor cache), so:
+//! `egui`, `epaint`, `egui-wgpu` and `wgpu` are the crates the binary was built
+//! with, and the two draw seams are real code now:
 //!
-//! * every GPU touch point became a call into the no-op seam [`gpu::Gpu`]
-//!   ([`gpu::NullGpu`] is the default implementation), and
+//! * [`field_gpu::paint_view_ui`] computes the recovered field quad and adds an
+//!   `egui_wgpu` paint callback to a painter; [`field_gpu::FieldCallback`]
+//!   implements `egui_wgpu::renderer::CallbackTrait` with the binary's exact
+//!   `prepare` / `finish_prepare` / `paint` signatures, and
+//!   [`field_gpu::init_ctx`] publishes the field state through the
+//!   `egui::Context`;
+//! * [`puppet_cache::PuppetPlacement::paint_figure_in`] paints the posed figure
+//!   with `egui::Painter::image` / `Painter::extend`.
+//!
+//! What is still reconstructed rather than executed:
+//!
+//! * the wgpu pipelines, render targets and vertex buffers (they need a live
+//!   `wgpu::Device`, which neither the tests nor this crate create) remain the
+//!   descriptor seam [`gpu::Gpu`] — [`gpu::NullGpu`] is the default
+//!   implementation, and every site is marked `// UNKNOWN:`;
 //! * the model types that used to come from `gs_puppet` are defined locally
 //!   with the field offsets observed in the disassembly and marked
 //!   `// INTEGRATION:`.

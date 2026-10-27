@@ -647,7 +647,12 @@ version = "0.0.0"
 name = "hydra_combat_log"
 version = "0.0.0"
 dependencies = [
+ "hydra_ledger",
+ "hydra_model",
  "hydra_net",
+ "hydra_session",
+ "rusqlite",
+ "tokio",
 ]
 
 [[package]]

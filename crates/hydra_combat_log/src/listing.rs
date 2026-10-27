@@ -144,18 +144,10 @@ fn paginate(rows: Vec<Vec<String>>, listing: &Listing) -> (Vec<Vec<String>>, usi
 /// WHERE a.hunt_id {} AND f.ours = 1 ORDER BY f.name` (0x103e686b0).
 pub fn flare_names(store: &Store, character: &str, scope: &Scope) -> Result<Vec<String>, Error> {
     let hunts = report::resolve(store, character, scope)?;
-    let mut names: Vec<String> = Vec::new();
-    for id in &hunts.ids {
-        for a in store.attacks_of(*id) {
-            for f in store.flares_of(a.id) {
-                if f.ours && !names.iter().any(|n| n == &f.name) {
-                    names.push(f.name.clone());
-                }
-            }
-        }
-    }
-    names.sort();
-    Ok(names)
+    // `SELECT DISTINCT f.name FROM flares f JOIN attacks a ON a.id = f.attack_id
+    // WHERE a.hunt_id IN (…) AND f.ours = 1 ORDER BY f.name`, executed by SQLite
+    // with the recovered `IN ({})` text spliced in.
+    store.flare_names(&hunts.ids)
 }
 
 /// The attack listing.
@@ -173,18 +165,20 @@ pub fn attacks(store: &Store, character: &str, listing: &Listing) -> Lines {
     let hunts = report::resolve(store, character, &listing.scope)?;
     let mut rows: Vec<(i64, Vec<String>)> = Vec::new();
     for id in &hunts.ids {
-        for a in store.attacks_of(*id) {
+        for a in store.attacks_of(*id)? {
             if !a.ours {
                 continue;
             }
-            let hits = store.hits_of(a.id);
+            let hits = store.hits_of(a.id)?;
             let damage: i64 = hits.iter().map(|h| h.damage).sum();
-            let flares = store.flares_of(a.id).len();
-            let target = a
-                .creature_id
-                .and_then(|c| store.creature(c))
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| String::from("no target"));
+            let flares = store.flares_of(a.id)?.len();
+            let target = match a.creature_id {
+                Some(c) => store
+                    .creature_by_id(c)?
+                    .map(|c| c.name)
+                    .unwrap_or_else(|| String::from("no target")),
+                None => String::from("no target"),
+            };
             let avg = if hits.is_empty() {
                 String::from("-")
             } else {
@@ -257,20 +251,11 @@ pub fn creatures(store: &Store, character: &str, listing: &Listing) -> Lines {
     let hunts = report::resolve(store, character, &listing.scope)?;
     let mut rows: Vec<(i64, Vec<String>)> = Vec::new();
     for id in &hunts.ids {
-        for c in store.creatures_of(*id) {
-            let mine: Vec<i64> = store
-                .attacks
-                .iter()
-                .filter(|a| a.creature_id == Some(c.id) && a.ours)
-                .map(|a| a.id)
-                .collect();
-            let attacks = mine.len() as i64;
-            let damage: i64 = store
-                .hits
-                .iter()
-                .filter(|h| mine.contains(&h.attack_id))
-                .map(|h| h.damage)
-                .sum();
+        for c in store.creatures_of(*id)? {
+            // The own swings at the creature and the damage they did, counted by
+            // SQLite rather than by walking every attack and hit in memory.
+            let attacks = store.creature_swings(c.id)?;
+            let damage = store.creature_damage(c.id)?;
             let status = match c.kill_credit.as_deref() {
                 Some("kill") => String::from("DEAD (kill)"),
                 Some("assist") => String::from("DEAD (assist)"),
@@ -376,9 +361,11 @@ mod store_tests {
 
     fn store() -> Store {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
-        s.hunt_ended(a, 1_000_600);
-        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
+        s.hunt_ended(a, 1_000_600).expect("ended");
+        let kobold = s
+            .creature_seen(a, "kobold", "a kobold", 1_000_100)
+            .expect("creature");
         let swing = s.attack(Attack {
             hunt_id: a,
             seq: 1,
@@ -389,7 +376,8 @@ mod store_tests {
             ours: true,
             outcome: Some(String::from("hit")),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: swing,
             hunt_id: a,
@@ -397,25 +385,29 @@ mod store_tests {
             seq: 1,
             damage: 25,
             ..Hit::default()
-        });
+        })
+        .expect("hit");
         s.flare(Flare {
             attack_id: swing,
             seq: 1,
             name: String::from("acid_flare"),
             ours: true,
             ..Flare::default()
-        });
+        })
+        .expect("flare");
         s.flare(Flare {
             attack_id: swing,
             seq: 2,
             name: String::from("mirror_image_def"),
             ours: true,
             ..Flare::default()
-        });
-        s.creatures.push(Creature {
+        })
+        .expect("flare");
+        s.creature(Creature {
             hunt_id: a,
             ..Creature::default()
-        });
+        })
+        .expect("creature");
         s
     }
 
@@ -451,7 +443,7 @@ mod store_tests {
         let s = store();
         let lines = creatures(&s, "Testchar", &Listing::default()).expect("runs");
         assert_eq!(lines[0], "Creatures, 1 - 1 (newest first)");
-        let id = s.creatures[0].id;
+        let id = s.creatures_of(1).unwrap()[0].id;
         assert!(lines.iter().any(|l| l == &format!("|{}|ALIVE|1|25|", id)));
     }
 
@@ -465,7 +457,7 @@ mod store_tests {
     #[test]
     fn empty_listings_say_so() {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
         let _ = a;
         let listing = Listing::default();
         assert_eq!(

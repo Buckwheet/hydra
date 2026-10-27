@@ -52,7 +52,7 @@ pub fn hp(store: &Store, character: &str, which: Option<&str>, scope: &Scope) ->
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut totals: Vec<i64> = Vec::new();
     for hunt in &hunts.ids {
-        for creature in store.creatures_of(*hunt) {
+        for creature in store.creatures_of(*hunt)? {
             if creature.killed_at.is_none() {
                 continue;
             }
@@ -61,19 +61,14 @@ pub fn hp(store: &Store, character: &str, which: Option<&str>, scope: &Scope) ->
                     continue;
                 }
             }
-            let mine: Vec<&Attack> = store
-                .attacks
-                .iter()
-                .filter(|a| a.creature_id == Some(creature.id))
-                .collect();
+            let mine: Vec<Attack> = store.attacks_of_creature(creature.id)?;
             let mut ours = 0;
             let mut all = 0;
             for a in &mine {
-                for h in store.hits.iter().filter(|h| h.attack_id == a.id) {
-                    all += h.damage;
-                    if a.ours {
-                        ours += h.damage;
-                    }
+                let damage = store.hit_sum(a.id)?;
+                all += damage;
+                if a.ours {
+                    ours += damage;
                 }
             }
             totals.push(ours);
@@ -109,7 +104,7 @@ pub fn gear(store: &Store, character: &str, scope: &Scope) -> Lines {
     let mut worn: Vec<Vec<String>> = Vec::new();
     let mut held: BTreeMap<String, i64> = BTreeMap::new();
     for hunt in &hunts.ids {
-        for row in store.gear_of(*hunt, "worn") {
+        for row in store.gear_of(*hunt, "worn")? {
             worn.push(vec![
                 row.name.clone(),
                 report::stamp(row.began_at),
@@ -119,12 +114,12 @@ pub fn gear(store: &Store, character: &str, scope: &Scope) -> Lines {
                 ),
             ]);
         }
-        for a in store.attacks_of(*hunt) {
+        for a in store.attacks_of(*hunt)? {
             if !a.ours {
                 continue;
             }
             for hand in [a.right_gear, a.left_gear].into_iter().flatten() {
-                let name = store.name(hand).to_string();
+                let name = store.name(hand)?;
                 if !name.is_empty() {
                     *held.entry(name).or_insert(0) += 1;
                 }
@@ -170,8 +165,8 @@ pub fn flare(
     let hunts = report::resolve(store, character, scope)?;
     let mut procs: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for hunt in &hunts.ids {
-        for a in store.attacks_of(*hunt) {
-            for f in store.flares_of(a.id) {
+        for a in store.attacks_of(*hunt)? {
+            for f in store.flares_of(a.id)? {
                 if !f.ours {
                     continue;
                 }
@@ -230,11 +225,11 @@ pub fn effects(store: &Store, character: &str, scope: &Scope) -> Lines {
     let hunts = report::resolve(store, character, scope)?;
     let mut rows: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for hunt in &hunts.ids {
-        for effect in store.effects_of(*hunt) {
+        for effect in store.effects_of(*hunt)? {
             rows.entry(effect.name.clone()).or_insert((0, 0));
         }
-        for a in store.attacks_of(*hunt) {
-            for f in store.flares_of(a.id) {
+        for a in store.attacks_of(*hunt)? {
+            for f in store.flares_of(a.id)? {
                 if !f.ours {
                     continue;
                 }
@@ -274,9 +269,9 @@ pub fn barkskin(store: &Store, character: &str) -> Lines {
     let mut casts: Vec<Vec<String>> = Vec::new();
     for hunt in &hunts.ids {
         let mut current: Option<(i64, i64, i64, i64)> = None;
-        for a in store.attacks_of(*hunt) {
+        for a in store.attacks_of(*hunt)? {
             let bark: Vec<_> = store
-                .flares_of(a.id)
+                .flares_of(a.id)?
                 .into_iter()
                 .filter(|f| f.ours && f.name == "barkskin")
                 .collect();
@@ -327,8 +322,8 @@ pub fn alongside(store: &Store, character: &str, name: &str, scope: &Scope) -> L
     let mut together: BTreeMap<String, i64> = BTreeMap::new();
     let mut total = 0;
     for hunt in &hunts.ids {
-        for a in store.attacks_of(*hunt) {
-            let flares = store.flares_of(a.id);
+        for a in store.attacks_of(*hunt)? {
+            let flares = store.flares_of(a.id)?;
             if !flares.iter().any(|f| f.ours && f.name == name) {
                 continue;
             }
@@ -395,8 +390,8 @@ pub fn compare(
     let mut out = vec![String::from("Hunt comparison (creature mix affects results)")];
     let mut rows = Vec::new();
     for id in &ids {
-        let row = report::hunt_row(store, *id);
-        let totals = report::totals(store, *id);
+        let row = report::hunt_row(store, *id)?;
+        let totals = report::totals(store, *id)?;
         rows.push(vec![
             id.to_string(),
             report::stamp(row.started_at),
@@ -434,7 +429,7 @@ pub fn defense(
     if noun.is_none() {
         let mut nouns: Vec<String> = Vec::new();
         for hunt in &hunts.ids {
-            for c in store.creatures_of(*hunt) {
+            for c in store.creatures_of(*hunt)? {
                 if !nouns.contains(&c.noun) {
                     nouns.push(c.noun.clone());
                 }
@@ -452,11 +447,11 @@ pub fn defense(
     let mut td: Vec<i64> = Vec::new();
     let mut udf: Vec<i64> = Vec::new();
     for hunt in &hunts.ids {
-        for c in store.creatures_of(*hunt) {
+        for c in store.creatures_of(*hunt)? {
             if c.noun != want {
                 continue;
             }
-            for s in store.statuses.iter().filter(|s| s.creature_id == Some(c.id)) {
+            for s in store.statuses_of_creature(c.id)? {
                 if let Some(value) = s.value {
                     match s.status.as_str() {
                         "ds" => ds.push(value),
@@ -511,13 +506,13 @@ pub fn intercepts(store: &Store, character: &str, scope: &Scope) -> Lines {
     let mut stops: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut swings = 0;
     for hunt in &hunts.ids {
-        for a in store.attacks_of(*hunt) {
+        for a in store.attacks_of(*hunt)? {
             if !a.inbound {
                 continue;
             }
             swings += 1;
             let mut stopped = false;
-            for f in store.flares_of(a.id) {
+            for f in store.flares_of(a.id)? {
                 if f.ours && report::barrier_name(&f.name) {
                     *stops.entry(barrier_word(&f.name)).or_insert(0) += 1;
                     stopped = true;
@@ -594,10 +589,10 @@ pub fn analytics(
             let mut kills = 0;
             let mut seconds = 0;
             for hunt in &hunts.ids {
-                let row = report::hunt_row(store, *hunt);
+                let row = report::hunt_row(store, *hunt)?;
                 seconds += row.ended_at.unwrap_or(row.last_event) - row.started_at;
                 kills += row.kills;
-                for a in store.attacks_of(*hunt) {
+                for a in store.attacks_of(*hunt)? {
                     if !a.ours {
                         continue;
                     }
@@ -631,9 +626,9 @@ pub fn analytics(
             out.push(String::from("Blind coverage by creature kind"));
             let mut rows: BTreeMap<String, (i64, i64)> = BTreeMap::new();
             for hunt in &hunts.ids {
-                for c in store.creatures_of(*hunt) {
+                for c in store.creatures_of(*hunt)? {
                     rows.entry(c.noun.clone()).or_insert((0, 0)).0 += 1;
-                    for s in store.statuses.iter().filter(|s| s.creature_id == Some(c.id)) {
+                    for s in store.statuses_of_creature(c.id)? {
                         if s.status.contains("blind") {
                             rows.entry(c.noun.clone()).or_insert((0, 0)).1 += 1;
                         }
@@ -652,7 +647,7 @@ pub fn analytics(
         Analytics::Control => {
             let mut by_attacker: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
             for hunt in &hunts.ids {
-                for a in store.attacks_of(*hunt) {
+                for a in store.attacks_of(*hunt)? {
                     let name = a.attacker.clone().unwrap_or_default();
                     let slot = by_attacker.entry(name).or_insert((0, 0, 0));
                     slot.0 += 1;
@@ -697,13 +692,13 @@ pub fn analytics(
             ];
             let mut rows: BTreeMap<String, i64> = BTreeMap::new();
             for hunt in &hunts.ids {
-                for a in store.attacks_of(*hunt) {
+                for a in store.attacks_of(*hunt)? {
                     if !a.ours {
                         continue;
                     }
                     match a.right_gear.or(a.left_gear) {
                         Some(id) => {
-                            let name = store.name(id).to_string();
+                            let name = store.name(id)?;
                             *rows.entry(name).or_insert(0) += 1;
                         }
                         None => *rows.entry(String::from("(hands not known)")).or_insert(0) += 1,
@@ -725,26 +720,23 @@ fn aim_report(store: &Store, hunts: &report::Hunts) -> Lines {
     let mut aimed = (0i64, Vec::<i64>::new(), 0i64);
     let mut unaimed = (0i64, Vec::<i64>::new(), 0i64);
     for hunt in &hunts.ids {
-        for a in store.attacks_of(*hunt) {
+        for a in store.attacks_of(*hunt)? {
             if !a.ours {
                 continue;
             }
             let slot = if a.aimed { &mut aimed } else { &mut unaimed };
             slot.0 += 1;
-            let hits: i64 = store
-                .hits_of(a.id)
-                .iter()
-                .map(|h| h.damage)
-                .sum();
+            let hits: i64 = store.hits_of(a.id)?.iter().map(|h| h.damage).sum();
             slot.1.push(hits);
         }
-        for c in store.creatures_of(*hunt) {
+        for c in store.creatures_of(*hunt)? {
             if c.killed_at.is_none() {
                 continue;
             }
-            let killer = c.killed_by_attack_id.and_then(|id| {
-                store.attacks.iter().find(|a| a.id == id)
-            });
+            let killer = match c.killed_by_attack_id {
+                Some(id) => store.attack_by_id(id)?,
+                None => None,
+            };
             match killer.map(|a| a.aimed) {
                 Some(true) => aimed.2 += 1,
                 Some(false) => unaimed.2 += 1,
@@ -787,9 +779,11 @@ mod tests {
 
     fn store() -> Store {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
-        s.hunt_ended(a, 1_000_600);
-        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
+        s.hunt_ended(a, 1_000_600).expect("ended");
+        let kobold = s
+            .creature_seen(a, "kobold", "a kobold", 1_000_100)
+            .expect("creature");
         let swing = s.attack(Attack {
             hunt_id: a,
             seq: 1,
@@ -801,7 +795,8 @@ mod tests {
             aimed: true,
             outcome: Some(String::from("hit")),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: swing,
             hunt_id: a,
@@ -809,8 +804,10 @@ mod tests {
             seq: 1,
             damage: 40,
             ..Hit::default()
-        });
-        s.kill(a, kobold, 1_000_400, Some(swing), "kill");
+        })
+        .expect("hit");
+        s.kill(a, kobold, 1_000_400, Some(swing), "kill")
+            .expect("kill");
         let inbound = s.attack(Attack {
             hunt_id: a,
             seq: 2,
@@ -821,15 +818,20 @@ mod tests {
             inbound: true,
             outcome: Some(String::from("intercept")),
             ..Attack::default()
-        });
-        let _ = inbound;
-        s.statuses.push(Status {
-            attack_id: 2,
-            creature_id: Some(kobold),
-            status: String::from("ds"),
-            value: Some(120),
-            ..Status::default()
-        });
+        })
+        .expect("attack");
+        s.status(
+            a,
+            1_000_500,
+            Status {
+                attack_id: inbound,
+                creature_id: Some(kobold),
+                status: String::from("ds"),
+                value: Some(120),
+                ..Status::default()
+            },
+        )
+        .expect("status");
         s
     }
 
@@ -852,7 +854,7 @@ mod tests {
         let lines = hp(&s, "Testchar", None, &Scope::Last).expect("runs");
         assert_eq!(lines[0], "HP - SESSION #1");
         assert_eq!(lines[1], "+ID+Our DMG+All DMG+");
-        let id = s.creatures[0].id;
+        let id = s.creatures_of(1).unwrap()[0].id;
         assert_eq!(lines[2], format!("|{}|40|40|", id));
         assert_eq!(lines[3], "Average: 40");
     }
@@ -878,12 +880,13 @@ mod tests {
     #[test]
     fn effects_lists_what_was_up() {
         let mut s = store();
-        s.effects.push(crate::store::Effect {
+        s.effect(crate::store::Effect {
             hunt_id: 1,
             name: String::from("barkskin"),
             began_at: 1_000_000,
             ..Default::default()
-        });
+        })
+        .expect("effect");
         let lines = effects(&s, "Testchar", &Scope::Last).expect("runs");
         assert!(lines[0].starts_with("With and without what was up"));
         assert!(lines.iter().any(|l| l.starts_with("|barkskin|")));

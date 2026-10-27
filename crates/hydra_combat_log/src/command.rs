@@ -573,9 +573,11 @@ mod answer_tests {
 
     fn store() -> Store {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
-        s.hunt_ended(a, 1_000_600);
-        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
+        s.hunt_ended(a, 1_000_600).expect("ended");
+        let kobold = s
+            .creature_seen(a, "kobold", "a kobold", 1_000_100)
+            .expect("creature");
         let swing = s.attack(Attack {
             hunt_id: a,
             seq: 1,
@@ -586,7 +588,8 @@ mod answer_tests {
             ours: true,
             outcome: Some(String::from("hit")),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: swing,
             hunt_id: a,
@@ -594,7 +597,8 @@ mod answer_tests {
             seq: 1,
             damage: 25,
             ..Hit::default()
-        });
+        })
+        .expect("hit");
         s
     }
 

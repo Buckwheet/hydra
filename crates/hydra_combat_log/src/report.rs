@@ -172,10 +172,9 @@ pub fn section(title: &str, heads: &[&str], rows: &[Vec<String>]) -> Vec<String>
 /// The session ids come from `SELECT id FROM hunts WHERE instance = ?1 AND
 /// character = ?2 ORDER BY id` (0x102412509).
 pub fn resolve(store: &Store, character: &str, scope: &Scope) -> Result<Hunts, Error> {
-    /// The statement 0x10135306c prepares through the statement cache.
-    const SQL: &str = "SELECT id FROM hunts WHERE instance = ?1 AND character = ?2 ORDER BY id";
-    let _ = SQL;
-    let ids = store.hunts_of(store.instance, character);
+    // The statement 0x10135306c prepares through the statement cache —
+    // `Store::hunts_of`, executed by SQLite.
+    let ids = store.hunts_of(store.instance, character)?;
     if ids.is_empty() {
         return Err(Error::new("No hunts recorded yet."));
     }
@@ -244,7 +243,7 @@ pub(crate) fn is_hit(outcome: &str) -> bool {
 pub fn inbound_of(store: &Store, hunts: &Hunts) -> Result<Inbound, Error> {
     let mut out = Inbound::default();
     for id in &hunts.ids {
-        for a in store.attacks_of(*id) {
+        for a in store.attacks_of(*id)? {
             if !a.inbound {
                 continue;
             }
@@ -305,10 +304,10 @@ pub const HUNT_HEADS: [&str; 8] = [
 ];
 
 /// Add up one session's row.
-pub fn hunt_row(store: &Store, hunt_id: i64) -> HuntRow {
-    let hunt = match store.hunt(hunt_id) {
+pub fn hunt_row(store: &Store, hunt_id: i64) -> Result<HuntRow, Error> {
+    let hunt = match store.hunt(hunt_id)? {
         Some(h) => h,
-        None => return HuntRow::default(),
+        None => return Ok(HuntRow::default()),
     };
     let mut row = HuntRow {
         id: hunt.id,
@@ -317,13 +316,13 @@ pub fn hunt_row(store: &Store, hunt_id: i64) -> HuntRow {
         last_event: hunt.started_at,
         ..HuntRow::default()
     };
-    for a in store.attacks_of(hunt_id) {
+    for a in store.attacks_of(hunt_id)? {
         row.last_event = row.last_event.max(a.occurred_at);
         if a.ours {
             row.attacks += 1;
         }
     }
-    for c in store.creatures_of(hunt_id) {
+    for c in store.creatures_of(hunt_id)? {
         row.last_event = row.last_event.max(c.last_seen);
         match c.kill_credit.as_deref() {
             Some("kill") => row.kills += 1,
@@ -332,10 +331,10 @@ pub fn hunt_row(store: &Store, hunt_id: i64) -> HuntRow {
             _ => row.alive += 1,
         }
     }
-    for h in store.hits.iter().filter(|h| h.hunt_id == hunt_id) {
-        row.damage += h.damage;
-    }
-    row
+    // `SELECT COALESCE(SUM(damage), 0) FROM hits WHERE hunt_id = ?1`, the sum
+    // the recovered row reads through `Row::get`.
+    row.damage = store.hunt_damage(hunt_id)?;
+    Ok(row)
 }
 
 impl HuntRow {
@@ -364,11 +363,10 @@ impl HuntRow {
 pub fn sessions(store: &Store, character: &str, scope: &Scope) -> Lines {
     const HEAD: &str = "Hunts - {} (cstats <id> for one):";
     let hunts = resolve(store, character, scope)?;
-    let rows: Vec<Vec<String>> = hunts
-        .ids
-        .iter()
-        .map(|id| hunt_row(store, *id).cells())
-        .collect();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for id in &hunts.ids {
+        rows.push(hunt_row(store, *id)?.cells());
+    }
     Ok(section(
         &HEAD.replace("{}", &hunts.label),
         &HUNT_HEADS,
@@ -394,50 +392,32 @@ pub struct Totals {
 }
 
 /// Add up one session.
-pub fn totals(store: &Store, hunt_id: i64) -> Totals {
+pub fn totals(store: &Store, hunt_id: i64) -> Result<Totals, Error> {
     let mut t = Totals::default();
-    let mut roots: BTreeMap<i64, ()> = BTreeMap::new();
-    for a in store.attacks_of(hunt_id) {
-        if a.ours {
-            t.attacks += 1;
-            roots.insert(a.root_attack_id.unwrap_or(a.id), ());
-        }
-    }
-    t.sequences = roots.len() as i64;
+    // The recovered pair of counts: the own swings and the sequences they form.
+    let (attacks, sequences) = store.attack_and_sequence_counts(hunt_id)?;
+    t.attacks = attacks;
+    t.sequences = sequences;
     t.inbound = inbound_of(
         store,
         &Hunts {
             label: String::new(),
             ids: vec![hunt_id],
         },
-    )
-    .unwrap_or_default();
-    for c in store.creatures_of(hunt_id) {
+    )?;
+    for c in store.creatures_of(hunt_id)? {
         match c.kill_credit.as_deref() {
             Some("kill") => t.kills += 1,
             Some("assist") => t.assists += 1,
             _ => {}
         }
     }
-    for h in store.hits.iter().filter(|h| h.hunt_id == hunt_id) {
-        let ours = store
-            .attacks
-            .iter()
-            .find(|a| a.id == h.attack_id)
-            .map(|a| a.ours)
-            .unwrap_or(false);
-        let flared = h
-            .flare_id
-            .and_then(|f| store.flares.iter().find(|x| x.id == f))
-            .map(|f| f.ours)
-            .unwrap_or(false);
-        if ours || flared {
-            t.dealt += h.damage;
-        } else {
-            t.taken += h.damage;
-        }
-    }
-    t
+    // The two damage sums, in one pass over the session's hits: a hit of an own
+    // attack or of an own flare is dealt, everything else is taken.
+    let (dealt, taken) = store.damage_split(hunt_id)?;
+    t.dealt = dealt;
+    t.taken = taken;
+    Ok(t)
 }
 
 /// One session's report.
@@ -458,7 +438,7 @@ pub fn session(store: &Store, character: &str, scope: &Scope, full: bool) -> Lin
         }
     };
     let id = hunts.ids[hunts.ids.len() - 1];
-    let row = hunt_row(store, id);
+    let row = hunt_row(store, id)?;
     let mut out = Vec::new();
     out.push(format!("=== SESSION REPORT #{} ===", id));
     out.push(format!("Character: {}", character));
@@ -473,7 +453,7 @@ pub fn session(store: &Store, character: &str, scope: &Scope, full: bool) -> Lin
         // 0x102412550 holds the word the open case prints.
         None => String::from("Ended: ACTIVE"),
     });
-    let t = totals(store, id);
+    let t = totals(store, id)?;
     out.push(format!(
         "  Total Attacks: {}    Sequences: {}    Inbound: {}",
         t.attacks, t.sequences, t.inbound.attacks
@@ -482,7 +462,7 @@ pub fn session(store: &Store, character: &str, scope: &Scope, full: bool) -> Lin
         "  Kills: {}    Assists: {}    Damage Dealt: {}    Damage Taken: {}",
         t.kills, t.assists, t.dealt, t.taken
     ));
-    let creatures = store.creatures_of(id);
+    let creatures = store.creatures_of(id)?;
     if !full {
         out.push(format!("CREATURES ENCOUNTERED ({}):", creatures.len()));
     }
@@ -522,7 +502,7 @@ pub fn session(store: &Store, character: &str, scope: &Scope, full: bool) -> Lin
 /// `  {} more came up during the hunt {}` (0x103e67788).
 pub fn effects_line(store: &Store, hunt_id: i64) -> Lines {
     let mut names: Vec<String> = Vec::new();
-    for effect in store.effects_of(hunt_id) {
+    for effect in store.effects_of(hunt_id)? {
         if !names.iter().any(|n| n == &effect.name) {
             names.push(effect.name.clone());
         }
@@ -547,7 +527,7 @@ pub fn effects_line(store: &Store, hunt_id: i64) -> Lines {
 /// hunt_gemstones WHERE hunt_id = ?1 ORDER BY number, id` (0x10241227f); each
 /// row prints as `{} {}/{}` (0x103e67848).
 pub fn gemstones_line(store: &Store, hunt_id: i64) -> Lines {
-    let rows = store.gemstones_of(hunt_id);
+    let rows = store.gemstones_of(hunt_id)?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -572,7 +552,7 @@ pub fn gemstones_line(store: &Store, hunt_id: i64) -> Lines {
 /// `(i64, Option<i64>, String)` — printing `  Worn: {}` and, for every later
 /// change, `  Worn list changed at {}` (0x103e68245).
 pub fn worn_line(store: &Store, hunt_id: i64) -> Lines {
-    let rows = store.gear_of(hunt_id, "worn");
+    let rows = store.gear_of(hunt_id, "worn")?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -634,23 +614,22 @@ pub fn aggregate(store: &Store, character: &str, scope: &Scope) -> Lines {
     let mut out = Vec::new();
     out.push(format!("=== AGGREGATE REPORT - {} ===", hunts.label));
     out.push(format!("Character: {}", character));
-    let first = store.hunt(hunts.ids[0]).map(|h| h.started_at).unwrap_or(0);
-    let last = hunts
-        .ids
-        .iter()
-        .filter_map(|id| store.hunt(*id))
-        .map(|h| h.ended_at.unwrap_or(h.started_at))
-        .max()
-        .unwrap_or(first);
+    let first = store.hunt(hunts.ids[0])?.map(|h| h.started_at).unwrap_or(0);
+    let mut last = first;
+    for id in &hunts.ids {
+        if let Some(h) = store.hunt(*id)? {
+            last = last.max(h.ended_at.unwrap_or(h.started_at));
+        }
+    }
     let mut total_time = 0u64;
     let mut t = Totals::default();
     let mut creatures: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for id in &hunts.ids {
-        let row = hunt_row(store, *id);
+        let row = hunt_row(store, *id)?;
         if let Some(ended) = row.ended_at {
             total_time += ended.saturating_sub(row.started_at) as u64;
         }
-        let one = totals(store, *id);
+        let one = totals(store, *id)?;
         t.attacks += one.attacks;
         t.sequences += one.sequences;
         t.kills += one.kills;
@@ -661,7 +640,7 @@ pub fn aggregate(store: &Store, character: &str, scope: &Scope) -> Lines {
         t.inbound.landed += one.inbound.landed;
         t.inbound.missed += one.inbound.missed;
         t.inbound.intercepted += one.inbound.intercepted;
-        for c in store.creatures_of(*id) {
+        for c in store.creatures_of(*id)? {
             let slot = creatures.entry(c.noun.clone()).or_insert((0, 0));
             slot.0 += 1;
             if c.killed_at.is_some() {
@@ -736,8 +715,8 @@ pub fn abilities(store: &Store, character: &str, scope: &Scope) -> Lines {
     let mut flares: BTreeMap<String, i64> = BTreeMap::new();
     let mut inbound: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     for id in &hunts.ids {
-        for a in store.attacks_of(*id) {
-            for f in store.flares_of(a.id) {
+        for a in store.attacks_of(*id)? {
+            for f in store.flares_of(a.id)? {
                 if f.ours {
                     *flares.entry(f.name.clone()).or_insert(0) += 1;
                 }
@@ -755,7 +734,7 @@ pub fn abilities(store: &Store, character: &str, scope: &Scope) -> Lines {
             if !a.ours {
                 continue;
             }
-            let hits = store.hits_of(a.id);
+            let hits = store.hits_of(a.id)?;
             let slot = by_name.entry(a.name.clone()).or_insert((0, 0, 0, 0, 0));
             slot.0 += 1;
             if !hits.is_empty() {
@@ -837,13 +816,13 @@ mod tests {
     /// inbound swing, a kill and a crit.
     fn store() -> Store {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
-        let b = s.hunt_started(1, "Testchar", 2_000_000);
-        let c = s.hunt_started(1, "Testchar", 3_000_000);
-        s.hunt_started(1, "Other", 4_000_000);
-        s.hunt_ended(a, 1_000_600);
-        s.hunt_ended(b, 2_001_200);
-        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
+        let b = s.hunt_started(1, "Testchar", 2_000_000).expect("hunt");
+        let c = s.hunt_started(1, "Testchar", 3_000_000).expect("hunt");
+        s.hunt_started(1, "Other", 4_000_000).expect("hunt");
+        s.hunt_ended(a, 1_000_600).expect("ended");
+        s.hunt_ended(b, 2_001_200).expect("ended");
+        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100).expect("creature");
         let swing = s.attack(Attack {
             hunt_id: a,
             seq: 1,
@@ -855,7 +834,8 @@ mod tests {
             outcome: Some(String::from("hit")),
             root_attack_id: Some(0),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: swing,
             hunt_id: a,
@@ -867,8 +847,10 @@ mod tests {
             crit_rank: Some(3),
             crit_type: Some(String::from("crush")),
             ..Hit::default()
-        });
-        s.kill(a, kobold, 1_000_400, Some(swing), "kill");
+        })
+        .expect("hit");
+        s.kill(a, kobold, 1_000_400, Some(swing), "kill")
+            .expect("kill");
         let inbound = s.attack(Attack {
             hunt_id: a,
             seq: 2,
@@ -879,7 +861,8 @@ mod tests {
             inbound: true,
             outcome: Some(String::from("hit")),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: inbound,
             hunt_id: a,
@@ -887,7 +870,8 @@ mod tests {
             seq: 1,
             damage: 7,
             ..Hit::default()
-        });
+        })
+        .expect("hit");
         s.flare(Flare {
             attack_id: inbound,
             seq: 1,
@@ -895,32 +879,36 @@ mod tests {
             ours: true,
             eligible: true,
             ..Flare::default()
-        });
-        s.effects.push(Effect {
+        })
+        .expect("flare");
+        s.effect(Effect {
             hunt_id: a,
             name_id: 0,
             name: String::from("strength"),
             began_at: 1_000_050,
             ended_at: Some(1_000_450),
             ..Effect::default()
-        });
-        s.effects.push(Effect {
+        })
+        .expect("effect");
+        s.effect(Effect {
             hunt_id: a,
             name_id: 0,
             name: String::from("bravery"),
             began_at: 1_000_060,
             ended_at: Some(1_000_460),
             ..Effect::default()
-        });
-        s.gear.push(GearRow {
+        })
+        .expect("effect");
+        s.gear(GearRow {
             hunt_id: a,
             gear_id: 0,
             slot: String::from("worn"),
             name: String::from("a cuirbouilli coat"),
             began_at: 1_000_000,
             ..GearRow::default()
-        });
-        s.gemstones.push(Gemstone {
+        })
+        .expect("gear");
+        s.gemstone(Gemstone {
             hunt_id: a,
             number: 1,
             description: String::from("a blue sapphire"),
@@ -928,11 +916,13 @@ mod tests {
             rank: 2,
             ranks: 4,
             ..Gemstone::default()
-        });
-        s.creatures.push(Creature {
+        })
+        .expect("gemstone");
+        s.creature(Creature {
             hunt_id: c,
             ..Creature::default()
-        });
+        })
+        .expect("creature");
         s
     }
 
@@ -1107,7 +1097,7 @@ mod tests {
     #[test]
     fn hunt_row_counts_the_session() {
         let s = store();
-        let row = hunt_row(&s, 1);
+        let row = hunt_row(&s, 1).expect("row");
         assert_eq!(row.id, 1);
         assert_eq!(row.attacks, 1);
         assert_eq!(row.kills, 1);

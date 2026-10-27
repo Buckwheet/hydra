@@ -14,19 +14,37 @@
 //!                    +0x28 SessionId next                 (u32)
 //! Who       (0x48)   3 × String
 //! AddError  (0x30)   2 × String
-//! Hosted    (0xa8)   Who@0x00, ten session handles @0x48..0xa0, task @0xa0
+//! Hosted    (0xa8)   Who@0x00, handles@0x48 (0x50), token@0x98, task@0xa0
 //! ```
 //!
-//! The original linked `tokio`, `tokio_util`, `hydra_session`, `hydra_board` and
-//! `hydra_table`.  This is a std-only port: the runtime handle, the session's
-//! channels and the task handle are expressed as seams marked `Departure:` /
-//! `UNKNOWN:`.  See `NOTES.md` for the function table and the evidence.
+//! Phase 1 measured the real types against those numbers and they agree: with
+//! tokio 1.53.1 `Option<Handle>` is still 16 bytes and `JoinHandle<()>` /
+//! `CancellationToken` are one word each, so `Host` is 0x30 and `Hosted` is 0xa8.
+//!
+//! The original linked `tokio` 1.53.1, `tokio_util`, `hydra_session`, `hydra_board`
+//! and `hydra_table`.  **Phase 1** reconnects the runtime to the real crates: the
+//! handle at `Host+0x00` is a `tokio::runtime::Handle`, the task at `Hosted+0xa0`
+//! is a `tokio::task::JoinHandle`, the token at `Hosted+0x98` is a real
+//! `tokio_util::sync::CancellationToken`, and `Hosted::stop` is the recovered
+//! `async fn` over `tokio::time::timeout` + `AbortHandle::abort`.  What is still a
+//! seam — the session body (`SupervisedSession`) and the ten session handles — is
+//! marked `Departure:` / `UNKNOWN:` below and in `NOTES.md`.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::future::Future;
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+/// The runtime handle at `Host+0x00`, re-exported so callers can name the type
+/// they pass to [`Host::on`].
+///
+/// Recovered: `drop_in_place<hydra_host::Host>` @0x10126f764 names it
+/// `core::option::Option<tokio::runtime::handle::Handle>`.  This is the real
+/// `tokio` type (Phase 1), not a stand-in.
+pub use tokio::runtime::Handle;
 
 /// How long [`Hosted::stop`] waits for a session task to end.
 ///
@@ -47,110 +65,22 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// alias is the safest reading; nothing in the binary wraps or unwraps it.
 pub type SessionId = u32;
 
-// ---------------------------------------------------------------------------
-// Runtime seams
-// ---------------------------------------------------------------------------
-
 /// One hosted session's task — the value at `Hosted+0xa0`.
 ///
 /// Recovered: [`Hosted::is_running`] @0x1013b0978 loads `[self+0xa0]` and calls
 /// `tokio::runtime::task::state::State::load`, and `drop_in_place<Hosted>`
 /// @0x1013a0760 ends with `State::drop_join_handle_fast` /
 /// `RawTask::drop_join_handle_slow`.  So `Hosted+0xa0` is a
-/// `tokio::runtime::task::JoinHandle<hydra_session::supervisor::SupervisedEnd>`.
+/// `tokio::runtime::task::JoinHandle<T>`, one word wide.
 ///
-/// Departure: tokio is unavailable offline, so a task is one `std::thread`.
-/// tokio sets the `COMPLETE` flag both when the task returns and when it is
-/// cancelled; a `JoinHandle` reports `is_finished()` in exactly those two cases,
-/// which is what [`Hosted::is_running`] needs.  The `SupervisedEnd` value the
-/// original's handle eventually yields belongs to `hydra_session` and is dropped
-/// here.
-///
-/// A tokio `JoinHandle` is one word; `std::thread::JoinHandle` is three
-/// (`Arc` + `Thread` + `Option<Arc>`), so the port boxes it — [`Hosted`] then
-/// keeps the recovered one-word slot at `+0xa0` and the recovered 0xa8 size.
-pub struct Task(Box<JoinHandle<()>>);
-
-impl Task {
-    /// Run `body` as a session task.
-    pub fn spawn<F>(body: F) -> Task
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        Task(Box::new(std::thread::spawn(body)))
-    }
-
-    /// Has the task completed (returned, panicked or been cancelled)?
-    ///
-    /// This is the `state & COMPLETE != 0` test of @0x1013b0980.
-    pub fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-
-    /// Block until the task ends.
-    pub fn join(self) {
-        let _ = self.0.join();
-    }
-}
-
-impl fmt::Debug for Task {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Task").field(&self.0).finish()
-    }
-}
-
-/// A place to run session tasks — the value at `Host+0x00`.
-///
-/// Recovered: `Host+0x00` is `Option<tokio::runtime::Handle>`.  `Host::on`
-/// takes it as two registers (`tag → +0`, `Arc → +8`) and zeroes the map;
-/// `drop_in_place<Host>` @0x10126f764 proves the type by name
-/// (`Option<tokio::runtime::Handle>`) and drops the `Arc` of whichever of the
-/// two scheduler flavours the tag selects (`cmp x8, #2` = the `None` niche).
-/// `Host::add` is the only reader: `ldr x8, [x23]; cmp x8, #2` @0x1001c7e90
-/// takes `Handle::spawn` when the option is `Some` and the ambient
-/// `tokio::task::spawn` when it is `None`.
-///
-/// Departure: a tokio `Handle` is an `Arc` to a scheduler; here a handle is any
-/// closure that turns a body into a [`Task`].  [`Handle::threads`] spawns a
-/// `std::thread`, which is also what a `Host` created with `Host::on(None)`
-/// does — i.e. the `Some`/`None` distinction no longer changes where the task
-/// runs, only who owns the spawner.
-/// UNKNOWN: the `CurrentThread`/`MultiThread` split (tag 0/1) has no std
-/// equivalent and is dropped.
-#[derive(Clone)]
-pub struct Handle(Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> Task + Send + Sync>);
-
-impl Handle {
-    /// Wrap `spawn` as a runtime handle.
-    pub fn new<F>(spawn: F) -> Handle
-    where
-        F: Fn(Box<dyn FnOnce() + Send>) -> Task + Send + Sync + 'static,
-    {
-        Handle(Arc::new(spawn))
-    }
-
-    /// The only flavour this port has: one thread per task.
-    pub fn threads() -> Handle {
-        Handle::new(|body| Task::spawn(move || body()))
-    }
-
-    /// Run `body` on this runtime.
-    pub fn spawn(&self, body: Box<dyn FnOnce() + Send>) -> Task {
-        (self.0)(body)
-    }
-}
-
-impl Default for Handle {
-    fn default() -> Handle {
-        Handle::threads()
-    }
-}
-
-impl fmt::Debug for Handle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Handle(..)")
-    }
-}
+/// The original's `T` is `hydra_session::supervisor::SupervisedEnd`.  That type
+/// does not exist in this reconstruction (`hydra_session::supervisor` exposes
+/// `jitter`/`backoff`/`answer_between` and no session type), and this crate must
+/// not invent it, so the seam is `JoinHandle<()>`: [`Host::add`] spawns a future
+/// whose output is `()`.  The handle is never awaited for its value here — only
+/// `is_finished`, `abort_handle` and `timeout` are used, exactly like the
+/// recovered code.
+pub type Task = JoinHandle<()>;
 
 // ---------------------------------------------------------------------------
 // Who
@@ -255,7 +185,7 @@ impl std::error::Error for AddError {}
 // Hosted
 // ---------------------------------------------------------------------------
 
-/// The ten handles a running session hands to the host, `Hosted+0x48..+0xa0`.
+/// The session handles the host keeps, `Hosted+0x48..+0x98`.
 ///
 /// Recovered from `drop_in_place<Hosted>` @0x1013a0594, which drops them in
 /// order:
@@ -265,35 +195,50 @@ impl std::error::Error for AddError {}
 /// +0x50  tokio::sync::broadcast::Sender<hydra_session::event::Event>
 /// +0x58  Arc<_>   +0x60 Arc<_>   +0x68 Arc<_>   +0x70 Arc<_>
 /// +0x78  Arc<_>   +0x80 Arc<_>   +0x88 Arc<_>   +0x90 Arc<_>
-/// +0x98  tokio_util::sync::CancellationToken
 /// ```
 ///
 /// (eight independent `Arc::drop_slow` instantiations, so eight distinct
 /// payloads — the `hydra_board::sessions::Sessions` pair plus the session's own
-/// state).
+/// state.)
 ///
-/// UNKNOWN: none of those types is expressible here — they belong to
-/// `hydra_session`, `hydra_board` and `tokio`, and *those* crates depend on this
-/// one.  No function in `hydra_host` reads any of the ten, so the port keeps one
-/// opaque, correctly-sized slot: the `Hosted` offsets stay as recovered.
+/// Departure (**still a seam after Phase 1**): those ten payload types live in
+/// `hydra_session`/`hydra_board`, and neither crate exposes them — `hydra_session`
+/// has no `SupervisedSession`/`SupervisedEnd`, so the handles cannot be named,
+/// cloned or read here.  No function in `hydra_host` reads any of them, so the
+/// port keeps one opaque, correctly-sized slot of ten words (0x50 bytes): the
+/// `Hosted` offsets stay as recovered.  The recovered *token* at `+0x98` is no
+/// longer inside this array — it is the real `CancellationToken` field below.
 #[derive(Default)]
 // Dead weight by design: the slot only holds the recovered offsets, and keeping it
 // is what makes `Hosted` 0xa8 bytes with the task at +0xa0.
 #[allow(dead_code)]
-struct Handles([usize; 11]);
+struct Handles([usize; 10]);
 
 /// One session the host is keeping: the map value, `0xa8` bytes.
 ///
-/// Recovered: `Hosted+0x00` is the [`Who`] (0x48 bytes), `+0x48..+0xa0` are the
-/// session's handles, and `+0xa0` is the task that [`Hosted::is_running`] and
-/// [`Hosted::stop`] follow.
-// `repr(C)`: keeps `who` at +0x00, the handles at +0x48 and the task at +0xa0.
+/// Recovered: `Hosted+0x00` is the [`Who`] (0x48 bytes), `+0x48..+0x98` are the
+/// session's handles, `+0x98` is the `CancellationToken`, and `+0xa0` is the task
+/// that [`Hosted::is_running`] and [`Hosted::stop`] follow.
+// `repr(C)`: keeps `who` at +0x00, the handles at +0x48, the token at +0x98 and
+// the task at +0xa0.
 #[repr(C)]
 pub struct Hosted {
     /// The identity the session was added under.
     pub who: Who,
     /// The session's channels (see `Handles`).
     handles: Handles,
+    /// The session's cancellation token; `+0x98` in the original.
+    ///
+    /// Recovered: `drop_in_place<Hosted>` calls `CancellationToken::drop` at
+    /// `+0x98`, `Host::add` takes a `CancellationToken::clone` out of the session
+    /// (`ldadd x8, x8, [x21, #0x15d0]`) for it, and `Hosted::stop` cancels it
+    /// @0x10006c180.  Phase 1: the real `tokio_util::sync::CancellationToken`.
+    ///
+    /// Departure: the original *cloned the session's own* token, so the session
+    /// kept a second clone and observed the cancel.  Here the host creates the
+    /// token (it has no session type to ask) and lends it out through
+    /// [`Hosted::stop_token`]; the seam is documented in `NOTES.md` §4a.
+    token: CancellationToken,
     /// The spawned task; `+0xa0` in the original.
     task: Task,
 }
@@ -309,8 +254,21 @@ impl Hosted {
     /// tst  x0, #0x2             ; the COMPLETE bit
     /// cset w0, eq               ; running == !complete
     /// ```
+    ///
+    /// i.e. `!JoinHandle::is_finished()`: a task counts as running from spawn
+    /// until it returns *or* is cancelled.
     pub fn is_running(&self) -> bool {
         !self.task.is_finished()
+    }
+
+    /// A clone of the session's cancellation token, the recovered `Hosted+0x98`.
+    ///
+    /// **Phase 1 addition** (not a recovered function): the original handed the
+    /// same token to the session, the relay and the player log, so those holders
+    /// could wait for shutdown; here [`Hosted::stop`] is the only writer, so
+    /// readers need this accessor.  Waiters use `token.cancelled()`.
+    pub fn stop_token(&self) -> CancellationToken {
+        self.token.clone()
     }
 
     /// Ask the session to stop and wait up to [`STOP_TIMEOUT`] for its task.
@@ -326,28 +284,31 @@ impl Hosted {
     ///    around `JoinHandle::poll`; when it elapses the task is aborted through
     ///    `AbortHandle::abort` @0x10006c2ec.
     ///
-    /// Departure: the session command channel is a `hydra_session` type that this
-    /// crate cannot name, so the caller passes the quit step; the cancellation
-    /// token sits inside `Handles` and is not modelled; and a `std::thread`
-    /// cannot be aborted, so a task that overruns the timeout is left detached
-    /// (it keeps running) instead of aborted.
-    pub fn stop<Q>(self, quit: Q) -> bool
+    /// Phase 1: steps 2 and 3 are the real ones — the token is cancelled and the
+    /// timeout/abort pair is `tokio::time::timeout` over `&mut JoinHandle` with
+    /// `JoinHandle::abort_handle`.  Departure (**still a seam**):
+    /// `hydra_session::command::SessionHandle` has no recovered `quit` (it offers
+    /// `stop(reason)`, which trips its own token — a different operation), so the
+    /// caller passes the quit step.  See `NOTES.md` §4a.
+    pub async fn stop<Q>(self, quit: Q) -> bool
     where
         Q: FnOnce(),
     {
-        if !self.is_running() {
-            return true;
+        if self.is_running() {
+            quit();
         }
-        quit();
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while !self.task.is_finished() {
-            if Instant::now() >= deadline {
-                return false;
+        self.token.cancel();
+        // The abort handle has to be taken before the join handle is borrowed by
+        // `timeout`, exactly as the original kept it across the poll.
+        let abort = self.task.abort_handle();
+        let mut task = self.task;
+        match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
+            Ok(_) => true,
+            Err(_) => {
+                abort.abort();
+                false
             }
-            std::thread::sleep(Duration::from_millis(1));
         }
-        self.task.join();
-        true
     }
 }
 
@@ -366,10 +327,12 @@ impl fmt::Debug for Hosted {
 
 /// The table of hosted sessions: `0x30` bytes.
 ///
-/// Recovered offsets: `+0x00` `Option<Handle>` (16 bytes), `+0x10` the
-/// `BTreeMap<SessionId, Hosted>` (`root@+0x10`, `height@+0x18`, `len@+0x20` —
-/// `Host::on` zeroes only root and length, because a null root makes the height
-/// dead), `+0x28` the next [`SessionId`] (u32).
+/// Recovered offsets: `+0x00` `Option<tokio::runtime::Handle>` (16 bytes; the
+/// real type is also 16 in tokio 1.53.1 — measured in
+/// `tests::host_layout`), `+0x10` the `BTreeMap<SessionId, Hosted>`
+/// (`root@+0x10`, `height@+0x18`, `len@+0x20` — `Host::on` zeroes only root and
+/// length, because a null root makes the height dead), `+0x28` the next
+/// [`SessionId`] (u32).
 // `repr(C)`: keeps `rt` at +0x00, the map at +0x10 and `next` at +0x28 (0x30
 // bytes in total, as recovered).
 #[repr(C)]
@@ -395,7 +358,9 @@ impl Host {
     /// str  x0,  [x8]             ; rt.0 = x0
     /// ```
     ///
-    /// i.e. `Host { rt, sessions: BTreeMap::new(), next: 0 }`.
+    /// i.e. `Host { rt, sessions: BTreeMap::new(), next: 0 }` — with the real
+    /// tokio types the same expression still builds a `0x30`-byte struct with
+    /// exactly those offsets.
     pub fn on(rt: Option<Handle>) -> Host {
         Host {
             rt,
@@ -479,22 +444,24 @@ impl Host {
     ///    `String`); `Some` is answered as the error without spawning anything
     ///    (@0x1001c7eb0).
     /// 2. `let id = self.next; self.next += 1;` (@0x1001c7d90).
-    /// 3. spawn the session task: on `Some(handle)` box the future and call
-    ///    `Handle::spawn` @0x1001c7f78, on `None` call the ambient
-    ///    `tokio::task::spawn::spawn` @0x1001c7ea8.
-    /// 4. insert `Hosted { who, …session handles…, task }` under `id`
+    /// 3. spawn the session future: on `Some(handle)` `Handle::spawn`
+    ///    @0x1001c7f78, on `None` the ambient `tokio::task::spawn::spawn`
+    ///    @0x1001c7ea8.
+    /// 4. insert `Hosted { who, …session handles…, token, task }` under `id`
     ///    (`VacantEntry::insert_entry` @0x1001c8158) and answer `Ok(id)`
     ///    (`str w25, [x19, #0x8]`, `str isize::MIN, [x19]` @0x1001c815c).
     ///
     /// The original signature is
     /// `fn add(&mut self, who: Who, session: SupervisedSession<LiveConnector>) -> Result<SessionId, AddError>`;
-    /// that session type lives in `hydra_session`/`hydra_table`, which depend on
-    /// this crate, so the port takes the task body instead: the guard, the id
-    /// allocation, the spawn decision and the insert are the original's, and the
-    /// ten session handles (`Handles`) are not reproduced.
+    /// `SupervisedSession`/`LiveConnector` do not exist in this reconstruction
+    /// (`hydra_session`/`hydra_table` do not expose that shape), so the port
+    /// takes the session's future instead.  Phase 1: that future is spawned by
+    /// the real tokio (`Handle::spawn` / `tokio::spawn`), so `Hosted+0xa0` is a
+    /// real `JoinHandle`; only the ten session handles (`Handles`) are not
+    /// reproduced.
     pub fn add<F>(&mut self, who: Who, body: F) -> Result<SessionId, AddError>
     where
-        F: FnOnce() + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         if let Some(err) = self.may_add(&who.name) {
             return Err(err);
@@ -502,14 +469,15 @@ impl Host {
         let id = self.next;
         self.next += 1;
         let task = match &self.rt {
-            Some(rt) => rt.spawn(Box::new(body)),
-            None => Task::spawn(body),
+            Some(rt) => rt.spawn(body),
+            None => tokio::spawn(body),
         };
         self.sessions.insert(
             id,
             Hosted {
                 who,
                 handles: Handles::default(),
+                token: CancellationToken::new(),
                 task,
             },
         );

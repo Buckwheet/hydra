@@ -5,10 +5,11 @@
 //! filtering, Ruby discovery, token generation) but uses `std::process`
 //! and `/dev/urandom` instead.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Environment-variable name prefix that carries the Lich password.
 ///
@@ -40,6 +41,36 @@ pub fn is_password(name: &str) -> bool {
 
 /// The directory searched for an installed Ruby 4Lich5 on Windows.
 pub const RUBY4LICH5_ROOT: &str = r"C:\Ruby4Lich5";
+
+/// Build the base `Command` for the Ruby interpreter.
+///
+/// Recovered (`child::command` @ `0x101683638`): `Command::new(ruby)`, then
+/// iterate `std::env::vars_os()` and call `CommandEnv::remove` for every
+/// variable whose name satisfies [`is_password`].  This removes both the
+/// password itself and any helper variables (e.g. the token) that share the
+/// `HYDRA_PASSWORD_` prefix, so the Lich child cannot read them.
+pub fn command(ruby: &Path) -> Command {
+    let mut cmd = Command::new(ruby);
+    filter_password_env(&mut cmd, std::env::vars_os());
+    cmd
+}
+
+/// Apply the recovered `HYDRA_PASSWORD_*` removal pass to an existing
+/// command using an explicit environment iterator.  Split out so tests do
+/// not need to mutate the test process's real environment.
+pub fn filter_password_env<I>(cmd: &mut Command, vars: I)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    for (name, _value) in vars {
+        // The binary feeds the raw OsStr bytes to is_password; use the
+        // lossy view so non-UTF-8 names never panic (they cannot match the
+        // ASCII prefix unless their first 15 bytes are ASCII anyway).
+        if is_password(&name.to_string_lossy()) {
+            cmd.env_remove(&name);
+        }
+    }
+}
 
 /// Find a Ruby interpreter for Lich.
 ///
@@ -242,6 +273,54 @@ fn fill_fallback(buf: &mut [u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn command_removes_password_prefixed_environment_variables() {
+        let mut cmd = Command::new("ruby");
+        cmd.env("HYDRA_PASSWORD_A", "secret-a");
+        cmd.env("hydra_password_B", "secret-b");
+        cmd.env("HYDRA_PASSWORD", "fourteen-bytes");
+        cmd.env("HYDRA_PASSWORDX", "wrong-prefix");
+        cmd.env("KEEP_ME", "kept");
+
+        let vars: Vec<(OsString, OsString)> = vec![
+            ("HYDRA_PASSWORD_A".into(), "secret-a".into()),
+            ("hydra_password_B".into(), "secret-b".into()),
+            ("HYDRA_PASSWORD".into(), "fourteen-bytes".into()),
+            ("HYDRA_PASSWORDX".into(), "wrong-prefix".into()),
+            ("KEEP_ME".into(), "kept".into()),
+        ];
+        filter_password_env(&mut cmd, vars);
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        // Password-prefixed variables were explicitly removed ...
+        for (key, value) in &envs {
+            if key.eq_ignore_ascii_case("HYDRA_PASSWORD_A")
+                || key.eq_ignore_ascii_case("HYDRA_PASSWORD_B")
+            {
+                assert_eq!(value, &None, "{key} should have been removed");
+            }
+        }
+        // ... while a 14-byte name and an unrelated name survive.
+        assert!(envs.contains(&("HYDRA_PASSWORD".into(), Some("fourteen-bytes".into()))));
+        assert!(envs.contains(&("HYDRA_PASSWORDX".into(), Some("wrong-prefix".into()))));
+        assert!(envs.contains(&("KEEP_ME".into(), Some("kept".into()))));
+    }
+
+    #[test]
+    fn command_uses_the_given_ruby_program() {
+        let cmd = command(Path::new("/opt/ruby/bin/ruby"));
+        assert_eq!(cmd.get_program(), "/opt/ruby/bin/ruby");
+    }
 
     #[test]
     fn is_password_accepts_prefix_and_suffixes() {

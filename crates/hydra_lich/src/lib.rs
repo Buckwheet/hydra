@@ -11,6 +11,6 @@ pub mod child;
 pub mod relay;
 
 pub use child::{
-    find_ruby, find_ruby_in, hex_lower, is_password, new_token, newest_version_dir, TokenError,
-    PASSWORD_PREFIX, RUBY4LICH5_ROOT,
+    command, filter_password_env, find_ruby, find_ruby_in, hex_lower, is_password, new_token,
+    newest_version_dir, TokenError, PASSWORD_PREFIX, RUBY4LICH5_ROOT,
 };

@@ -11,3 +11,10 @@ edition = "2021"
 # `CancellationToken`, is compiled unconditionally.
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+# Synthetic Lich stand-in for the loopback integration tests.  Declared as a
+# real bin target so `tests/loopback.rs` can reach it through
+# `env!("CARGO_BIN_EXE_fake_lich")`; nothing in the library references it.
+[[bin]]
+name = "fake_lich"
+path = "tests/bin/fake_lich.rs"

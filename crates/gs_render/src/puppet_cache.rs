@@ -160,39 +160,33 @@ impl Source {
 /// function at `0x1008f1cb4` whose whole body is:
 ///
 /// ```text
-/// a = round(p[0] * 1000.0).clamp(5.0, 1000.0) as u16
+/// a = round(p[0] * 1000.0).clamp(5.0, 500.0) as u16
 /// b = round(p[1] *  100.0).clamp(20.0, 200.0) as u16
 /// c = round(p[2] *  100.0).clamp( 5.0, 100.0) as u8
 /// SplatKey(a as u64 | (b as u64) << 16 | (c as u64) << 32)
 /// ```
 ///
-/// (`fmov w8,#0x447a0000` = 1000.0, `#0x43fa0000` = 1000.0, `#0x42c80000` =
+/// (`fmov w8,#0x447a0000` = 1000.0, `#0x43fa0000` = 500.0, `#0x42c80000` =
 /// 100.0, `#0x43480000` = 200.0, `mov w11,#0xff` = the `u8` clamp; the packing
 /// is `lsl x10,x10,#32; orr x9,x10,x9,lsl #16; orr x0,x9,x8`.)
 ///
-/// `// INTEGRATION:` the parameter type (`gs_puppet::splat::SplatParams`) is not
-/// available on main, so this crate cannot write the `From` impl yet. The two
-/// halves of the seam are [`SplatKey::from_params_parts`] (the exact recovered
-/// conversion) and [`SplatKey::from_params`] (a `&[f32; 3]` view of the three
-/// quantised fields). The parent should add, in `gs_puppet`:
-///
-/// ```ignore
-/// // crates/gs_render/src/puppet_cache.rs, once gs_puppet is merged:
-/// impl From<gs_puppet::splat::SplatParams> for gs_render::puppet_cache::SplatKey {
-///     fn from(p: gs_puppet::splat::SplatParams) -> Self {
-///         SplatKey::from_params_parts(p.size, p.width, p.height)
-///     }
-/// }
-/// ```
-///
-/// where `size`/`width`/`height` are the `f32`s at `+0x00`, `+0x04`, `+0x08` of
-/// `SplatParams` (the only offsets this function reads).
+/// The parameter type is [`gs_puppet::splat::SplatParams`]; its `radius`,
+/// `opacity` and `detail` fields sit at `+0x00`, `+0x04`, `+0x08`, the only
+/// offsets this function reads. [`SplatKey::from_params_parts`] is the exact
+/// recovered conversion and [`SplatKey::from_params`] is the `[f32; 3]` view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SplatKey(pub u64);
 
+impl From<gs_puppet::splat::SplatParams> for SplatKey {
+    /// `<SplatKey as From<gs_puppet::splat::SplatParams>>::from` @0x1008f1cb4.
+    fn from(p: gs_puppet::splat::SplatParams) -> SplatKey {
+        SplatKey::from_params_parts(p.radius, p.opacity, p.detail)
+    }
+}
+
 impl SplatKey {
     /// The three quantisation clamps, as recovered.
-    pub const SIZE_RANGE: (f32, f32) = (5.0, 1000.0);
+    pub const SIZE_RANGE: (f32, f32) = (5.0, 500.0);
     pub const WIDTH_RANGE: (f32, f32) = (20.0, 200.0);
     pub const HEIGHT_RANGE: (f32, f32) = (5.0, 100.0);
 
@@ -2330,17 +2324,22 @@ mod tests {
         assert_eq!(k.height(), 50);
         assert_eq!(k.0, 50 | 50 << 16 | 50 << 32);
 
-        // Clamps: (5..1000, 20..200, 5..100).
+        // Clamps: (5..500, 20..200, 5..100).
         let low = SplatKey::from_params([0.0, 0.0, 0.0]);
         assert_eq!((low.size(), low.width(), low.height()), (5, 20, 5));
         let high = SplatKey::from_params([2.0, 3.0, 2.0]);
-        assert_eq!((high.size(), high.width(), high.height()), (1000, 200, 100));
+        assert_eq!((high.size(), high.width(), high.height()), (500, 200, 100));
         // round() is `frinta` (half away from zero).
         let r = SplatKey::from_params_parts(0.0055, 0.205, 0.055);
         assert_eq!((r.size(), r.width(), r.height()), (6, 21, 6));
-        assert_eq!(SplatKey::SIZE_RANGE, (5.0, 1000.0));
+        assert_eq!(SplatKey::SIZE_RANGE, (5.0, 500.0));
         assert_eq!(SplatKey::WIDTH_RANGE, (20.0, 200.0));
         assert_eq!(SplatKey::HEIGHT_RANGE, (5.0, 100.0));
+
+        // The cross-crate `From<gs_puppet::splat::SplatParams>` seam.
+        let p = gs_puppet::splat::SplatParams::new(0.05, 0.5, 0.5);
+        assert_eq!(SplatKey::from(p), SplatKey::from_params([0.05, 0.5, 0.5]));
+        assert_eq!(SplatKey::from(p).0, 50 | 50 << 16 | 50 << 32);
     }
 
     #[test]

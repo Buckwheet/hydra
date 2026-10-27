@@ -8,8 +8,9 @@ edition = "2021"
 #   * `gs_base::body::part_label`   (`bl` at 0x1008f4610, 0x1008fe3f8, ...)
 #   * `gs_base::status::Statuses`   (`has_name` / `resolved`, bl at 0x1008f41b4 ...)
 #
-# `gs_puppet` is deliberately *not* a dependency: its recovered `SplatParams`
-# does not exist on main yet, so a path dependency would break this crate's
-# gate.  See `NOTES.md` section "Integration gap" for the seam that replaces it.
+# `gs_puppet` supplies `splat::SplatParams`, the parameter type of the binary's
+# `<SplatKey as From<gs_puppet::splat::SplatParams>>::from`.  See `NOTES.md`
+# section "Integration gap".
 [dependencies]
 gs_base = { path = "../gs_base" }
+gs_puppet = { path = "../gs_puppet" }

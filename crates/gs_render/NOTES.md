@@ -231,32 +231,39 @@ is the only symbol in this crate that *names* a `gs_puppet` type in its signatur
 next **global** symbol is far away, but the next local symbol is
 `drop_in_place<MutexGuard<MarkedJobs>>` at `0x1008f1d98`).
 
-`gs_puppet` is being reconstructed in a sibling worktree and its
-`SplatParams` does not exist on main, so `cargo check` would fail if this crate
-depended on it. Therefore:
-
-* `SplatKey` itself **is** recovered (`pub struct SplatKey(pub u64)`, the exact
-  quantisation and packing, plus `size()/width()/height()` accessors);
-* the conversion is exposed as two seams:
-  `SplatKey::from_params_parts(a: f32, b: f32, c: f32)` (the exact body of the
-  `From` impl) and `SplatKey::from_params([f32; 3])`;
-* the parent wires the real impl after merging:
+`gs_puppet` was reconstructed in a sibling worktree in parallel. It is merged
+now, and this crate has a path dependency on it, so the real impl is present:
 
 ```rust
-// crates/gs_render/src/puppet_cache.rs, after gs_puppet lands:
 impl From<gs_puppet::splat::SplatParams> for gs_render::puppet_cache::SplatKey {
     fn from(p: gs_puppet::splat::SplatParams) -> Self {
-        // The `From` body reads +0x00, +0x04, +0x08 of SplatParams as f32.
-        SplatKey::from_params_parts(p.??? /* +0x00 */, p.??? /* +0x04 */, p.??? /* +0x08 */)
+        SplatKey::from_params_parts(p.radius, p.opacity, p.detail)
     }
 }
 ```
 
-The only constraint on `SplatParams` is that the three `f32`s the conversion reads
-are at offsets `+0x00`, `+0x04`, `+0x08` — scaled by `1000.0`, `100.0`, `100.0`
-and clamped to `5..1000`, `20..200`, `5..100` respectively. `gs_puppet`'s own
-recovery notes call those fields `size`, `width`, `height` (the `SplatKey`
-accessors use the same names).
+* `SplatKey` itself **is** recovered (`pub struct SplatKey(pub u64)`, the exact
+  quantisation and packing, plus `size()/width()/height()` accessors);
+* `SplatKey::from_params_parts(a: f32, b: f32, c: f32)` is the exact body of the
+  `From` impl and `SplatKey::from_params([f32; 3])` is its array form;
+* the test `splat_key_quantises_like_the_from_impl` exercises both the raw parts
+  and the real `From<SplatParams>`.
+
+The three `f32`s the conversion reads are `gs_puppet::splat::SplatParams`'s
+`radius`, `opacity` and `detail` at offsets `+0x00`, `+0x04`, `+0x08` — scaled by
+`1000.0`, `100.0`, `100.0` and clamped to `5..500`, `20..200`, `5..100`
+respectively (`0x43fa0000` is **500.0**, not 1000.0; the earlier note in this
+file had that typo and the constant here is the corrected one).
+
+Other `gs_puppet` types referenced by this crate's functions (redefined locally,
+each marked `// INTEGRATION:`): `skin::SkinSurface`, `skin::Effects`,
+`pose::{Pose, PoseSet}`, `camera::Camera`, `mesh::{Mesh, BodyMeta, SplatBody,
+Hollows}`, `layers::{LayerCloud, Hollows}`, `uv::{UvLayout, Texture}`,
+`shadow::ShadowCaster`, `fall::Fall`, `hang::Puppet::arm_hangs_at`,
+`model::Puppet`.  These local models intentionally keep only the fields the
+cache code reads (they are cache-key/placement views, not a second animation
+engine); `splat::SplatParams` was the one type the binary names in a symbol, and
+it is now the real sibling type.
 
 Other `gs_puppet` types referenced by this crate's functions (redefined locally,
 each marked `// INTEGRATION:`): `skin::SkinSurface`, `skin::Effects`,

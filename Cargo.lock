@@ -15,6 +15,7 @@ name = "gs_render"
 version = "0.0.0"
 dependencies = [
  "gs_base",
+ "gs_puppet",
 ]
 
 [[package]]

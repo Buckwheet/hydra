@@ -87,8 +87,12 @@
 //! `hydra_lich`'s relay and this crate's tests use.
 //!
 //! The token and password handshake live in `hydra_lich` (`new_token` produces
-//! the 64-character token; `--pipe` makes Lich listen on `127.0.0.1:<port>`);
-//! this crate only carries the door.  See `NOTES.md` §"Lich door contract".
+//! the 64-character token).  The observed direction is: Hydra **listens** on
+//! `127.0.0.1:<ephemeral>`, Lich is started with `-g 127.0.0.1:<port>` and
+//! connects back, so the accept runs on the server side (see
+//! [`accept_keyed`]/[`client_handshake`] and `docs/LICH_WIRE.md`).  This crate
+//! carries the door plus the small protocol helpers the session itself needs;
+//! the relay proper is `hydra_lich`.  See `NOTES.md` §"Lich door contract".
 
 use crate::command::{Event, SessionHandle};
 use crate::notice::{Notice, LEVEL_INFO, LEVEL_WARN};
@@ -717,37 +721,187 @@ impl SessionHandle {
 /// (`hydra_lich/NOTES.md` §2.2: "did not connect within 60 seconds").
 pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Perform the keyed accept for Lich's local `--pipe`.
+/// The client-identification line, exactly as observed on both channels
+/// (`docs/LICH_WIRE.md` §2).  Duplicated from `hydra_lich::wire` because this
+/// crate must not depend on the relay crate; keep the two spellings identical.
+pub const CLIENT_IDENTIFICATION: &str = "/FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML";
+
+/// The byte Lich puts in front of every forwarded game chunk on its stdout
+/// (US, 0x1F).  Lich's own lines are unprefixed.
+pub const GAME_CHUNK_PREFIX: u8 = 0x1F;
+
+/// The Stormfront prefix on a command Lich originated (`<c>exp`); text the
+/// player typed and Lich forwarded is the bare line (`look`).
+pub const COMMAND_TAG: &str = "<c>";
+
+/// Longest handshake line accepted (the real ones are 64 and 51 bytes).
+pub const MAX_HANDSHAKE_LINE: usize = 4096;
+
+/// Hydra's side of the keyed accept, **observed** (`docs/LICH_WIRE.md` §2).
 ///
-/// **ESTABLISHED** (from `hydra_lich`): the relay mints a 64-character token
-/// with `hydra_lich::child::new_token`, starts Lich with
-/// `--pipe --stormfront --sentinel -g 127.0.0.1:<port>`, connects back to that
-/// port and hands the token to an inlined `accept_keyed` future with a
-/// 60-second deadline.
+/// Hydra mints a 64-character token (`hydra_lich::child::new_token`), binds
+/// `127.0.0.1:<ephemeral>`, starts Lich with
+/// `--pipe --stormfront --sentinel -g 127.0.0.1:<port>` and **listens**.  Lich
+/// connects and the first two lines of the stream must be
 ///
-/// **UNKNOWN**: the exact wire encoding of the keyed first line (newline,
-/// JSON or a length prefix).  This synchronous helper uses the simplest
-/// keyed-first-line form: the token followed by `\n`, then a flush.  The
-/// caller can then read Lich's acknowledgement from the same stream.  The
-/// token itself is never logged.
-pub fn accept_keyed<S: Read + Write>(stream: &mut S, token: &str) -> io::Result<()> {
-    stream.write_all(token.as_bytes())?;
-    stream.write_all(b"\n")?;
+/// ```text
+/// <token>\n
+/// /FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n
+/// ```
+///
+/// i.e. the same two lines Hydra wrote to Lich's stdin right after the spawn
+/// (see [`client_handshake`]).  Any other content is a refusal; the caller
+/// drops the stream, which closes it.  The token is never logged.
+///
+/// This is the *server* half.  [`client_handshake`] is Lich's half, used by the
+/// fake Lich in tests and by anything that needs to prove itself to an accept.
+pub fn accept_keyed<S: Read>(stream: &mut S, token: &str) -> io::Result<()> {
+    let first = read_line(stream)?;
+    if first != token {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Lich's first line was not this session's token",
+        ));
+    }
+    let second = read_line(stream)?;
+    if second != CLIENT_IDENTIFICATION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Lich's second line was not the client identification line",
+        ));
+    }
+    Ok(())
+}
+
+/// Lich's side of the handshake: write the two lines and flush.
+///
+/// This is what Hydra sends to Lich's **stdin** immediately after the spawn
+/// (`docs/LICH_WIRE.md` §2, step 1) and what Lich then sends back as the first
+/// bytes of the socket stream.  It is kept here for tests and fake Lich
+/// helpers; Hydra itself no longer *sends* it on a socket.
+pub fn client_handshake<S: Write>(stream: &mut S, token: &str) -> io::Result<()> {
+    stream.write_all(&handshake_bytes(token))?;
     stream.flush()
 }
 
-/// Connect to Lich's local pipe and perform [`accept_keyed`].
+/// The exact bytes of the two-line handshake (`<token>\n<client line>\n`).
+pub fn handshake_bytes(token: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(token.len() + CLIENT_IDENTIFICATION.len() + 2);
+    bytes.extend_from_slice(token.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(CLIENT_IDENTIFICATION.as_bytes());
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Read one `\n`-terminated line, stripping the `\n` and a preceding `\r`.
+///
+/// One byte at a time, so the bytes after the handshake are not swallowed by a
+/// buffer the caller cannot see.
+fn read_line<S: Read>(stream: &mut S) -> io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+                if line.len() > MAX_HANDSHAKE_LINE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Lich sent an over-long handshake line",
+                    ));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Connect to `127.0.0.1:<port>` and perform Lich's half of the handshake.
 ///
 /// The address is always `127.0.0.1:<port>` (**ESTABLISHED**: the relay's
-/// `build_command` appends that string).  The connection, read and write all
-/// use [`ACCEPT_TIMEOUT`].
+/// `build_command` passes `-g 127.0.0.1:<port>`).  The connection, read and
+/// write all use [`ACCEPT_TIMEOUT`] (60 s).  Used by the fake Lich and by
+/// tests; Hydra accepts, it does not connect.
 pub fn connect_keyed(port: u16, token: &str) -> io::Result<TcpStream> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    connect_keyed_to(SocketAddr::from(([127, 0, 0, 1], port)), token)
+}
+
+/// [`connect_keyed`] for an explicit address (tests use an ephemeral port).
+pub fn connect_keyed_to(addr: SocketAddr, token: &str) -> io::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&addr, ACCEPT_TIMEOUT)?;
     stream.set_read_timeout(Some(ACCEPT_TIMEOUT))?;
     stream.set_write_timeout(Some(ACCEPT_TIMEOUT))?;
-    accept_keyed(&mut stream, token)?;
+    client_handshake(&mut stream, token)?;
     Ok(stream)
+}
+
+/// `true` when Lich prefixed this stdout line with [`GAME_CHUNK_PREFIX`].
+pub fn has_game_chunk_prefix(line: &str) -> bool {
+    line.starts_with(GAME_CHUNK_PREFIX as char)
+}
+
+/// The forwarded game chunk with its 0x1F prefix removed, or `None` when the
+/// line is Lich's own output (banner, `<output …/>` messages, errors).
+pub fn strip_game_chunk_prefix(line: &str) -> Option<&str> {
+    line.strip_prefix(GAME_CHUNK_PREFIX as char)
+}
+
+/// One line Lich sent up the socket, split by provenance.
+///
+/// `<c>exp` is a command Lich (or a script) originated; `look` is text the
+/// player typed that Lich forwarded; `_injury 2` is a bare protocol line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LichFrame {
+    /// `<c>…` — the command without the prefix.
+    Command(String),
+    /// A bare line, unchanged.
+    Bare(String),
+}
+
+impl LichFrame {
+    /// Classify one line, ignoring any trailing `\n`/`\r`.
+    pub fn parse(line: &str) -> Self {
+        let line = line.trim_end_matches(['\n', '\r']);
+        match line.strip_prefix(COMMAND_TAG) {
+            Some(command) => LichFrame::Command(command.to_string()),
+            None => LichFrame::Bare(line.to_string()),
+        }
+    }
+
+    /// The line without its `<c>` prefix and without the line ending.
+    pub fn text(&self) -> &str {
+        match self {
+            LichFrame::Command(text) | LichFrame::Bare(text) => text,
+        }
+    }
+
+    /// Was this a Lich-originated command?
+    pub fn is_command(&self) -> bool {
+        matches!(self, LichFrame::Command(_))
+    }
+
+    /// Render the line back to its wire form (no line ending added).
+    pub fn to_wire(&self) -> String {
+        match self {
+            LichFrame::Command(text) => command_frame(text),
+            LichFrame::Bare(text) => text.clone(),
+        }
+    }
+}
+
+/// Build a `<c>` command frame: `command_frame("exp") == "<c>exp"`.
+pub fn command_frame(command: &str) -> String {
+    format!("{COMMAND_TAG}{command}")
 }
 
 #[cfg(test)]
@@ -882,13 +1036,105 @@ mod tests {
         assert!(t.is_empty());
     }
 
+    const TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
-    fn keyed_accept_sends_one_token_line() {
-        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fn the_handshake_is_the_two_observed_lines() {
+        assert_eq!(
+            handshake_bytes(TOKEN),
+            format!("{TOKEN}\n/FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n").into_bytes()
+        );
         let mut wire = std::io::Cursor::new(Vec::new());
-        accept_keyed(&mut wire, token).unwrap();
-        assert_eq!(wire.into_inner(), format!("{token}\n").into_bytes());
+        client_handshake(&mut wire, TOKEN).unwrap();
+        assert_eq!(wire.into_inner(), handshake_bytes(TOKEN));
         assert_eq!(ACCEPT_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn accept_keyed_reads_the_token_then_the_client_line() {
+        let mut wire = std::io::Cursor::new(handshake_bytes(TOKEN));
+        accept_keyed(&mut wire, TOKEN).unwrap();
+        // Only the two handshake lines were consumed: nothing is left over for
+        // the game stream reader that follows.
+        let mut rest = Vec::new();
+        wire.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn accept_keyed_tolerates_crlf() {
+        let mut wire = std::io::Cursor::new(
+            format!("{TOKEN}\r\n{CLIENT_IDENTIFICATION}\r\n").into_bytes(),
+        );
+        accept_keyed(&mut wire, TOKEN).unwrap();
+    }
+
+    #[test]
+    fn accept_keyed_refuses_a_wrong_token() {
+        let mut wire = std::io::Cursor::new(handshake_bytes(&"f".repeat(64)));
+        let err = accept_keyed(&mut wire, TOKEN).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!err.to_string().contains(TOKEN), "the token must not leak");
+    }
+
+    #[test]
+    fn accept_keyed_refuses_a_wrong_client_line() {
+        let mut wire = std::io::Cursor::new(
+            format!("{TOKEN}\n/FE:WRAYTH /VERSION:0.0.0 /XML\n").into_bytes(),
+        );
+        let err = accept_keyed(&mut wire, TOKEN).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn accept_keyed_refuses_a_truncated_handshake() {
+        let mut wire = std::io::Cursor::new(format!("{TOKEN}\n").into_bytes());
+        let err = accept_keyed(&mut wire, TOKEN).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn connect_keyed_performs_lichs_half_over_loopback() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0u16)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accept_keyed(&mut stream, TOKEN)
+        });
+        let stream = connect_keyed(port, TOKEN).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        accept.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn framing_separates_c_commands_from_bare_lines() {
+        assert_eq!(
+            LichFrame::parse("<c>locker info\n"),
+            LichFrame::Command("locker info".to_string())
+        );
+        assert_eq!(LichFrame::parse("look\n"), LichFrame::Bare("look".into()));
+        assert_eq!(
+            LichFrame::parse("_injury 2\n"),
+            LichFrame::Bare("_injury 2".into())
+        );
+        assert_eq!(command_frame("exp"), "<c>exp");
+        assert_eq!(
+            LichFrame::Command("exp".into()).to_wire(),
+            "<c>exp"
+        );
+        assert!(!LichFrame::parse("look").is_command());
+    }
+
+    #[test]
+    fn the_game_chunk_prefix_is_recognised_and_stripped() {
+        let chunk = format!("{}<room>1</room>", GAME_CHUNK_PREFIX as char);
+        assert!(has_game_chunk_prefix(&chunk));
+        assert_eq!(strip_game_chunk_prefix(&chunk), Some("<room>1</room>"));
+        let own = "<output class=\"mono\"/>Lich is active.<output class=\"\"/>";
+        assert!(!has_game_chunk_prefix(own));
+        assert_eq!(strip_game_chunk_prefix(own), None);
+        assert_eq!(GAME_CHUNK_PREFIX, 0x1F);
     }
 
     #[tokio::test]

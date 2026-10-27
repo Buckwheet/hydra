@@ -18,12 +18,21 @@
 //! `Waits`, [`Notice`], [`Typed`], [`never_given`], [`shared_symbol`] and
 //! [`Ended`] are unchanged value types shared by both layers.
 //!
+//! **Observed wire protocol** (`docs/LICH_WIRE.md`, see [`crate::wire`]): Hydra
+//! listens on `127.0.0.1:<ephemeral>` and Lich (`-g 127.0.0.1:<port>`) connects
+//! back.  [`start_keyed`] performs the whole sequence — bind, spawn, write the
+//! two-line stdin handshake, accept and validate the two-line socket handshake
+//! with the recovered 60-second deadline — and returns the relay plus the
+//! accepted socket.  [`show`] keeps its old signature (spawn + wire the pipes,
+//! no socket) for callers and tests that do not speak the handshake.
+//!
 //! See `NOTES.md` for the recovered wire protocol, the established-vs-UNKNOWN
 //! split and the Phase 1 reconnection table.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -393,9 +402,41 @@ impl Ended {
 /// over the bytes, while `lines()` would return an `InvalidData` error on the
 /// first invalid byte.  The delimiter and a preceding `\r` are stripped, like
 /// `Lines`.
+///
+/// **Observed protocol** (`docs/LICH_WIRE.md` §4): Lich prefixes every
+/// forwarded game chunk with the byte 0x1F.  That byte is stripped here, so a
+/// consumer of this channel (the protocol parser) never sees it; use
+/// [`read_lich_out_async`] when the game/Lich distinction itself matters.
 pub async fn read_lines_async<R>(reader: R) -> tokio::sync::mpsc::Receiver<String>
 where
     R: AsyncRead + Unpin + Send + 'static,
+{
+    read_lines_mapped(reader, strip_game_chunk).await
+}
+
+/// Classify every stdout line as a forwarded game chunk or Lich's own output.
+///
+/// Same reader, same bounded channel and same CRLF handling as
+/// [`read_lines_async`], but the receiver yields [`crate::wire::LichOut`] so a
+/// caller can tell Lich's banner and `<output …/>` lines from the game XML it
+/// relays.  Game chunks arrive with the 0x1F prefix already stripped.
+pub async fn read_lich_out_async<R>(
+    reader: R,
+) -> tokio::sync::mpsc::Receiver<crate::wire::LichOut>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    read_lines_mapped(reader, |line| crate::wire::LichOut::parse(&line)).await
+}
+
+/// Shared body of [`read_lines_async`] and [`read_lich_out_async`]: split the
+/// reader into CRLF-stripped lossy `String` lines and push them (bounded at
+/// [`LINE_CHANNEL_CAPACITY`]) through `map`.
+async fn read_lines_mapped<R, T, F>(reader: R, map: F) -> tokio::sync::mpsc::Receiver<T>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    T: Send + 'static,
+    F: Fn(String) -> T + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel(LINE_CHANNEL_CAPACITY);
     crate::runtime::spawn(async move {
@@ -410,7 +451,7 @@ where
                     let line = String::from_utf8_lossy(&buf).into_owned();
                     // Bounded send: a slow consumer stalls the reader, exactly
                     // like the recovered `Semaphore::new(0x40)` channel.
-                    if tx.send(line).await.is_err() {
+                    if tx.send(map(line)).await.is_err() {
                         break;
                     }
                 }
@@ -419,6 +460,15 @@ where
         }
     });
     rx
+}
+
+/// Remove the 0x1F chunk prefix from a stdout line, keeping Lich's own lines
+/// untouched (they are already unprefixed).
+fn strip_game_chunk(line: String) -> String {
+    match crate::wire::strip_game_chunk_prefix(&line) {
+        Some(text) => text.to_string(),
+        None => line,
+    }
 }
 
 /// Synchronous [`read_lines_async`]: a `std::io::BufRead` in, a
@@ -433,6 +483,9 @@ where
 /// by one bridge thread.
 ///
 /// The returned receiver disconnects when the reader reaches EOF or errors.
+///
+/// The 0x1F game-chunk prefix is stripped exactly as in [`read_lines_async`];
+/// [`read_lich_out`] is the classifying variant.
 pub fn read_lines<R>(reader: R) -> Receiver<String>
 where
     R: BufRead + Send + 'static,
@@ -441,12 +494,22 @@ where
     bridge_to_std(lines)
 }
 
+/// Synchronous [`read_lich_out_async`]: classify each stdout line as a game
+/// chunk or Lich's own output while keeping the CRLF handling.
+pub fn read_lich_out<R>(reader: R) -> Receiver<crate::wire::LichOut>
+where
+    R: BufRead + Send + 'static,
+{
+    let lines = crate::runtime::block_on(read_lich_out_async(BlockingReader::new(reader)));
+    bridge_to_std(lines)
+}
+
 /// Move a tokio line channel onto a `std::sync::mpsc` receiver.
 ///
 /// Both channels are bounded at [`LINE_CHANNEL_CAPACITY`], so the sync facade
 /// applies the same backpressure as the tokio channel.  The bridge thread ends
 /// when the tokio sender closes (EOF) or the std receiver is dropped.
-fn bridge_to_std(mut lines: tokio::sync::mpsc::Receiver<String>) -> Receiver<String> {
+fn bridge_to_std<T: Send + 'static>(mut lines: tokio::sync::mpsc::Receiver<T>) -> Receiver<T> {
     let (tx, rx) = mpsc::sync_channel(LINE_CHANNEL_CAPACITY);
     thread::spawn(move || {
         while let Some(line) = lines.blocking_recv() {
@@ -814,15 +877,24 @@ pub struct Relay {
 /// returns a control handle pair (stored at +0x280/+0x288 by the relay
 /// loop).  This version returns the whole [`Relay`], which is the equivalent
 /// testable amount of state.
+///
+/// `show` takes the port the caller already bound; the observed protocol has
+/// Hydra *listen* on it and Lich connect back.  [`start_keyed`] is the full
+/// handshake sequence; `show` alone (used by the fake-Ruby tests, which never
+/// speak the socket) just wires the pipes.
 pub fn show(launch: &Launch, port: u16) -> io::Result<Relay> {
-    let spawned = spawn(launch, port)?;
+    Ok(relay_from_spawned(spawn(launch, port)?))
+}
+
+/// Wire an already-spawned child into a [`Relay`] (shared by [`show`] and
+/// [`start_keyed`]).
+fn relay_from_spawned(spawned: Spawned) -> Relay {
     // `read_lines`/`keep_errors` wrap the blocking pipe in a
     // `tokio::io::BufReader` (8192 bytes, the recovered `0x2000` allocation).
     let lines = read_lines(BufReader::with_capacity(8192, spawned.stdout));
-    let (errors, stderr_handle) =
-        keep_errors(BufReader::with_capacity(8192, spawned.stderr));
+    let (errors, stderr_handle) = keep_errors(BufReader::with_capacity(8192, spawned.stderr));
     let waits = Waits::new(false);
-    Ok(Relay {
+    Relay {
         child: spawned.child,
         stdin: spawned.stdin,
         lines,
@@ -832,12 +904,120 @@ pub fn show(launch: &Launch, port: u16) -> io::Result<Relay> {
         stderr_handle,
         status: None,
         stop: CancellationToken::new(),
+    }
+}
+
+/// A relay whose keyed handshake has completed: the live [`Relay`] plus the
+/// accepted socket (the game stream Hydra and Lich share).
+pub struct KeyedRelay {
+    /// The wired relay (child, stdin, stdout lines, stderr ring).
+    pub relay: Relay,
+    /// The socket Lich connected back on, handshake already validated.  Use it
+    /// to write the game stream ([`KeyedRelay::send_game`]); reads go through
+    /// [`KeyedRelay::reader`] so the stream is buffered.
+    pub socket: TcpStream,
+    /// Buffered read side of [`KeyedRelay::socket`] (a `try_clone`, so the
+    /// accept left its 60-second timeout in place).  Nothing is buffered at
+    /// this point: the accept reads byte by byte and never over-reads.
+    pub reader: BufReader<TcpStream>,
+    /// The token this session generated and demanded on the socket's first
+    /// line.  Kept for diagnostics and tests; never logged by the relay.
+    pub token: String,
+}
+
+/// Start Lich and complete the observed keyed handshake.
+///
+/// The recovered sequence (`docs/LICH_WIRE.md` §1-2):
+/// 1. bind `127.0.0.1:0` and read the ephemeral port;
+/// 2. spawn Lich with `-g 127.0.0.1:<port>`;
+/// 3. immediately write `<token>\n<client line>\n` to Lich's stdin;
+/// 4. accept one connection with the recovered 60-second deadline and require
+///    the token as its first line and the client-identification line as its
+///    second, dropping the socket on any mismatch.
+///
+/// Every failure path kills and reaps the child before returning the error, so
+/// a refused handshake never leaves an orphaned `ruby lich.rbw` behind.
+pub fn start_keyed(launch: &Launch, token: &str) -> io::Result<KeyedRelay> {
+    let (listener, port) = crate::wire::keyed_listener()?;
+    let mut spawned = spawn(launch, port)?;
+
+    if let Err(err) = crate::wire::write_lich_handshake(&mut spawned.stdin, token) {
+        kill_and_reap(&mut spawned.child);
+        return Err(err);
+    }
+    let socket = match crate::wire::accept_keyed_listener(&listener, token) {
+        Ok(socket) => socket,
+        Err(err) => {
+            kill_and_reap(&mut spawned.child);
+            return Err(err);
+        }
+    };
+    // One Lich per relay: a second connection would be unauthenticated.
+    drop(listener);
+
+    Ok(KeyedRelay {
+        relay: relay_from_spawned(spawned),
+        reader: BufReader::new(socket.try_clone()?),
+        socket,
+        token: token.to_string(),
     })
+}
+
+/// [`start_keyed`] with a freshly minted [`crate::child::new_token`] token.
+pub fn start_keyed_minted(launch: &Launch) -> io::Result<KeyedRelay> {
+    let token = crate::child::new_token().map_err(|err| io::Error::other(err.to_string()))?;
+    start_keyed(launch, &token)
+}
+
+impl KeyedRelay {
+    /// Write one line of the game stream to the accepted socket.
+    ///
+    /// Hydra plays the game server for Lich, so this is the socket direction
+    /// that carries the game XML (and any frame Hydra injects).  A trailing
+    /// `\n` is added when the line does not already carry one.
+    pub fn send_game(&mut self, line: &str) -> io::Result<()> {
+        self.socket.write_all(line.as_bytes())?;
+        if !line.ends_with('\n') {
+            self.socket.write_all(b"\n")?;
+        }
+        self.socket.flush()
+    }
+
+    /// Read one Lich -> Hydra line from the socket, split into a `<c>` command
+    /// and a bare (typed / protocol) line.
+    ///
+    /// A closed socket is `UnexpectedEof`: there is no line to report.  The
+    /// accept left a 60-second read timeout on the socket, so a silent Lich
+    /// surfaces as `WouldBlock`/`TimedOut` rather than blocking forever.
+    pub fn read_frame(&mut self) -> io::Result<crate::wire::LichFrame> {
+        let mut buf = Vec::new();
+        if self.reader.read_until(b'\n', &mut buf)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Lich's socket closed",
+            ));
+        }
+        strip_line_ending(&mut buf);
+        Ok(crate::wire::LichFrame::parse(
+            &String::from_utf8_lossy(&buf),
+        ))
+    }
+}
+
+/// Kill and reap a child on a failed handshake.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Relay {
     /// Write one line (without an added newline) to the child's stdin and
-    /// flush it.  This is the parent -> child game-command path.
+    /// flush it.
+    ///
+    /// Observed (`docs/LICH_WIRE.md` §3): stdin is the typed-input path and the
+    /// line is bare (`look`), never `<c>`-prefixed — Lich forwards it to the
+    /// game itself.  The game stream Hydra relays goes over the accepted
+    /// socket instead ([`KeyedRelay::send_game`]).
     pub fn send(&mut self, line: &str) -> io::Result<()> {
         self.stdin.write_all(line.as_bytes())?;
         if !line.ends_with('\n') {
@@ -2023,6 +2203,186 @@ mod tests {
         // Killed by SIGKILL: no exit code on Unix.
         assert_eq!(status.code(), None);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 3: the observed wire protocol (docs/LICH_WIRE.md).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn read_lines_strips_the_game_chunk_prefix() {
+        // Lich prefixes a forwarded game chunk with 0x1F; its own lines are
+        // unprefixed.  The chunk byte must not reach a protocol parser.
+        let input = Cursor::new(
+            b"\x1f<room>1</room>\r\nLich is active.\n\x1f<prompt>\n".to_vec(),
+        );
+        assert_eq!(
+            collect_lines(read_lines(input)),
+            ["<room>1</room>", "Lich is active.", "<prompt>"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_async_strips_the_game_chunk_prefix() {
+        let input: &'static [u8] = b"\x1f<room>1</room>\r\n--- Lich v5.22.0\n";
+        assert_eq!(
+            drain_async(read_lines_async(input).await).await,
+            ["<room>1</room>", "--- Lich v5.22.0"]
+        );
+    }
+
+    #[test]
+    fn read_lich_out_classifies_the_stdout_lines() {
+        // `\r\n` is the observed game-chunk ending; Lich's own wrapped lines
+        // end `\r\r\n`, and (like `Lines`) only the delimiter and one `\r`
+        // are stripped, so the extra `\r` stays part of the line.
+        let input = Cursor::new(
+            b"\x1f<room>1</room>\r\n<output class=\"mono\"/>hi<output class=\"\"/>\r\r\n".to_vec(),
+        );
+        let mut lines = read_lich_out(input);
+        let first = lines.recv().unwrap();
+        assert_eq!(first, crate::wire::LichOut::Game("<room>1</room>".into()));
+        let second = lines.recv().unwrap();
+        assert_eq!(
+            second,
+            crate::wire::LichOut::Own(
+                "<output class=\"mono\"/>hi<output class=\"\"/>\r".into()
+            )
+        );
+        assert!(lines.recv().is_err(), "the channel closes at EOF");
+    }
+
+    #[tokio::test]
+    async fn read_lich_out_async_classifies_the_stdout_lines() {
+        let input: &'static [u8] = b"\x1f<prompt>\nLich is running.\n";
+        let mut lines = read_lich_out_async(input).await;
+        assert_eq!(
+            lines.recv().await.unwrap(),
+            crate::wire::LichOut::Game("<prompt>".into())
+        );
+        assert_eq!(
+            lines.recv().await.unwrap(),
+            crate::wire::LichOut::Own("Lich is running.".into())
+        );
+        assert!(lines.recv().await.is_none());
+    }
+
+    /// A fake Lich written as a bash script: it speaks the observed protocol
+    /// over `/dev/tcp` (no Ruby is involved, and no game text is used).
+    ///
+    /// It reads the two stdin handshake lines, records its pid next to the
+    /// script (so a test can check it was reaped) and runs `body` with `$token`,
+    /// `$client` and `$port` in scope.
+    #[cfg(unix)]
+    fn fake_lich_script(body: &str) -> (PathBuf, PathBuf, PathBuf) {
+        // The `-g 127.0.0.1:<port>` argument is always the last one for these
+        // launches; the script extracts it with bash parameter expansion.
+        let script = format!(
+            "#!/bin/bash\n\
+             read -r token\n\
+             read -r client\n\
+             last=${{@: -1}}\n\
+             port=${{last#127.0.0.1:}}\n\
+             echo \"$$\" > \"$(dirname \"$0\")/pid\"\n\
+             {body}\n"
+        );
+        fake_ruby("keyed", &script)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_keyed_completes_the_two_channel_handshake() {
+        let (root, ruby, lich) = fake_lich_script(
+            "exec 3<>/dev/tcp/127.0.0.1/$port\n\
+             printf '%s\\n' \"$token\" >&3\n\
+             printf '%s\\n' \"$client\" >&3\n\
+             echo \"seen:$token:$client\"\n\
+             read -r game <&3\n\
+             printf '%s\\n' \"$game\" >&3",
+        );
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut keyed = start_keyed(&Launch::new(&ruby, &lich), token).unwrap();
+        assert_eq!(keyed.token, token);
+
+        // Hydra's side of the game stream is the socket; the fake Lich echoes
+        // the line back as a bare (typed) line.
+        keyed.send_game("look").unwrap();
+        assert_eq!(
+            keyed.read_frame().unwrap(),
+            crate::wire::LichFrame::Bare("look".into())
+        );
+
+        let status = keyed.relay.run_to_end().unwrap();
+        assert!(status.success());
+        // The stdin handshake carried the same two lines, and the child echoed
+        // them so the test sees exactly what it read.
+        let seen = format!("seen:{token}:{}", crate::wire::CLIENT_IDENTIFICATION);
+        assert!(
+            keyed.relay.output.iter().any(|line| line == &seen),
+            "stdin handshake not observed: {:?}",
+            keyed.relay.output
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `kill -0 <pid>`: is the process still there?
+    #[cfg(unix)]
+    fn process_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_keyed_refuses_a_wrong_token_and_reaps_the_child() {
+        let (root, ruby, lich) = fake_lich_script(
+            "exec 3<>/dev/tcp/127.0.0.1/$port\n\
+             printf '%s\\n' \"not-the-token\" >&3\n\
+             printf '%s\\n' \"$client\" >&3\n\
+             cat <&3 >/dev/null\n\
+             sleep 30",
+        );
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = match start_keyed(&Launch::new(&ruby, &lich), token) {
+            Ok(_) => panic!("a wrong token must not be accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!err.to_string().contains(token), "the token must not leak");
+
+        // The failure path killed and reaped the child.
+        let pid = std::fs::read_to_string(root.join("pid")).unwrap_or_default();
+        assert!(!pid.trim().is_empty(), "the fake Lich never started");
+        assert!(
+            !process_alive(pid.trim()),
+            "the failed handshake left child {} behind",
+            pid.trim()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_keyed_refuses_a_wrong_client_line() {
+        let (root, ruby, lich) = fake_lich_script(
+            "exec 3<>/dev/tcp/127.0.0.1/$port\n\
+             printf '%s\\n' \"$token\" >&3\n\
+             printf '%s\\n' \"/FE:WRAYTH /VERSION:0.0.0 /XML\" >&3\n\
+             sleep 30",
+        );
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = match start_keyed(&Launch::new(&ruby, &lich), token) {
+            Ok(_) => panic!("a wrong client line must not be accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let pid = std::fs::read_to_string(root.join("pid")).unwrap_or_default();
+        assert!(!process_alive(pid.trim()), "a child was left behind");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

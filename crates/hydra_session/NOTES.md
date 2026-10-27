@@ -360,24 +360,55 @@ Lich is not running for this character: not sent: {}                       level
 Lich is not reading what is typed for it ({} lines wait): not handed: {}    level 1
 ```
 
-### 3.4 Token handshake (recovered in `hydra_lich`, not here)
+### 3.4 Token handshake — OBSERVED (`docs/LICH_WIRE.md` §2)
 
 `hydra_lich::new_token` (`0x101689d30`) fills 32 bytes from `getrandom` and
 renders 64 lowercase hex characters.  Lich is started with
-`--pipe --stormfront --sentinel -g 127.0.0.1:<port>` (`relay::spawn`), and the
-relay connects back to that port and proves it is the parent with the token as
-the keyed first line.
+`--pipe --stormfront --sentinel -g 127.0.0.1:<port>` (`relay::spawn`).
 
-`hydra_session::lich` now exposes the synchronous equivalent the relay needs:
+**The direction is the opposite of what this file claimed until Phase 3.**
+Hydra **listens** on `127.0.0.1:<ephemeral>` and Lich connects back to it:
+Hydra plays the game server for Lich.  The token is a key *Lich* presents, and
+the same two `\n`-terminated lines travel on two redundant channels:
 
-* `accept_keyed(&mut stream, token)` — writes the token as one line and flushes;
-* `connect_keyed(port, token)` — connects to `127.0.0.1:<port>`, applies the
-  recovered **60-second** deadline to connect/read/write, and calls
-  `accept_keyed`.  The token is never logged.
+```text
+Hydra -> Lich stdin, once, right after the spawn:
+    <token>\n
+    /FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n
+Lich -> Hydra, first two lines of the accepted socket:
+    <token>\n                                          (the key)
+    /FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n  (client identification)
+```
 
-**UNKNOWN**: the original's exact wire encoding (newline, JSON or length
-prefix); the newline form is the documented safest choice.  The original body
-was inlined into the relay closure, so no symbol carries it.
+`hydra_session::lich` carries the small pieces this crate needs (it cannot
+depend on `hydra_lich`, so the constant and the two-line parser are
+duplicated and must stay spelled identically):
+
+* `accept_keyed(&mut stream, token)` — **server** side, validating the two
+  lines: first line must equal the token, second must equal
+  `CLIENT_IDENTIFICATION` (`PermissionDenied` / `InvalidData` otherwise; the
+  caller drops the stream, which closes it).  The token is never logged.
+* `client_handshake(&mut stream, token)` / `handshake_bytes(token)` — Lich's
+  side: writes the two lines and flushes.  Used by fake Lich helpers and
+  tests, **not** by Hydra (Hydra accepts).
+* `connect_keyed(port, token)` / `connect_keyed_to(addr, token)` — connect to
+  `127.0.0.1:<port>`, apply the recovered **60-second** deadline to
+  connect/read/write and run `client_handshake`.
+* `LichFrame` / `command_frame` — the `<c>` command versus bare line
+  distinction on the Lich -> Hydra socket (`<c>exp` vs `look` vs `_injury 2`).
+* `GAME_CHUNK_PREFIX` (0x1F) with `has_game_chunk_prefix` /
+  `strip_game_chunk_prefix` — the per-chunk prefix on game XML Lich forwards
+  on its stdout; Lich's own lines carry none.
+
+The 60-second number is the `Ended::DidNotConnect { seconds: 60 }` literal in
+`hydra_lich`; the capture is consistent with it (a healthy Lich connects at
+once).
+
+**Still UNKNOWN**: what Hydra shows the player on a token mismatch (no
+mismatch happened in the capture, so no message is invented here), whether the
+stdin lines are re-sent on a Lich restart, and behaviour on non-Windows builds
+and other game instances.  The duplicate constants and parsers in the two
+crates are a deliberate consequence of the crates not depending on each other.
 
 ### 3.5 Password flow — recovered, and it is *not* a Lich prompt
 
@@ -567,7 +598,14 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
   both recovered `hand_to_lich` messages, `session_over`, `show` folding frames,
   `Wire::fell_behind`, `begin`, the typing queue, and (*Phase 1*) `claim_async`
   over real tokio channels — typed lines in order, lines back to the door, the
-  recovered 4096/64 capacities, and a full channel refusing a line.
+  recovered 4096/64 capacities, and a full channel refusing a line.  (*Phase 3*)
+  the observed handshake: the two exact lines from `handshake_bytes`/
+  `client_handshake`, the server-side `accept_keyed` accepting a good token +
+  client line (CRLF tolerated, nothing over-read), refusing a wrong token
+  (`PermissionDenied`, token not in the message), a wrong second line and a
+  truncated handshake; `connect_keyed` round-tripping against a real loopback
+  listener; `<c>`/bare `LichFrame` framing and `command_frame`; and the 0x1F
+  game-chunk prefix helpers.
 * `command`: the basics, `say` vs `say_unlogged`, subscriber cursors,
   `chain_stopped` at level 1, `run_steps` through the taker, the broken-alias
   path, `command_words`, `fold_in`, `clip`, `stop`, and (*Phase 1*) the

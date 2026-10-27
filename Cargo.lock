@@ -64,6 +64,10 @@ version = "0.0.0"
 [[package]]
 name = "hydra_model"
 version = "0.0.0"
+dependencies = [
+ "gs_base",
+ "hydra_protocol",
+]
 
 [[package]]
 name = "hydra_net"

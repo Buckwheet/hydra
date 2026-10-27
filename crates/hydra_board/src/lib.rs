@@ -12,11 +12,14 @@ pub mod macros;
 pub mod merchants;
 pub mod own;
 pub mod pad;
+pub mod paint;
 pub mod push;
 pub mod seat;
 pub mod sessions;
 pub mod store;
 pub mod stream_rules;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod text;
 pub mod targets;
 pub mod trainer;

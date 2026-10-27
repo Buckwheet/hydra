@@ -82,6 +82,22 @@ pub struct TriggerRow {
     pub note: String,
 }
 
+impl TriggerRow {
+    /// Draw the row: its label and value in a grid, its note underneath.
+    ///
+    /// The lookout's page and the banner's ([`crate::banner::Row::ui`]) are the
+    /// same shape, so the drawing is the same call.
+    pub fn ui(&self, ui: &mut egui::Ui) {
+        crate::banner::Row {
+            key: self.key.clone(),
+            label: self.label.clone(),
+            value: self.value.clone(),
+            note: self.note.clone(),
+        }
+        .ui(ui);
+    }
+}
+
 /// The path the trigger is written to.
 ///
 /// **ESTABLISHED** (`0x10149c164`): the folder's `lookout.trigger`.
@@ -301,5 +317,29 @@ mod tests {
         assert_eq!(rows[1].note, "Sound and banner.");
         assert_eq!(file(Path::new("/data")), PathBuf::from("/data/lookout.trigger"));
         assert_eq!(sound_path(Path::new("/data")), PathBuf::from("/data/lookout.wav"));
+    }
+
+    #[test]
+    fn a_trigger_row_draws_its_label_and_value() {
+        let rows = with_trigger_row(&Trigger::default());
+        let (_, out) = crate::testkit::frame(|ui| {
+            for row in &rows {
+                row.ui(ui);
+            }
+        });
+        let words = crate::testkit::words(&out);
+        // Each row paints its label, its value, then its note when it has one.
+        assert_eq!(words[0], "Words");
+        assert_eq!(words[1], "");
+        assert!(words[2].contains("lookout.trigger"), "{}", words[2]);
+        assert_eq!(words[3], "Sound");
+        assert_eq!(words[4], "off");
+        assert_eq!(words[5], "Sound and banner.");
+        assert_eq!(words[6], "Banner");
+        assert_eq!(words[7], "off");
+        assert_eq!(words[8], "Seconds");
+        // `Trigger::default` takes no seconds; a read file would say 3.
+        assert_eq!(words[9], "0");
+        assert_eq!(words.len(), 4 * 2 + 2);
     }
 }

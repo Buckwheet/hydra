@@ -182,6 +182,75 @@ impl Chip {
     }
 }
 
+/// The height of a chip that does not say its own, in points.
+///
+/// The same figure [`Chip::bar`] writes (`10.0`).
+pub const DEFAULT_HEIGHT: f32 = 10.0;
+
+/// The colour of the part of a chip's bar not yet filled.
+///
+/// **UNKNOWN**: the binary's own track colour was not recovered.
+pub const TRACK: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x24);
+
+impl Chip {
+    /// Draw the chip with no value known: the empty text, and an unfilled bar.
+    ///
+    /// The chip itself carries no reading (the binary keeps the current value
+    /// outside the file it reads, in `current`); [`Chip::ui_at`] is the one that
+    /// draws a reading, and this is that with none.
+    pub fn ui(&self, ui: &mut egui::Ui) {
+        self.ui_at(ui, None);
+    }
+
+    /// Draw the chip for `value`: the bar, the thresholds' colour, and the words.
+    ///
+    /// **ESTABLISHED** for the model: the fill is the value as a percentage
+    /// clamped into `0..=100`, the colour is [`Chip::color_at`], the height is
+    /// [`Chip::height`], and the words are [`Chip::words`].  [`Chip::bar`] says
+    /// whether a bar is drawn at all, [`Chip::percent`] whether the number reads
+    /// as a percentage.
+    ///
+    /// **UNKNOWN**: the track colour ([`TRACK`]) and the colour of the words.
+    pub fn ui_at(&self, ui: &mut egui::Ui, value: Option<f32>) {
+        let percent = value.unwrap_or(0.0).clamp(0.0, 100.0);
+        let height = if self.height > 0.0 {
+            self.height
+        } else {
+            DEFAULT_HEIGHT
+        };
+        let words = self.words(value);
+        let fill = crate::paint::color_or(self.color_at(percent), ui.visuals().text_color());
+        let ink = crate::paint::color_or(&self.color, ui.visuals().strong_text_color());
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        if self.bar {
+            painter.rect_filled(rect, 0.0, TRACK);
+            if percent > 0.0 {
+                let done = rect.width() * percent / 100.0;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.left() + done, rect.bottom()),
+                    ),
+                    0.0,
+                    fill,
+                );
+            }
+        }
+        painter.text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            words,
+            font,
+            ink,
+        );
+    }
+}
+
 /// The whole `chips.toml`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Chips {
@@ -248,6 +317,21 @@ pub struct Row {
     pub says: String,
     /// The colour it shows in.
     pub color: String,
+}
+
+impl Row {
+    /// Draw a gathered chip: the bar at the value `gather` read, in the colour
+    /// it chose.
+    ///
+    /// [`Row::color`] replaces the chip's own `color`, which is the colour
+    /// [`Chip::color_at`] falls back to when no threshold applies.
+    pub fn ui(&self, ui: &mut egui::Ui) {
+        let mut chip = self.chip.clone();
+        if !self.color.is_empty() {
+            chip.color = self.color.clone();
+        }
+        chip.ui_at(ui, self.value);
+    }
 }
 
 /// The time the chips were last gathered, so they are not gathered twice.
@@ -358,5 +442,104 @@ shown = true
         assert!(!clock(&mut last, start, std::time::Duration::from_millis(100)));
         let later = start + std::time::Duration::from_millis(150);
         assert!(clock(&mut last, later, std::time::Duration::from_millis(100)));
+    }
+
+    /// A health bar as `chips.toml` would hold it.
+    fn health() -> Chip {
+        Chip {
+            name: "health".into(),
+            color: "#404040".into(),
+            empty: "--".into(),
+            critical: 25.0,
+            order: 1,
+            bar: true,
+            height: 12.0,
+            percent: true,
+            thresholds: vec![
+                Threshold { at: 75.0, color: "#2e8b57".into() },
+                Threshold { at: 25.0, color: "#b03030".into() },
+            ],
+            shown: true,
+            ..Chip::default()
+        }
+    }
+
+    #[test]
+    fn u_i_draws_the_bar_the_height_and_the_words() {
+        let (_, out) = crate::testkit::frame(|ui| health().ui_at(ui, Some(40.0)));
+        // The bar is the full width of the ui, at the chip's own height.
+        let rects = crate::testkit::rect_fills(&out);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        let (track, track_fill) = rects[0];
+        assert_eq!(track, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 12.0)));
+        assert_eq!(track_fill, TRACK);
+        // 40% of it is filled, within half a point, in the 25% threshold's colour.
+        let (done, done_fill) = rects[1];
+        assert!((done.width() - 800.0 * 0.4).abs() < 0.5, "{done:?}");
+        assert_eq!(done.height(), 12.0);
+        assert_eq!(done_fill, egui::Color32::from_rgb(0xb0, 0x30, 0x30));
+        // And the number, as a percentage.
+        assert_eq!(crate::testkit::words(&out), vec!["40%".to_string()]);
+        assert_eq!(
+            crate::testkit::text_colours(&out)[0].1,
+            egui::Color32::from_rgb(0x40, 0x40, 0x40)
+        );
+    }
+
+    #[test]
+    fn the_fill_is_clamped_and_the_thresholds_step() {
+        // Past 100 the bar is full and the top threshold's colour wins.
+        let (_, out) = crate::testkit::frame(|ui| health().ui_at(ui, Some(400.0)));
+        let rects = crate::testkit::rect_fills(&out);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[1].0.width(), 800.0);
+        assert_eq!(rects[1].1, egui::Color32::from_rgb(0x2e, 0x8b, 0x57));
+        // Below 0 nothing is filled, and the chip's own colour answers.
+        let (_, out) = crate::testkit::frame(|ui| health().ui_at(ui, Some(-5.0)));
+        let rects = crate::testkit::rect_fills(&out);
+        assert_eq!(rects.len(), 1, "only the track: {rects:?}");
+        assert_eq!(rects[0].1, TRACK);
+        // With no reading at all the empty text is shown and nothing is filled.
+        let (_, out) = crate::testkit::frame(|ui| health().ui(ui));
+        assert_eq!(crate::testkit::words(&out), vec!["--".to_string()]);
+        assert_eq!(crate::testkit::rect_fills(&out).len(), 1);
+    }
+
+    #[test]
+    fn a_chip_without_a_bar_is_only_its_number() {
+        let counted = Chip {
+            bar: false,
+            percent: false,
+            height: 0.0,
+            ..health()
+        };
+        let (_, out) = crate::testkit::frame(|ui| counted.ui_at(ui, Some(42.4)));
+        assert_eq!(crate::testkit::words(&out), vec!["42".to_string()]);
+        assert!(crate::testkit::rect_fills(&out).is_empty());
+        // A height the file does not give falls back to the default one.
+        let sized = Chip {
+            bar: true,
+            height: 0.0,
+            ..health()
+        };
+        let (_, out) = crate::testkit::frame(|ui| sized.ui_at(ui, Some(10.0)));
+        assert_eq!(crate::testkit::rect_fills(&out)[0].0.height(), DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn a_gathered_row_draws_its_own_colour() {
+        let row = Row {
+            chip: Chip {
+                thresholds: Vec::new(),
+                ..health()
+            },
+            value: Some(70.0),
+            says: "70%".into(),
+            color: "#123456".into(),
+        };
+        let (_, out) = crate::testkit::frame(|ui| row.ui(ui));
+        let rects = crate::testkit::rect_fills(&out);
+        assert_eq!(rects[1].1, egui::Color32::from_rgb(0x12, 0x34, 0x56));
+        assert_eq!(crate::testkit::words(&out), vec!["70%".to_string()]);
     }
 }

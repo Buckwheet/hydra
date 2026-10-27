@@ -614,6 +614,69 @@ impl Wake {
     }
 }
 
+/// What a seat's windows ask of the front end that owns them.
+///
+/// **ESTABLISHED** (the three vtable entries `hydra_gui::EguiWindows` fills —
+/// `<hydra_gui::EguiWindows as hydra_board::seat::Windows>::{open_url, repaint,
+/// repaint_seat}` at `0x1005846b4`, `0x1005846a8`, `0x10058462c`):
+///
+///  * `open_url` allocates a copy of the url and hands `egui::Context::open_url`
+///    an `OpenUrl` with `new_tab` **true**;
+///  * `repaint` is `egui::Context::request_repaint`;
+///  * `repaint_seat` is `request_repaint` and then
+///    `request_repaint_of(ViewportId::from_hash_of(("play", seat)))` — the
+///    literal `"play"` (four bytes at `0x10208216b`) salted with the seat, so one
+///    seat's window can be woken without the others.
+///
+/// The binary spells this trait `hydra_board::seat::Windows`.  That name is taken
+/// here by the recovered per-seat set of open windows ([`Windows`], above), and
+/// public items are not renamed, so the trait lives in this module.
+pub mod windows {
+    /// What a seat's windows ask of the front end that owns them.
+    ///
+    /// See the module's own note: this is the binary's
+    /// `hydra_board::seat::Windows` trait.
+    pub trait Windows {
+        /// Open `url` in the player's browser.
+        fn open_url(&self, url: &str);
+
+        /// Repaint the whole window.
+        fn repaint(&self);
+
+        /// Repaint the window `seat` is played in.
+        fn repaint_seat(&self, seat: u32);
+    }
+}
+
+/// The word `repaint_seat` salts a seat's viewport id with.
+///
+/// **ESTABLISHED** (`0x10208216b`, four bytes).
+pub const PLAY: &str = "play";
+
+/// [`windows::Windows`] over a real [`egui::Context`] — what `hydra_gui`'s
+/// `EguiWindows` was.
+///
+/// **ESTABLISHED** (`0x1005846b4`, `0x1005846a8`, `0x10058462c`): all three
+/// forward to the context, and `open_url` opens a new tab.
+#[derive(Clone, Copy)]
+pub struct EguiWindows<'a>(pub &'a egui::Context);
+
+impl windows::Windows for EguiWindows<'_> {
+    fn open_url(&self, url: &str) {
+        self.0.open_url(egui::OpenUrl::new_tab(url));
+    }
+
+    fn repaint(&self) {
+        self.0.request_repaint();
+    }
+
+    fn repaint_seat(&self, seat: u32) {
+        self.0.request_repaint();
+        self.0
+            .request_repaint_of(egui::ViewportId::from_hash_of((PLAY, seat)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,4 +763,84 @@ mod tests {
         assert_eq!(wake.raised_seats().len(), 2);
         assert!(wake.hub().is_none());
     }
+
+    #[test]
+    fn egui_windows_opens_urls_in_a_new_tab() {
+        use windows::Windows as _;
+
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(crate::testkit::input(crate::testkit::SCREEN), |ui| {
+            let _ = ui;
+            EguiWindows(&ctx).open_url("https://example.com/play");
+        });
+        // `open_url` becomes an OutputCommand for the integration to run.
+        let said = out.platform_output.commands.clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        match &said[0] {
+            egui::OutputCommand::OpenUrl(open) => {
+                assert_eq!(open.url, "https://example.com/play");
+                assert!(open.new_tab, "the recovered call opens a new tab");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// How many of the last frame's repaint causes were asked for from
+    /// `seat.rs`, i.e. by [`EguiWindows`].
+    ///
+    /// `Context::repaint_causes` reports the *previous* pass, so one more empty
+    /// frame has to be run before reading it.
+    fn asked_here(ctx: &egui::Context) -> usize {
+        let _ = ctx.run_ui(crate::testkit::input(crate::testkit::SCREEN), |ui| {
+            let _ = ui;
+        });
+        ctx.repaint_causes()
+            .iter()
+            .filter(|cause| cause.file.ends_with("seat.rs"))
+            .count()
+    }
+
+    #[test]
+    fn egui_windows_repaints_a_seat_and_everything() {
+        use windows::Windows as _;
+
+        let seat = egui::ViewportId::from_hash_of((PLAY, 3u32));
+        let other = egui::ViewportId::from_hash_of((PLAY, 4u32));
+        let ctx = egui::Context::default();
+        assert!(!ctx.has_requested_repaint_for(&seat));
+        // What the context was told, read back inside the pass: egui drops a
+        // child viewport that was never shown, so the request is only observable
+        // while the frame that made it is running.
+        let mut woke = (false, false, false);
+        let _ = ctx.run_ui(crate::testkit::input(crate::testkit::SCREEN), |ui| {
+            let _ = ui;
+            EguiWindows(&ctx).repaint_seat(3);
+            woke = (
+                ctx.has_requested_repaint_for(&seat),
+                ctx.has_requested_repaint_for(&other),
+                ctx.has_requested_repaint(),
+            );
+        });
+        assert!(woke.0, "the seat's own viewport was woken");
+        assert!(!woke.1, "no other seat was");
+        assert!(woke.2, "the whole window was too");
+        // And the plain request came from this file's `repaint`.
+        assert_eq!(asked_here(&ctx), 1);
+
+        // A plain `repaint` wakes only the window it is in.
+        let ctx = egui::Context::default();
+        let mut woke = (false, false);
+        let _ = ctx.run_ui(crate::testkit::input(crate::testkit::SCREEN), |ui| {
+            let _ = ui;
+            EguiWindows(&ctx).repaint();
+            woke = (
+                ctx.has_requested_repaint_for(&seat),
+                ctx.has_requested_repaint(),
+            );
+        });
+        assert!(woke.1);
+        assert!(!woke.0, "no seat's viewport was named");
+        assert_eq!(asked_here(&ctx), 1);
+    }
 }
+

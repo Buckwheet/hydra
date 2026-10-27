@@ -676,6 +676,139 @@ fn read_slices(value: &Value) -> Result<Vec<Slice>, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Painting the wheel
+// ---------------------------------------------------------------------------
+
+/// How finely a slice's arc is drawn: one edge per this many degrees.
+///
+/// **UNKNOWN**: not recovered; ten degrees reads smooth at the wheel's size.
+pub const ARC_STEP: f32 = 10.0;
+
+/// How far out from the centre a slice's label sits, as a share of the radius.
+///
+/// **UNKNOWN**: not recovered.
+pub const LABEL_AT: f32 = 0.6;
+
+/// The colour a slice is drawn in when its file names none.
+///
+/// **UNKNOWN**: not recovered; the colours that *are* recovered are the
+/// `#rrggbb` strings in `controller.toml` ([`Slice::color`]).
+pub const SLICE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x2c, 0x2c, 0x34);
+
+/// The colour a slice's label is written in.
+///
+/// **UNKNOWN**: not recovered.
+pub const SLICE_INK: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xf0, 0xf4);
+
+/// The size of a slice's label, in points.
+///
+/// **UNKNOWN**: not recovered.
+pub const LABEL_SIZE: f32 = 12.0;
+
+/// The direction `degrees` points in.
+///
+/// Angle zero points along `+x` and grows towards `+y` (down the screen), which
+/// is what [`seat_at_angle`] reads: it is handed a direction's `sin` and `cos`,
+/// i.e. its `y` and `x`, so a drawn slice and the hit test agree.
+pub fn turn(degrees: f32) -> egui::Vec2 {
+    let radians = degrees.to_radians();
+    egui::vec2(radians.cos(), radians.sin())
+}
+
+/// The point `radius` out from `centre` at `degrees`.
+pub fn on_wheel(centre: egui::Pos2, radius: f32, degrees: f32) -> egui::Pos2 {
+    centre + turn(degrees) * radius
+}
+
+/// The width of each slice of `view`, in degrees, in [`View::angles`]' order.
+pub fn widths(view: &View) -> Vec<f32> {
+    let weights: Vec<(bool, f32)> = view.slices.iter().map(Slice::weight).collect();
+    spans(&weights)
+}
+
+/// The wedge of each slice: its centre, [`View::angles`]' angle, and its width.
+///
+/// This is exactly the pair [`View::seats`] hands [`seat_at_angle`], drawn — so
+/// what a pointer lands on is what is painted.
+pub fn wedges(view: &View, centre: egui::Pos2, radius: f32) -> Vec<egui::Shape> {
+    let each = widths(view);
+    let mut out = Vec::with_capacity(view.slices.len());
+    for (i, slice) in view.slices.iter().enumerate() {
+        let Some(&at) = view.angles.get(i) else {
+            break;
+        };
+        let width = each.get(i).copied().unwrap_or(0.0);
+        let half = width * 0.5;
+        let steps = ((width / ARC_STEP).ceil() as usize).max(1);
+        let mut points = Vec::with_capacity(steps + 2);
+        points.push(centre);
+        for step in 0..=steps {
+            let along = width * step as f32 / steps as f32;
+            points.push(on_wheel(centre, radius, at - half + along));
+        }
+        let fill = crate::paint::color_or(slice.color.as_deref().unwrap_or(""), SLICE_COLOR);
+        out.push(egui::Shape::convex_polygon(
+            points,
+            fill,
+            egui::epaint::PathStroke::NONE,
+        ));
+    }
+    out
+}
+
+/// Where each slice's label goes, and what it says.
+///
+/// The label is [`Slice::label`], written [`LABEL_AT`] of the way out along the
+/// slice's own angle; a slice with no label says nothing.
+pub fn labels(view: &View, centre: egui::Pos2, radius: f32) -> Vec<(egui::Pos2, String)> {
+    let mut out = Vec::new();
+    for (i, slice) in view.slices.iter().enumerate() {
+        let Some(&at) = view.angles.get(i) else {
+            break;
+        };
+        let Some(label) = slice.label.as_deref().map(str::trim) else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        out.push((
+            on_wheel(centre, radius * LABEL_AT, at),
+            label.to_string(),
+        ));
+    }
+    out
+}
+
+/// Paint the wheel: its slices, then their labels.
+///
+/// The geometry is [`wedges`] and [`labels`]; the colours are each slice's own
+/// `#rrggbb` ([`Slice::color`]) with [`SLICE_COLOR`] for a slice that names none.
+pub fn paint(painter: &egui::Painter, view: &View, centre: egui::Pos2, radius: f32) {
+    painter.extend(wedges(view, centre, radius));
+    let font = egui::FontId::proportional(LABEL_SIZE);
+    for (at, label) in labels(view, centre, radius) {
+        painter.text(
+            at,
+            egui::Align2::CENTER_CENTER,
+            label,
+            font.clone(),
+            SLICE_INK,
+        );
+    }
+}
+
+/// A square `ui` the wheel is drawn in, and the radix of the wheel inside it.
+///
+/// The wheel takes the smaller of the two sides it is given and is drawn in the
+/// middle of that square: returns the square's rect.
+pub fn ui(ui: &mut egui::Ui, view: &View, side: f32) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    paint(ui.painter(), view, rect.center(), side * 0.5);
+    rect
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +1048,108 @@ start = 270.0
         base.over(&over);
         assert!(base.wheels.contains_key("a"));
         assert!(base.wheels.contains_key("b"));
+    }
+
+    /// Two half-circles: one that names its colour, one that does not.
+    fn halves() -> View {
+        let text = "\
+[controller_wheels]
+main = [ { label = \"look\", color = \"#b03030\", span = 180.0, slices = [ { label = \"ring\" } ] },
+         { label = \"ring\", span = 180.0, slices = [ { label = \"deep\" } ] } ]
+";
+        let wheels = Wheels::parse(text).unwrap();
+        wheels.view("main", &[], false)
+    }
+
+    #[test]
+    fn a_wedge_covers_its_own_slice_of_the_circle() {
+        let view = halves();
+        let centre = egui::pos2(100.0, 100.0);
+        let radius = 50.0;
+        let shapes = wedges(&view, centre, radius);
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(widths(&view), vec![180.0, 180.0]);
+        // A 180 degree slice is drawn in 18 edges plus the centre and the start.
+        for (i, shape) in shapes.iter().enumerate() {
+            let egui::Shape::Path(path) = shape else {
+                panic!("a wedge is a path: {shape:?}");
+            };
+            assert_eq!(path.points.len(), 1 + 18 + 1, "slice {i}");
+            assert_eq!(path.points[0], centre);
+            // Every edge point is on the rim, and inside the slice's own angles.
+            let at = view.angles[i];
+            for point in &path.points[1..] {
+                let away = (*point - centre).length();
+                assert!((away - radius).abs() < 0.01, "{away}");
+                let angle = crate::testkit::angle_of(centre, *point);
+                let off = (angle - at + 180.0).rem_euclid(360.0) - 180.0;
+                assert!(off.abs() <= 90.0 + 0.01, "slice {i}: {angle} vs {at}");
+            }
+        }
+        // The colours are the file's own, and the fallback where it names none.
+        let fills: Vec<egui::Color32> = shapes
+            .iter()
+            .map(|shape| match shape {
+                egui::Shape::Path(path) => path.fill,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(fills, vec![egui::Color32::from_rgb(0xb0, 0x30, 0x30), SLICE_COLOR]);
+    }
+
+    #[test]
+    fn the_labels_sit_on_their_own_slices() {
+        let view = halves();
+        let centre = egui::pos2(100.0, 100.0);
+        let radius = 50.0;
+        let labels = labels(&view, centre, radius);
+        assert_eq!(
+            labels.iter().map(|(_, said)| said.as_str()).collect::<Vec<_>>(),
+            vec!["look", "ring"]
+        );
+        // The first label is due east of the centre, the second due west.
+        assert!((labels[0].0 - egui::pos2(100.0 + radius * LABEL_AT, 100.0)).length() < 0.01);
+        assert!((labels[1].0 - egui::pos2(100.0 - radius * LABEL_AT, 100.0)).length() < 0.01);
+    }
+
+    #[test]
+    fn the_drawn_wheel_and_its_hit_test_agree() {
+        // What a pointer lands on is what was painted: every seat's centre angle
+        // is inside its own wedge, and `over` answers with that seat.
+        let view = halves();
+        let centre = egui::pos2(100.0, 100.0);
+        let radius = 50.0;
+        for (i, points) in wedges(&view, centre, radius).iter().enumerate() {
+            let egui::Shape::Path(path) = points else {
+                panic!("not a path")
+            };
+            // The middle of the arc, from a point the wedge itself was drawn to.
+            let middle = path.points[path.points.len() / 2];
+            let direction = (middle - centre).normalized();
+            assert_eq!(
+                view.over(direction.y, direction.x),
+                Some(i),
+                "the middle of slice {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn u_i_paints_the_wheel_in_the_middle_of_its_square() {
+        let view = halves();
+        let (_, out) = crate::testkit::frame(|ui| {
+            super::ui(ui, &view, 200.0);
+        });
+        assert_eq!(crate::testkit::words(&out), vec!["look".to_string(), "ring".to_string()]);
+        let polygons = crate::testkit::polygons(&out);
+        assert_eq!(polygons.len(), 2);
+        // The square is drawn at the left of the frame, so its centre is 100 in.
+        let centre = egui::pos2(100.0, 100.0);
+        for (points, _) in &polygons {
+            assert_eq!(points[0], centre);
+            for point in &points[1..] {
+                assert!(((*point - centre).length() - 100.0).abs() < 0.01);
+            }
+        }
     }
 }

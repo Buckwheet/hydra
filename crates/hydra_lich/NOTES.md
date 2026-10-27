@@ -1,17 +1,55 @@
 # `hydra_lich` — reverse-engineering notes
 
 Source: arm64 Mach-O `/Users/cpmbpro/Code/hydra-inspect/hydra`, symbols at
-`symbols_demangled.txt`; addresses below are unslid VAs.  This crate is a
-**std-only** reconstruction: the original linked `tokio`, `getrandom`,
-`tokio_util::sync::CancellationToken` and `hydra_session::lich::LichDoor`.
-No other Hydra crate is a dependency of this crate, so the recovered pieces
-are expressed as owned data structures plus a synchronous relay.
+`symbols_demangled.txt`; addresses below are unslid VAs.  The original linked
+`tokio`, `getrandom`, `tokio_util::sync::CancellationToken` and
+`hydra_session::lich::LichDoor`.
+
+**Phase 1 status:** `tokio` (1.53.1) and `tokio_util::sync::CancellationToken`
+(0.7.19) are reconnected for real; see §0.  Still stand-ins: `getrandom` and
+`hydra_session::lich::LichDoor` (§4).
 
 Legend:
 * **ESTABLISHED** — directly visible in the disassembly/strings.
 * **INFERRED** — follows from the code shape or from the surrounding
   `hydra_session` API, but the original type/name is not in our crate.
 * **UNKNOWN** — not recoverable from this binary; safest behaviour chosen.
+
+## 0. Phase 1 reconnection
+
+Pins come from the root `Cargo.toml` `[workspace.dependencies]`; this crate
+declares `x = { workspace = true }` and builds with `cargo --offline`.
+
+| original | reconnected crate | pin | replaced | where |
+| --- | --- | --- | --- | --- |
+| `tokio::sync::mpsc::channel(64)` (stdout lines) | `tokio` | `=1.53.1` (`full`) | `std::sync::mpsc::sync_channel(64)` | `relay::read_lines_async`, `relay::bridge_to_std` |
+| `tokio::io::BufReader` + `read_until` | `tokio` | `=1.53.1` | `std::io::BufReader` + `BufRead::read_until` | `relay::read_lines_async` |
+| `tokio::sync::Mutex` (stderr ring, `Waits`) | `tokio` | `=1.53.1` | `std::sync::Mutex` | `relay::keep_errors_async`, `RelayAsync::waits` |
+| `tokio::sync::watch::Receiver<bool>` (+0x160) | `tokio` | `=1.53.1` | plain `hand_held` bool | `RelayAsync::hand` |
+| `tokio::process::Command` / `Child` | `tokio` | `=1.53.1` | `std::process::Command` / `Child` | `child::command_async`, `relay::build_command_async`, `relay::spawn_async`, `RelayAsync` |
+| `tokio::select!` relay loop | `tokio` | `=1.53.1` | poll loop over a std channel | `RelayAsync::pump` |
+| `tokio_util::sync::CancellationToken` | `tokio-util` | `=0.7.19` | `Relay::stop` / `Drop` kill flag | `Relay::stop`/`pump`/`Drop`, `RelayAsync::stop`, `relay::run_until` |
+| `tokio::runtime` | `tokio` | `=1.53.1` | none (the binary's `main` owned it) | `crate::runtime` |
+
+Two layers, one behaviour:
+
+* **tokio-native (new)**: `read_lines_async`, `keep_errors_async`,
+  `build_command_async`, `spawn_async`, `show_async`, `run_async`,
+  `run_until`, `RelayAsync`, `Step`.
+* **synchronous facade (kept, unchanged signatures)**: `read_lines`,
+  `keep_errors`, `build_command`, `spawn`, `show`, `run`, `Relay`.  These now
+  run the same tokio code behind a shared multi-thread runtime
+  (`crate::runtime::{block_on, spawn}`); the only std hop that remains is the
+  final `std::sync::mpsc` receiver the old API hands out, fed by one bridge
+  thread and bounded at 64 so backpressure is unchanged.
+
+`tokio-util` needs no extra feature flags at 0.7.19: `tokio_util::sync`
+(and therefore `CancellationToken`) is compiled unconditionally.  No other
+feature flags were added; `tokio` gets the workspace's `full`.
+
+Not applicable here: this crate has no serde/TOML surface at all (the
+recovered `hydra_lich` range contains no manifest, settings or JSON code), so
+Phase 1 added no serde/toml round-trip tests.
 
 ---
 
@@ -165,14 +203,26 @@ above is certain, the enum spelling is ours.
 * `read_lines`: `BufReader` (8192-byte allocation), reads until `\n`,
   `String::from_utf8_lossy`, bounded `tokio::sync::mpsc` with
   `Semaphore::new(0x40)` = **capacity 64**; detached task; sender closes at
-  EOF.  std equivalent: `std::sync::mpsc::sync_channel(64)` plus a thread
-  (backpressure identical).  The binary strips the delimiter (`Lines`-style);
-  our reader strips `\n` and a preceding `\r`, replaces invalid UTF-8 with
-  U+FFFD, and disconnects the receiver at EOF.
+  EOF.  **Reconnected** (`relay::read_lines_async`): real
+  `tokio::io::BufReader` (its default capacity *is* 8192) over an
+  `AsyncRead`, real `tokio::sync::mpsc::channel(64)`, real spawned task.  The
+  binary strips the delimiter (`Lines`-style); our reader strips `\n` and a
+  preceding `\r`, replaces invalid UTF-8 with U+FFFD, and disconnects the
+  receiver at EOF.  `AsyncBufReadExt::lines` is deliberately *not* used:
+  `lines()` rejects invalid UTF-8 with `InvalidData`, while the binary is
+  lossy — so the split is `read_until(b'\n')` plus `from_utf8_lossy`.
 * `keep_errors`: allocates `Arc<Mutex<VecDeque<String>>>` itself, reads
   `ChildStderr` lines, and **keeps the last 20** (`cmp x8, #0x14`; pop the
   front while full, then push back).  Returns `(Arc, JoinHandle)`.
-  std equivalent: same ring under `Arc<Mutex<…>>` with a reader thread.
+  **Reconnected** (`relay::keep_errors_async`): `Arc<tokio::sync::Mutex<…>>`
+  plus a tokio task over the same line reader.
+* Synchronous facade: `read_lines` / `keep_errors` keep their old signatures.
+  They adapt the blocking `std::io::BufRead` with `relay::BlockingReader`
+  (a reader thread plus a 2-chunk bounded tokio channel, so blocking I/O never
+  lands on a runtime worker) and hand the result back through
+  `bridge_to_std` (one thread, bounded at 64).  The recovered ring rule lives
+  in one helper, `push_kept`, shared by both ring flavours.
+
 
 ---
 
@@ -263,10 +313,21 @@ Recovered transitions:
 * "did not connect within 60 seconds": the accept-keyed race times out.
 * "could not start": `Command::spawn` failed.
 
-Our std-only `run`/`show` implement the same *shape* (spawn → wire readers →
-pump lines until exit → map to `Ended`) without the tokio select, session
-crate or frame parser.  **UNKNOWN:** exact cancellation ordering and the
+Our `run`/`show` implement the same *shape* (spawn → wire readers → pump lines
+until exit → map to `Ended`).  Phase 1 gave that shape two forms:
+
+* `RelayAsync::pump` is the real `tokio::select!`, with the three arms this
+  crate owns: the bounded stdout receiver, `Child::wait` and the
+  `CancellationToken` (`relay::run_async` / `relay::run_until`).
+* The synchronous `Relay::pump` polls the bridged channel with the same order
+  of checks and consults its `CancellationToken` first.
+
+The other recovered arms (door commands, the hand-held `watch`, the `Waits`
+deadline, `fell_behind`, the keyed-accept race) still live outside this crate:
+they need `hydra_session::lich::LichDoor`'s command stream, which is not a
+dependency here (see §4.2).  **UNKNOWN:** exact cancellation ordering and the
 Lich TCP wire framing of the token.
+
 
 ### 2.3 Password / environment flow
 
@@ -312,20 +373,69 @@ body is inlined into the relay closure.
 
 ---
 
-## 4. std-only departures (all marked in code)
+## 4. Departures still in place after Phase 1
 
-| original | std-only reconstruction | why |
+The `tokio` / `tokio_util` rows are **gone** (reconnected, §0).  What remains:
+
+| original | stand-in still used | exact reason |
 | --- | --- | --- |
-| `tokio::sync::mpsc::channel(64)` | `std::sync::mpsc::sync_channel(64)` + thread | no tokio |
-| `tokio::io::BufReader`/`Lines` | `std::io::BufReader` + `read_until` | no tokio |
-| `tokio::sync::Mutex`/`RwLock`/`watch` | `std::sync::Mutex`, plain flags | no tokio |
-| `tokio::process::Command/Child` | `std::process::Command/Child` + threads | no tokio |
-| `getrandom` | `/dev/urandom`, documented fallback | no dependency |
-| `hydra_session::lich::LichDoor` | `Relay` + `Notice` + `Typed` | separate crate not a dependency |
-| `hydra_protocol` frame parsing | caller consumes `String` lines | std-only rule |
-| `CancellationToken` | `Relay::stop` / `Drop` kill+wait | no tokio_util |
+| `getrandom` | `/dev/urandom` + documented SplitMix64 fallback (`child::new_token`) | **not in the workspace pins** (root `Cargo.toml` `[workspace.dependencies]` has no `getrandom`), and Phase 1 may not add a version of its own.  `getrandom::Error` also cannot be named, hence the crate-local `child::TokenError`.  Behaviour is unchanged: 32 bytes -> 64 lowercase hex characters; the fallback is marked `// UNKNOWN:` because the binary has none. |
+| `hydra_session::lich::LichDoor` | local `relay::Relay` / `Notice` / `Typed` / `Waits` | see §4.2 — a sibling *reconstruction*, not a pinned external crate; API shape and merge risk, not a hard blocker. |
+| `hydra_protocol` frame parsing | caller consumes `String` lines (`Relay::output` / `RelayAsync::lines`) | unchanged, and out of scope for this layer: `hydra_protocol` is another workspace crate whose Phase 1 branch is separate; the recovered `hydra_lich` code never parses frames itself (`show` only forwards lines to the door). |
+| `tokio::sync::RwLock` (the shared session flag read in `Waits::new`) | `Waits` keeps its own `hand_held` flag; `RelayAsync::hand` is the real `watch::Receiver<bool>` | the `RwLock` in the binary belongs to `hydra_session`'s shared slot (`shared+0x150`), not to this crate; without the door there is no shared value to lock. |
 
 Everything marked `// UNKNOWN:` in the source expands the points above.
+
+### 4.1 What "reconnected for real" means here
+
+`tokio 1.53.1` and `tokio-util 0.7.19` are real dependencies (workspace pins,
+`cargo --offline`), used through the primitive types the binary used: bounded
+`mpsc`, `BufReader`, `Mutex`, `watch`, `process`, `select!`,
+`CancellationToken`, and a runtime.  The synchronous API is a facade over
+them, not a parallel std implementation — the only std pieces left on that
+path are the blocking-reader adapter (`BlockingReader`, needed because the
+public `read_lines`/`keep_errors` accept `std::io::BufRead`) and the final
+`std::sync::mpsc::Receiver` the old signature returns.
+
+### 4.2 Why `hydra_session::lich::LichDoor` is still a local equivalent
+
+Checked against the current snapshot (`crates/hydra_session/src/lich.rs`,
+`NOTES.md` §3 of that crate):
+
+* **No cycle exists**, so a `path` dependency is *technically* possible:
+  `hydra_session` does not depend on `hydra_lich` (nothing in the workspace
+  does; this crate has no consumers).
+* **The API does not fit without changing our public surface.**
+  `hydra_session`'s `Notice` is `{ kind: Kind /* enum */, level: u8, lines,
+  quiet: bool }` built by `Notice::line(level, text)`; ours is `{ kind: u32,
+  lines, logged, level }` built by `Notice::line(kind, text)` and used exactly
+  that way by the existing tests and by `Ended::notice`
+  (`Notice::line(1, …).with_level(2)`).  Adopting the door's `Notice` would
+  change `Relay`, `Typed`, `Waits::typed/tell`, `shared_symbol` and
+  `Ended::notice` — i.e. the public API this task must keep — and it would
+  move the recovered level/kind numbering into another crate's guesswork.
+* **The door in the snapshot is itself a reconstruction, not a pinned crate.**
+  Its `claim()` returns `Claim { lines: std::sync::mpsc::Sender<String>, typed:
+  std::sync::mpsc::Receiver<String>, wire }`, i.e. *std* channels this crate
+  would have to bridge back into tokio, and its `lich` module is being
+  rewritten on the parallel `p1/hydra_session` branch.  A path dependency
+  would couple the two Phase-1 branches (both must land together or neither
+  builds) and pull `hydra_session`'s growing dependency graph
+  (`hydra_model`/`hydra_net`/`hydra_protocol`, tokio, serde, …) into the relay
+  crate for no behaviour we can test today.
+* **Consequence:** the local equivalents stay, and the parent decides the
+  integration.  For that merge, the mapping is mechanical:
+  * `relay::Notice` -> `hydra_session::notice::Notice::{line,lines}` with
+    `kind: u32` folded onto `Kind::Text` and `level` onto the same `0..=2`
+    scale (`logged` -> `quiet` inverted);
+  * `Relay::send` / `RelayAsync::send` -> `SessionHandle::to_lich` /
+    `hand_to_lich` (the door owns the child's stdin);
+  * `RelayAsync::hand` (`watch::Receiver<bool>`) -> `LichDoor::claim`'s typed
+    tap plus `SessionHandle::lich_takes_typing`;
+  * `Ended` -> `LichDoor::say`, and `LichDoor::fell_behind` -> `Ended::FellBehind`;
+  * `hydra_session::lich::{accept_keyed, connect_keyed}` already exist there
+    for the token handshake this crate mints with `new_token`.
+
 
 ## 5. Tests
 
@@ -338,13 +448,29 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 * `find_ruby`: first PATH hit, PATH-before-version-dir, numeric version
   ordering (`3.2.10 > 3.2.9`), missing root.
 * `filter_password_env`/`command`: password vars removed, 14-byte and
-  wrong-prefix names kept.
+  wrong-prefix names kept — for the `std` **and** the `tokio::process`
+  builders.
 * `Waits`: 10-second deadline, queue order, first-line notice text, tell
   flags/message with N=2, FIFO drain only when armed, immediate-hand branch.
 * `never_given` concatenation order; `shared_symbol` exact warning.
 * `Ended::notice` exact text/levels for all seven variants.
-* `read_lines`: order, CRLF stripping, empty lines, lossy UTF-8, EOF.
-* `keep_errors`: last-20 ring and order.
-* `build_command`: exact recovered argv, env pairs, cwd, port 65535.
+* `read_lines`: order, CRLF stripping, empty lines, lossy UTF-8, EOF
+  (through the synchronous facade).
+* `keep_errors`: last-20 ring and order (sync ring, plus the
+  `tokio::sync::Mutex` ring of `keep_errors_async`).
+* `build_command`: exact recovered argv, env pairs, cwd, port 65535;
+  `build_command_async` must produce the identical argv/program/cwd.
 * end-to-end `show`/`run` with a fake Ruby shell script: stdout lines in
   order, stdin round-trip, stderr ring, exit status; missing Ruby -> error.
+* `runtime`: singleton, `block_on` from plain threads, nested `block_on`
+  inside a runtime, `spawn` from a foreign runtime, panic propagation.
+* **Phase 1 async layer**: `read_lines_async` order / lossy UTF-8 / EOF;
+  bounded backpressure (a 200-line writer stalls while 64 lines are buffered
+  and resumes when drained); `keep_errors_async` ring; `show_async` over a
+  fake Ruby (queued typed line + notice, `watch` hand flag flipped by
+  `release_hold`, stdin round-trip, stdout order, stderr ring, exit status);
+  `run_async` exit status -> `Ended`; `run_until` cancellation ->
+  `Ended::Stopped` ("Lich stopped.", level 2) with the child killed; a
+  pre-cancelled token; the synchronous `Relay`'s `CancellationToken`
+  cancelling `run_to_end` from another thread; `BlockingReader`.
+

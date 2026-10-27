@@ -2,3 +2,12 @@
 name = "hydra_lich"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Phase 1 reconnection: the original relay linked tokio (bounded mpsc,
+# BufReader, Mutex/RwLock/watch, process) and
+# tokio_util::sync::CancellationToken.  Versions come from the workspace pins.
+# `tokio-util` needs no extra feature flags in 0.7.19: `sync`, and therefore
+# `CancellationToken`, is compiled unconditionally.
+tokio = { workspace = true }
+tokio-util = { workspace = true }

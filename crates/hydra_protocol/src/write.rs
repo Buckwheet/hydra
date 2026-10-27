@@ -175,6 +175,10 @@ pub fn runs(runs: &Runs) -> String {
     if link_open {
         out.push_str("</a>");
     }
+    // The binary pops every still-open bold level at the end.
+    if bold {
+        out.push_str("<popBold/>");
+    }
     if current_preset.is_some() {
         out.push_str("</preset>");
     }
@@ -230,6 +234,12 @@ mod tests {
         ]);
         let wire = super::runs(&r);
         assert_eq!(wire, "You see <pushBold/>a gem<popBold/>.");
+    }
+
+    #[test]
+    fn runs_closes_an_unterminated_bold_span() {
+        let r = Runs(vec![Run::bold("hi")]);
+        assert_eq!(super::runs(&r), "<pushBold/>hi<popBold/>");
     }
 
     #[test]

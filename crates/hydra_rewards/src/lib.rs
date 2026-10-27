@@ -9,7 +9,8 @@
 //! Recovered from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hydra`
 //! (no DWARF).  Every module's `pub` items quote the unslid virtual address
 //! they were recovered from; see `NOTES.md` for the evidence, the exact
-//! message strings and the `std`-only departures.
+//! message strings, the crates reconnected in Phase 1 and the seams that
+//! remain.
 //!
 //! The shape of the crate, as the binary has it:
 //!

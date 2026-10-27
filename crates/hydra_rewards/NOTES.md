@@ -6,9 +6,18 @@ is an **unslid virtual address**.  The crate is Hydra's daily-login-reward
 tracker: it watches the lines a session says, keeps the reward, replays old
 logs, prints the `rewards` reports and owns `rewards.toml`.
 
-Status: `cargo check -p hydra_rewards` and `cargo test -p hydra_rewards` pass
-(**60 tests**), and `grep -rn 'todo!()\|unimplemented!()' crates/hydra_rewards/src`
-is empty.
+Status: `cargo check -p hydra_rewards --offline` and `cargo test -p
+hydra_rewards --offline` pass (**72 tests**), and
+`grep -rn 'todo!()\|unimplemented!()' crates/hydra_rewards/src` is empty.
+
+> **Phase 1 (reconnection)**: `serde` + `toml`, `jiff` and `tokio` are the real
+> crates again at the workspace pins (`serde` 1.0.229 derive, `toml` 1.1.6,
+> `jiff` 0.2.37, `tokio` 1.53.1 `full`), declared as `x = { workspace = true }`.
+> The `rewards.toml` reader/writer is a serde derive, the claim time is
+> resolved through jiff's time-zone database (`America/New_York`, DST gaps and
+> folds included) and the recorder has the `tokio` task back alongside its
+> synchronous entry point.  `rusqlite`/`hydra_ledger` and `hydra_protocol` stay
+> seams — see §5.2 for why.
 
 Legend:
 
@@ -82,13 +91,13 @@ dependency replaced by a seam; `unknown` = not recoverable.
 | `report` | `everyone` | `0x1014d0260` | **partly** — the header and the pieces are recovered, the row layout is not (§6.7) |
 | `store` | `kept` | `0x1014d1204` | **partly** — the date arithmetic and the row are recovered, the page enum is not (§6.8) |
 | `replay` | `rewards` | `0x1014ca344` | **partly** — the search, the frame replay and the element type are recovered; the text is replayed line by line instead of through `hydra_protocol` (§6.9) |
-| `recorder` | `start` | `0x1014e1ea8` | **partly** — a `tokio` task and a `rusqlite` write in the original; the loop and the grammar are recovered, the write is the `Sink` seam (§6.10) |
+| `recorder` | `start` | `0x1014e1ea8` | **full** for the loop and the grammar, now `tokio` again ([`crate::recorder::spawn`]); the `rusqlite` write is the `Sink` seam (§6.10) |
 | `schedule` | `Settings::read` | `0x1014c857c` | **full** |
-| `schedule` | `Settings::parse` | `0x1014c87c8` | **full** for the keys and the `time` grammar; the `toml`/`serde` layer is replaced (§6.11) |
+| `schedule` | `Settings::parse` | `0x1014c87c8` | **full**, `serde` + `toml` again ([`crate::toml`]) |
 | `schedule` | `Settings::write` | `0x1014c92b8` | **full** |
 | `schedule` | `Settings::to_toml` | `0x1014c946c` | **full** (the error arm answers an empty string, §6.12) |
-| `schedule` | `Settings::today` | `0x1014c8d08` | **partly** — the configured time resolved to an instant, but through `jiff`'s zone database in the original (§6.13) |
-| `schedule` | `Settings::today_now` | `0x1014c9648` | **partly** — `jiff::now::sys::system_time` replaced by `SystemTime::now` |
+| `schedule` | `Settings::today` | `0x1014c8d08` | **full** — the recovered form is `(&self, &jiff::Zoned) -> Option<jiff::Timestamp>`, kept as [`Settings::today_at`] (§6.13) |
+| `schedule` | `Settings::today_now` | `0x1014c9648` | **full** — the recovered form answers a `jiff::Zoned`, kept as [`zoned_now`] |
 | `schedule` | `Character::skipped` | `0x1014c9c24` | **full** |
 | `schedule` | `next` (private, referenced by `hydra_table`) | `0x1010011cb08` window | **partly** (§6.14) |
 
@@ -226,21 +235,30 @@ login reward` (`0x102408d52`).
 
 ---
 
-## 5. `std`-only departures
+## 5. Departures
 
-| original | what it did | this build |
+### 5.1 Reconnected in Phase 1 (the `std` stand-ins are gone)
+
+| real crate (pin) | replaces | where | notes |
+|---|---|---|---|
+| `serde` 1.0.229 (derive) + `toml` 1.1.6 | the hand-written three-key reader/writer (~250 lines) | [`crate::toml`] — `Raw`, `parse`, `to_toml` | `struct Raw` is the derive the binary has (`0x10241af27`, fields at `0x10241aee8`…`0x10241aef5`); reading is `toml::from_str` (the `visit_map` at `0x1014db690`), writing `toml::to_string` (`0x1014c952c`, error arm → empty `String`, `0x1014c9538`).  Unknown keys are dropped by the derived visitor and by a rewrite, as the original's were.  The `std` reader's error texts (`line {}: cannot read the value`) are gone; a bad document now answers the `toml` crate's message, which `Settings::read` wraps as `{path}: {error}` (`0x103e21615`). |
+| `jiff` 0.2.37 | `hydra_net::eastern`'s fixed arithmetic for `Settings::today` / `today_now` | [`crate::schedule`] — `Settings::{today, today_at}`, [`zoned_now`] | The recovered body is `Settings::today(&self, now: &jiff::Zoned) -> Option<jiff::Timestamp>` (`0x1014c8d08`): the civil date comes out of `now` (`0x1014c8d5c`), the wall-clock time out of the setting, and the instant out of `TimeZone::to_ambiguous_timestamp` (`0x1014c8ddc`/`0x1014c8db0`/`0x1014c8e2c`, one call per `TimeZone` representation).  Both ambiguous arms take the offset *before* the transition (`0x1014c8e84`, `0x1014c8fd0`) — jiff's `compatible` — so a time in the spring gap reads forward and a time in the autumn fold takes the earlier instant.  `today_now` (`0x1014c9648`) is the inlined `Zoned::now()` (`jiff::now::sys::system_time` at `0x101c8be40`, `SystemTime::duration_since`, `SignedDuration::try_from`, `jiff::tz::db`, `jiff::tz::system::get`). |
+| `tokio` 1.53.1 (`full`) | the "spawned task" that was only a comment | [`crate::recorder`] — `spawn`, `run`, `OwnedChunk`, `Frames` | `recorder::start`/`recorder::run` are `tokio` tasks in the original (their `{{closure}}` drop glue is at `0x1014ccf8c`, `0x1014d9768`, `0x1014dfe54`, `0x1014d9464`, next to `tokio`'s `Harness` symbols).  `spawn` starts the same loop as a task fed by a `tokio::sync::mpsc` channel of owned frames; `start` stays as the synchronous spelling of the same state machine, because that is what the crate's own tests, `replay` and any caller holding its frames already uses.  `#[tokio::test]` drives the four new task tests. |
+
+### 5.2 Departures that remain
+
+| original | this build | why it stays |
 |---|---|---|
-| `serde` + `toml` | `settings::Raw`'s derive, `toml::ser::to_string`, `toml::de::Error` | [`crate::toml`] — ~250 lines that read and write the three keys, strings, booleans and string arrays, keeping unknown keys and the file's key order. The error messages differ from `serde`'s (`invalid type: {}`, `unknown field \`{}\`` at `0x103e6b8a7`… are not reproduced). |
-| `jiff` | `Settings::today` resolved the configured wall-clock time through the zone database (including the ambiguous-hour retries at `0x1014c8e0c`), `today_now` took the system clock | [`hydra_net::eastern`] — the game's clock, which is the clock every report quotes: `midnight(date(now)) + minutes * 60`. Ambiguous and non-existent local times are not modelled. |
-| `tokio` | `recorder::start` was a spawned task driven by the session's frame stream | [`crate::recorder::start`] is a plain loop over [`Chunk`]s; nothing is spawned and no channel exists. |
-| `rusqlite` / `hydra_ledger` | `Reader::{rewards, latest_store_visits, latest_store_claims}`, `Writer::record`, `Ledger::reader` | [`crate::report::Source`] and [`crate::recorder::Sink`] traits — the same seam `hydra_exp` uses. The error type is `String` where the original had `rusqlite::Error`, and `report::{answer,run}` answer `Result<Vec<String>, String>`. |
-| `hydra_protocol` | `Watcher::hear` took `&hydra_protocol::frame::vocabulary::Frame` (a 0x118-byte tagged frame: a `&[u8]` at `+0x08`/`+0x10` and a "line ends here" byte at `+0x110`), and `replay::rewards` ran the text through `Parser::push_bytes`/`finish` | [`crate::watcher::Chunk`] carries exactly those two facts, and `replay::rewards` splits the text on `\n`. Recovered `hydra_protocol::frame::Frame` is a *simplified* model of the same enum (its own `NOTES.md` says so), so a `plain()`-based adapter would lose the offset-0x110 flag. |
-| `hydra_session::store::save_bytes` | used, as-is | used, as-is (path dependency) — `Settings::write` keeps the durable write and the `remove_file` fallback. |
-
-Path dependencies added to `crates/hydra_rewards/Cargo.toml`: `hydra_net`
-(`eastern`, `store::page`) and `hydra_session` (`store::save_bytes`).  Both are
-the crates the original called at the same sites (`0x101c586c0`,
-`0x101c5cd1c`, `0x101aa16dc`).
+| `rusqlite` / `hydra_ledger` | [`crate::report::Source`] and [`crate::recorder::Sink`] traits; the error is `String` where the original had `rusqlite::Error`, and `report::{answer,run}` answer `Result<Vec<String>, String>`. | `hydra_ledger` is being rewritten around `rusqlite` in a parallel worktree and its API is moving: today's `Reader::rewards` answers `Vec<hydra_ledger::row::Reward>` and `Writer::record` takes a `Row`, which is not this crate's [`Heard`](crate::watcher::Heard).  A path dependency on it now would couple two in-flight crates, cannot keep `Source`/`Sink`'s public signatures, and would break the moment the sibling lands.  The seam is the documented original mapping (`Reader::{rewards, latest_store_visits, latest_store_claims}` at `0x10168c874`, `0x10168c4b0`, `0x10168c3b0`, `Writer::record`→the `INSERT` at `0x103985e59`); the adapter belongs here once the ledger's rows are settled. |
+| `hydra_protocol` | [`crate::watcher::Chunk`] (bytes + `ends_line`), [`crate::recorder::OwnedChunk`], and `replay::rewards` splitting the text on `\n`. | `hydra_protocol` is merged (L1), but its recovered `Frame` is a *simplified* model of the binary's `vocabulary::Frame` — its own `NOTES.md` says so, and it has no "line ends here" fact.  `Watcher::hear` needs exactly that byte (`0x1014effbc`: `ldrb w8, [x21, #0x110]; tbz w8, #0x0, …`), so a `Frame::plain()` adapter would silently claim every frame ends its line and turn a split reward line into two rows.  The two facts therefore stay explicit until `hydra_protocol` can answer the flag.  `replay`'s `Parser::push_bytes`/`finish` path (`0x1014ca5xx`) is the same trade: the replayed logs are line-per-`\n` text, and the parser's own `Frame` would lose the flag anyway. |
+| `hydra_session::store::save_bytes` | used, as-is (path dependency) — `Settings::write` keeps the durable write and the `remove_file` fallback. | it is the recovered call at `0x1014c9334`. |
+Path dependencies in `crates/hydra_rewards/Cargo.toml`: `hydra_net` (`eastern`,
+`store::page`) and `hydra_session` (`store::save_bytes`).  Both are the crates
+the original called at the same sites (`0x101c586c0`, `0x101c5cd1c`,
+`0x101aa16dc`); `tokio`, `serde`, `toml` and `jiff` come from the workspace
+pins.  `toml_edit` 0.25.15 is pinned but **not** used here: the recovered
+writer builds a fresh `Raw` and serialises it, so nothing has to preserve an
+existing document's formatting.
 
 ---
 
@@ -262,9 +280,12 @@ the crates the original called at the same sites (`0x101c586c0`,
    folded into an integer, but which match wins (first or last) is not visible
    in the arithmetic.  `rfind` is used; every recovered line has the phrase
    once.
-3. **`Watcher::hear`'s argument.**  The frame struct is not reconstructed
-   (§5), so [`Chunk`] is a two-field stand-in whose field offsets (`&[u8]` at
-   `+0x08`, flag at `+0x110`) are the recovered ones.
+3. **`Watcher::hear`'s argument.**  The frame struct is the binary's
+   `hydra_protocol::frame::vocabulary::Frame` (0x118 bytes, §5.2), so
+   [`Chunk`] is a two-field value whose field offsets (`&[u8]` at `+0x08`,
+   flag at `+0x110`) are the recovered ones.  `hydra_protocol` is merged, but
+   its recovered `Frame` is a simplified model without the flag, so the
+   adapter would lose a recovered fact (§5.2).
 4. **`Watcher::hear_line`'s day test.**  The emitted `cmp x21, #0x2; b.ne`
    (`0x1014f0120`) tests the first word of `Option<u32>`, whose tag is 0 or 1,
    so it can never be equal; the only reading that keeps the two grammars
@@ -298,30 +319,59 @@ the crates the original called at the same sites (`0x101c586c0`,
    is not in the recovered bodies, so this crate returns the `Said` values and
    offers [`replay::rows`] to make the rows.  The original's second argument
    (kept in the iterator state at `0x1014ca768`) is not identified and has no
-   counterpart here.
+   counterpart here.  The text still goes through the [`Watcher`] line by line
+   rather than through `hydra_protocol`'s `Parser::push_bytes`/`finish`
+   (`0x1014ca5xx`): the same reason as §5.2, the parser's frames cannot say
+   where a line ends.
 10. **`recorder::start`.**  49,808 bytes of `tokio` task machinery, a
     `rusqlite` writer and the session's frame source.  The recovered parts are
-    the watcher loop, the grammar and the `login_rewards` `INSERT`; the write
-    itself is the `Sink` seam, and the original's de-duplication (the
-    `INSERT … WHERE login_rewards.reward = '' AND excluded.reward <> ''`
-    upgrade at `0x103986049`) is not modelled — every hearing is written.
+    the watcher loop, the grammar, the `tokio` task and the `login_rewards`
+    `INSERT`; the loop is back on `tokio` ([`crate::recorder::spawn`]) and the
+    write is still the `Sink` seam (§5.2).  **UNKNOWN**: the channel capacity
+    (this crate uses [`crate::recorder::FRAMES`]) and whether the original
+    keyed its rows by character before spawning.  The original's
+    de-duplication (the `INSERT … WHERE login_rewards.reward = '' AND
+    excluded.reward <> ''` upgrade at `0x103986049`) is not modelled — every
+    hearing is written.
 11. **`Settings::parse`'s `time` grammar.**  The `:` split, the sign handling
     and the minutes bound of 60 are recovered; the bound `cmp x10, #0xf` at
     `0x1014c8bd0` (fifteen of *something*) is not explained — this
     reconstruction accepts two-digit hours `0..=23` and minutes `0..=59`.
     The GUI's help says the time is "hours from midnight, such as 19.25",
     which is a different spelling of the same setting and is not accepted by
-    the TOML reader.
+    the TOML reader.  **INFERRED**: the serde attributes.  The binary has the
+    field names and their types (`0x10241aee8`…`0x10241af27`) but not the
+    attributes; `#[serde(default)]` on `skip`/`store` and
+    `skip_serializing_if` on `time`/`skip` are what reproduces the recovered
+    file shape (`store` always written, the other two only when set) and the
+    existing tests, which read a document with any subset of the three keys.
 12. **`Settings::to_toml`'s return type.**  The emitted body answers a
     `Result`-shaped value whose error arm writes an empty `String`
     (`0x1014c9538`), and `Settings::write` uses the text without ever looking
-    at an error.  This reconstruction returns `String` and cannot fail.
-13. **`Settings::today`.**  The original resolved the time through `jiff`'s
-    zone database with retries for ambiguous and skipped local times
-    (`0x1014c8e0c`, `0x1014c8f04`).  This reconstruction resolves it on the
-    game's Eastern clock at `midnight + minutes * 60`, which is the clock the
-    reports quote; the difference only shows for settings whose time falls in
-    a DST gap.
+    at an error.  This reconstruction returns `String` and cannot fail —
+    [`crate::toml::to_toml`] answers the same empty `String` if `toml` ever
+    refuses.
+13. **`Settings::today`.**  *(Corrected in Phase 1.)*  The original resolved
+    the time through `jiff`: `now.date().at(hh, mm, 0, 0)` and then
+    `TimeZone::to_ambiguous_timestamp(...)` (`0x1014c8ddc`, `0x1014c8db0`,
+    `0x1014c8e2c` — one call per `TimeZone` representation), with the offset
+    *before* the transition taken for both a gap and a fold
+    (`0x1014c8e84`, `0x1014c8fd0`) — jiff's `compatible`.  There are no
+    "ambiguous-hour retries" at `0x1014c8e0c` as the earlier note said: that
+    address is jiff's own `Offset::from_seconds` range check
+    (`jiff-0.2.37/src/tz/offset.rs:1049`, reached only for a fixed-offset
+    zone), and `0x1014c8f04` is the fold/gap re-dispatch.  This crate now does
+    the same thing, in the game's zone.  Two differences remain:
+    * the zone.  The recovered `today` takes the `Zoned` from its caller and
+      the only recovered caller passes `today_now()` — a `Zoned::now()`, i.e.
+      the *system* zone.  This crate's no-argument `today()` passes an Eastern
+      `Zoned`, because the setting is the game's wall clock; a caller with its
+      own `Zoned` should use [`Settings::today_at`] and get the recovered
+      behaviour exactly.
+    * an out-of-range `time` (24:00 or later).  The recovered code built it
+      with jiff's panicking `Date::at` and `0x1014c8d54` jumps to the
+      `invalid time` panic (`jiff-0.2.37/src/civil/time.rs:328`).  This crate
+      answers `None` instead; `Settings::parse` cannot produce such a value.
 14. **`schedule::next`.**  The symbol survives (`0x1010011cb08`) but its body
     is a `jiff` comparison this reconstruction cannot read faithfully; "today's
     instant when it is still to come, tomorrow's otherwise" is the reading the

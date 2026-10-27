@@ -20,13 +20,62 @@
 //! `time` is a `hh:mm` string (`to_toml` builds it with the `{:02}:{:02}`
 //! blob at `0x10241af01`), `skip` is the list of characters not to claim for
 //! and `store` turns the store claim on.
+//!
+//! **Phase 1 reconnection**: the document is read and written by `serde` +
+//! `toml` ([`crate::toml`]) and the claim time is resolved through `jiff`'s
+//! time-zone database, at the pinned crate versions.  Two of the recovered
+//! signatures differ from the public ones this crate keeps for its siblings:
+//!
+//! * `Settings::today` is `(&self, now: &jiff::Zoned) -> Option<jiff::Timestamp>`
+//!   — kept as [`Settings::today_at`], with the no-argument
+//!   [`Settings::today`] answering unix seconds;
+//! * `Settings::today_now` answers a `jiff::Zoned` — kept as [`zoned_now`],
+//!   with [`Settings::today_now`] answering unix seconds.
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+use jiff::civil::Date as CivilDate;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 
 use crate::row::Who;
+use crate::toml::{self as manifest, Raw};
 use hydra_net::eastern;
 use hydra_session::store::save_bytes;
-use crate::toml::{self as toml, Value};
+
+/// The game's time zone, from the zone database.
+///
+/// `America/New_York`, with `EST5EDT` (the same modern rule, without the
+/// history) as the fallback `hydra_net::eastern` uses; `None` on a machine
+/// with no zone database at all, which is the only case the `std`-only
+/// arithmetic in [`hydra_net::eastern`] still answers.
+fn game_zone() -> Option<TimeZone> {
+    static ZONE: OnceLock<Option<TimeZone>> = OnceLock::new();
+    ZONE.get_or_init(|| {
+        TimeZone::get("America/New_York")
+            .ok()
+            .or_else(|| TimeZone::get("EST5EDT").ok())
+    })
+    .clone()
+}
+
+/// Now, as the `jiff::Zoned` the recovered `Settings::today` takes.
+///
+/// **Reconnected**: `Settings::today_now() -> jiff::Zoned` — `@0x1014c9648`
+/// is `jiff::now::sys::system_time` (`0x101c8be40`), then
+/// `SystemTime::duration_since(UNIX_EPOCH)`, `SignedDuration::try_from`, and
+/// the zone from `jiff::tz::db`/`jiff::tz::system::get` — i.e. `Zoned::now()`.
+/// The zone is the game's here, not the machine's: the setting is the game's
+/// wall clock and every report quotes that clock
+/// (`hydra_net::eastern`).  **UNKNOWN**: whether the original asked for the
+/// system zone or an Eastern one — the recovered `today_now` is the inlined
+/// `Zoned::now()`, which is the system zone, and the only recovered callers
+/// are `hydra_table::reward_claim::run`'s task (`0x10006edd8`, inside the
+/// closure at `0x10006e9c0`), which passes it straight to `today`.
+pub fn zoned_now() -> Zoned {
+    Timestamp::now().to_zoned(game_zone().unwrap_or(TimeZone::UTC))
+}
 
 /// The file's name (`0x10241aef5`, twelve bytes).
 pub const FILE: &str = "rewards.toml";
@@ -110,37 +159,32 @@ impl Settings {
     /// `@0x1014c87c8` (**full**).
     ///
     /// The document is read as `Raw { time: Option<String>, skip:
-    /// Vec<String>, store: bool }` (the `Raw` visitor at `0x1014db690`), then
-    /// `time` is parsed as `hh:mm` by hand — the `:` is found with
-    /// `slice::memchr` (`0x1014c8958`), both halves are folded as integers
-    /// with a sign (`cmp w8, #0x2b`/`#0x2d` at `0x1014c89b0`), the minutes
-    /// must be under `60` (`cmp w10, #0x3c` at `0x1014c8be0`) and a value it
-    /// cannot read answers `` `{}` is not a time of day: say it as 19:05. ``
-    /// (the blob at `0x103e6b629`).
+    /// Vec<String>, store: bool }` by `serde` + `toml` (the `Raw` visitor at
+    /// `0x1014db690`, now [`crate::toml::Raw`]), then `time` is parsed as
+    /// `hh:mm` by hand — the `:` is found with `slice::memchr`
+    /// (`0x1014c8958`), both halves are folded as integers with a sign
+    /// (`cmp w8, #0x2b`/`#0x2d` at `0x1014c89b0`), the minutes must be under
+    /// `60` (`cmp w10, #0x3c` at `0x1014c8be0`) and a value it cannot read
+    /// answers `` `{}` is not a time of day: say it as 19:05. `` (the blob at
+    /// `0x103e6b629`).
     ///
     /// ```text
     /// parse("time = \"19:15\"\nskip = [\"Aelith\"]\nstore = true\n").unwrap()
     ///     == Settings { skip: [Character("Aelith")], time: Some(19*60+15), store: true }
     /// ```
     pub fn parse(text: &str) -> Result<Settings, String> {
-        let doc = toml::parse(text)?;
+        let raw = manifest::parse(text)?;
         let mut settings = Settings::default();
-        if let Some(time) = doc.get("time").and_then(Value::as_str) {
+        if let Some(time) = raw.time.as_deref() {
             settings.time = Some(parse_time(time)?);
         }
-        settings.skip = doc
-            .get("skip")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|s| Character::new(s.trim()))
-                    .filter(|c| !c.0.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        settings.store = doc.bool_of("store");
+        settings.skip = raw
+            .skip
+            .iter()
+            .map(|s| Character::new(s.trim()))
+            .filter(|c| !c.0.is_empty())
+            .collect();
+        settings.store = raw.store;
         Ok(settings)
     }
 
@@ -176,30 +220,18 @@ impl Settings {
     /// The `time` is rendered `{:02}:{:02}` (`0x10241af01`) from
     /// `minutes / 60` and `minutes % 60` (`0x1014c94a0` divides by 60 with the
     /// `0x88888889` magic), the skip list is cloned as-is and the `store` flag
-    /// appended, then the lot is serialised
-    /// (`toml::ser::to_string` at `0x1014c952c`; the error arm at
+    /// appended, then the lot is serialised by `toml::to_string`
+    /// (`0x1014c952c`, now [`crate::toml::to_toml`]; the error arm at
     /// `0x1014c9538` answers an empty string, which is what this returns).
     pub fn to_toml(&self) -> String {
-        let mut doc: Vec<(String, Value)> = Vec::new();
-        if let Some(minutes) = self.time {
-            doc.push((
-                "time".to_string(),
-                Value::Str(format!("{:02}:{:02}", minutes / 60, minutes % 60)),
-            ));
-        }
-        if !self.skip.is_empty() {
-            doc.push((
-                "skip".to_string(),
-                Value::Arr(
-                    self.skip
-                        .iter()
-                        .map(|c| Value::Str(c.0.clone()))
-                        .collect(),
-                ),
-            ));
-        }
-        doc.push(("store".to_string(), Value::Bool(self.store)));
-        toml::to_toml(&Value::Obj(doc))
+        let raw = Raw {
+            time: self
+                .time
+                .map(|minutes| format!("{:02}:{:02}", minutes / 60, minutes % 60)),
+            skip: self.skip.iter().map(|c| c.0.clone()).collect(),
+            store: self.store,
+        };
+        manifest::to_toml(&raw)
     }
 
     /// Write `<dir>/rewards.toml`, or delete it when nothing is set.
@@ -228,38 +260,88 @@ impl Settings {
 
     /// Now, unix seconds.
     ///
-    /// `Settings::today_now() -> i64` — `@0x1014c9648` (**partly**: the
-    /// emitted body asks `jiff::now::sys::system_time` and divides a
-    /// `SystemTime` down to an instant; the std equivalent is
-    /// `SystemTime::now()`).
-    ///
-    /// **Departure**: `jiff`/`chrono` are replaced by the system clock.
+    /// `Settings::today_now() -> i64` — `@0x1014c9648` (**full**, reconnected):
+    /// the emitted body is `jiff::now::sys::system_time` →
+    /// `SystemTime::duration_since(UNIX_EPOCH)` → `SignedDuration::try_from`
+    /// → the zone (`jiff::tz::db`, `jiff::tz::system::get`), i.e. a
+    /// `jiff::Zoned`.  [`zoned_now`] is that `Zoned`; this keeps the unix
+    /// second spelling the crate's other row types use.
     pub fn today_now() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+        zoned_now().timestamp().as_second()
     }
 
     /// The instant today's claim time falls on, unix seconds.
     ///
-    /// `Settings::today(&self) -> Option<i64>` — `@0x1014c8d08` (**partly**:
-    /// the body resolves the configured wall-clock time through `jiff`'s
-    /// time-zone database, including the ambiguous-hour cases at
-    /// `0x1014c8e0c`; this reconstruction resolves it on the game's own clock
-    /// instead, which is the clock every report quotes).
+    /// The recovered body is `Settings::today(&self, now: &jiff::Zoned) ->
+    /// Option<jiff::Timestamp>` — `@0x1014c8d08` (**full**), kept here as
+    /// [`Settings::today_at`] with this no-argument spelling answering the
+    /// unix second its siblings use.
     ///
     /// ```text
     /// Settings { time: Some(19 * 60 + 15), .. }.today()
     ///     == Some(<2024-01-15 19:15 Eastern>)
     /// ```
-    ///
-    /// **Departure**: `jiff` is replaced by
-    /// [`hydra_net::eastern`](hydra_net::eastern).
     pub fn today(&self) -> Option<i64> {
-        let minutes = self.time? as i64;
-        let now = Settings::today_now();
-        Some(eastern::midnight(&eastern::date(now)) + minutes * 60)
+        match game_zone() {
+            Some(zone) => {
+                let now = Timestamp::now().to_zoned(zone);
+                self.today_at(&now).map(|ts| ts.as_second())
+            }
+            // No zone database at all: the game clock, as the `std`-only build
+            // had it.  The original had no such fallback — jiff's
+            // `TimeZone::get` would have had nothing to answer.
+            None => {
+                let minutes = self.time? as i64;
+                Some(eastern::midnight(&eastern::date(eastern::now())) + minutes * 60)
+            }
+        }
+    }
+
+    /// The instant today's claim time falls on, resolved in `now`'s zone.
+    ///
+    /// `Settings::today(&self, now: &jiff::Zoned) -> Option<jiff::Timestamp>`
+    /// — `@0x1014c8d08` (**full**).  This is the recovered signature: the
+    /// wall-clock time is built on `now`'s civil date
+    /// (`ldr w24, [x1, #0x20]` reads the date out of the `Zoned`'s datetime,
+    /// `0x1014c8d5c`) and resolved in `now`'s zone
+    /// (`ldr x19, [x1, #0x10]`, `0x1014c8d74`).
+    ///
+    /// | case | answer |
+    /// |---|---|
+    /// | unambiguous | that instant (`0x1014c8e58`: the `Unambiguous` tag falls straight through to `local - offset`) |
+    /// | DST gap | the wall clock is pushed forward — 02:30 on 2024-03-10 resolves to 03:30 EDT, `0x1014c8e84` taking the `Gap`'s `before` offset |
+    /// | DST fold | the earlier of the two instants — 01:30 on 2024-11-03 is 05:30Z (EDT), `0x1014c8fd0` taking the `Fold`'s `before` offset |
+    ///
+    /// Those two arms are `jiff`'s `AmbiguousTimestamp::compatible`, which is
+    /// exactly the match the emitted code performs: the `AmbiguousOffset` tag
+    /// is tested (`cmp w11, #0x1` at `0x1014c8e7c`) and both the `Gap` and the
+    /// `Fold` arm subtract `before` (`sub x21, x11, w8, sxtw`, `0x1014c8ef4`).
+    ///
+    /// A `time` of 24:00 or later is not a civil time: it answers `None` here.
+    /// The recovered code built it with jiff's panicking `Date::at` and
+    /// aborted inside `jiff` (`0x1014c8d54` jumps to the `invalid time` panic
+    /// at `jiff-0.2.37/src/civil/time.rs:328`), which this crate does not
+    /// reproduce — `parse` and `to_toml` cannot make such a value.
+    pub fn today_at(&self, now: &Zoned) -> Option<Timestamp> {
+        self.instant(now.date(), now.time_zone())
+    }
+
+    /// The configured wall-clock time on `date`, in `zone`, or `None`.
+    fn instant(&self, date: CivilDate, zone: &TimeZone) -> Option<Timestamp> {
+        let minutes = self.time?;
+        let hour = i8::try_from(minutes / 60).ok()?;
+        let minute = i8::try_from(minutes % 60).ok()?;
+        let dt = jiff::civil::DateTime::new(
+            date.year(),
+            date.month(),
+            date.day(),
+            hour,
+            minute,
+            0,
+            0,
+        )
+        .ok()?;
+        zone.to_ambiguous_timestamp(dt).compatible().ok()
     }
 
     /// The time of day as `hh:mm`.
@@ -449,5 +531,157 @@ mod tests {
     fn today_now_is_a_unix_second() {
         let now = Settings::today_now();
         assert!(now > 1_577_836_800 && now < 4_102_444_800, "{now}");
+    }
+
+    // --- the `jiff` zone database (Phase 1) -------------------------------
+
+    /// A deterministic `Zoned` in the game's zone, for the DST cases.
+    fn eastern_zoned(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Zoned {
+        jiff::civil::date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .to_zoned(game_zone().expect("the zone database"))
+            .expect("an unambiguous wall-clock time")
+    }
+
+    fn zone() -> TimeZone {
+        game_zone().expect("the zone database")
+    }
+
+    /// The zone database is a platform fact, not a code fact: without it the
+    /// crate falls back to `hydra_net::eastern`'s fixed rule and these tests
+    /// have nothing to say.
+    fn have_zone() -> bool {
+        game_zone().is_some()
+    }
+
+    #[test]
+    fn today_at_resolves_the_wall_clock_in_the_zone() {
+        if !have_zone() {
+            return;
+        }
+        let settings = Settings {
+            time: Some(19 * 60 + 15),
+            ..Settings::default()
+        };
+        let now = eastern_zoned(2024, 7, 15, 9, 0);
+        let at = settings.today_at(&now).unwrap();
+        // 19:15 EDT (UTC-4) is 23:15Z
+        assert_eq!(at.to_string(), "2024-07-15T23:15:00Z");
+        assert_eq!(
+            at.to_zoned(zone()).datetime().to_string(),
+            "2024-07-15T19:15:00"
+        );
+        // winter is standard time, so the same wall clock is an hour later
+        let now = eastern_zoned(2024, 1, 15, 9, 0);
+        let at = settings.today_at(&now).unwrap();
+        assert_eq!(at.to_string(), "2024-01-16T00:15:00Z");
+        // and no time, no instant
+        assert_eq!(Settings::default().today_at(&now), None);
+    }
+
+    #[test]
+    fn a_time_in_the_dst_gap_is_pushed_forward() {
+        if !have_zone() {
+            return;
+        }
+        // 2024-03-10: the clocks go 02:00 EST -> 03:00 EDT, so 02:30 never
+        // happens.  jiff's `compatible` (the recovered `before` offset, -5)
+        // reads it as 03:30 EDT.
+        let settings = Settings {
+            time: Some(2 * 60 + 30),
+            ..Settings::default()
+        };
+        let now = eastern_zoned(2024, 3, 10, 1, 0);
+        let at = settings.today_at(&now).unwrap();
+        assert_eq!(at.to_string(), "2024-03-10T07:30:00Z");
+        assert_eq!(
+            at.to_zoned(zone()).datetime().to_string(),
+            "2024-03-10T03:30:00"
+        );
+        // the hour before the gap is a normal, unambiguous time
+        let settings = Settings {
+            time: Some(1 * 60 + 30),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.today_at(&now).unwrap().to_string(),
+            "2024-03-10T06:30:00Z"
+        );
+    }
+
+    #[test]
+    fn a_time_in_the_dst_fold_takes_the_earlier_instant() {
+        if !have_zone() {
+            return;
+        }
+        // 2024-11-03: the clocks go 02:00 EDT -> 01:00 EST, so 01:30 happens
+        // twice.  The recovered handler takes the `Fold`'s `before` offset
+        // (-4), i.e. the earlier of the two instants.
+        let settings = Settings {
+            time: Some(1 * 60 + 30),
+            ..Settings::default()
+        };
+        let now = eastern_zoned(2024, 11, 3, 0, 30);
+        let at = settings.today_at(&now).unwrap();
+        assert_eq!(at.to_string(), "2024-11-03T05:30:00Z");
+        assert_eq!(
+            at.to_zoned(zone()).datetime().to_string(),
+            "2024-11-03T01:30:00"
+        );
+        // jiff agrees that the later occurrence is the other offset
+        let dt = jiff::civil::date(2024, 11, 3).at(1, 30, 0, 0);
+        assert_eq!(
+            zone().to_ambiguous_timestamp(dt).later().unwrap().to_string(),
+            "2024-11-03T06:30:00Z"
+        );
+        assert_eq!(
+            at.as_second() + 3_600,
+            zone().to_ambiguous_timestamp(dt).later().unwrap().as_second()
+        );
+    }
+
+    #[test]
+    fn a_time_that_is_not_a_civil_time_has_no_instant() {
+        if !have_zone() {
+            return;
+        }
+        // `parse` cannot produce these (it bounds the hours to 0..=23), but a
+        // caller can: the recovered code panicked inside jiff's `Time::constant`
+        // here, and this answers `None` instead.
+        let now = eastern_zoned(2024, 7, 15, 9, 0);
+        for minutes in [MINUTES, MINUTES + 60, u32::MAX] {
+            let settings = Settings {
+                time: Some(minutes),
+                ..Settings::default()
+            };
+            assert_eq!(settings.today_at(&now), None, "{minutes}");
+        }
+    }
+
+    #[test]
+    fn today_goes_through_the_zone_database() {
+        if !have_zone() {
+            return;
+        }
+        let settings = Settings {
+            time: Some(19 * 60 + 15),
+            ..Settings::default()
+        };
+        let at = settings.today().unwrap();
+        let now = zoned_now();
+        assert_eq!(
+            at,
+            settings
+                .today_at(&now)
+                .expect("an instant today")
+                .as_second()
+        );
+        // the same wall clock, resolved in the zone, is what the reports quote
+        let local = Timestamp::from_second(at)
+            .unwrap()
+            .to_zoned(zone())
+            .datetime();
+        assert_eq!((local.hour(), local.minute()), (19, 15));
+        assert_eq!(local.date(), now.date());
     }
 }

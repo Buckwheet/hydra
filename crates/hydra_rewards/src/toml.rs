@@ -1,238 +1,80 @@
-//! The little TOML `rewards.toml` needs: three keys, strings, booleans and an
-//! array of strings.
+//! `rewards.toml`, read and written by `serde` + `toml`.
 //!
-//! **Departure**: the original used `toml`/`serde` (`toml::de::error::Error`'s
-//! `Display` at `0x1014c8888`, `toml::ser::to_string` at `0x1014c952c`, the
-//! `Raw` `visit_map` at `0x1014db690`, and the `toml_datetime` panics for the
-//! `time` value).  This crate is `std`-only, so the subset the file actually
-//! uses is read and written here:
+//! **Reconnected (Phase 1)**: the original's document is a serde derive and the
+//! `toml` crate — the `struct Raw` and its three field names at
+//! `0x10241aee8` … `0x10241af27`, the `visit_map` at `0x1014db690`, the
+//! `toml::de::error::Error` `Display` that `Settings::read` formats at
+//! `0x1014c8888` and the `toml::ser::to_string` that `Settings::to_toml` calls
+//! at `0x1014c952c`.  This module is that derive, at the pinned crate versions
+//! (`serde` 1.0.229, `toml` 1.1.6).
 //!
-//! * `key = <value>` lines, `[table]` headers (skipped), `#` comments;
-//! * basic strings (`"…"` with the usual escapes), booleans and integers;
-//! * single-line arrays of those scalars.
+//! The three keys, in the order the visitor declares them
+//! (`0x10241aee8` … `0x10241aef5`):
 //!
-//! Unknown keys are kept in the document and ignored by the reader, which is
-//! what `serde`'s `Raw` did with them (its visitor's "unknown field
-//! `{}`, there are no fields" arm at `0x103e6b8d0`).
+//! ```toml
+//! time = "19:15"
+//! skip = ["Aelith", "GS4:Bob"]
+//! store = true
+//! ```
+//!
+//! Behaviour the derive gives back, which the `std` stand-in had to fake:
+//!
+//! * unknown keys are **ignored** by the reader (serde's default for a
+//!   derived struct: `visit_map` drops what it does not know) and are
+//!   therefore not carried across a rewrite — the writer serialises a fresh
+//!   [`Raw`], exactly as the recovered `to_toml` does;
+//! * a missing `skip` or `store` reads as the empty list / `false`
+//!   (`#[serde(default)]`), a missing `time` as `None` (serde's `Option` rule);
+//! * a syntax error, or a value of the wrong type, is the `toml` crate's own
+//!   error — a message with the line and the span, which `Settings::read`
+//!   wraps as `{path}: {error}` (`0x103e21615`);
+//! * `to_toml` cannot fail for this document; the recovered code's error arm
+//!   answers an empty `String` (`0x1014c9538`), which is what [`to_toml`] does
+//!   if the crate ever does fail.
+//!
+//! `skip` and `time` are left out when they are empty, and `store` is always
+//! written, so the idle schedule is `store = false\n` — the shape the
+//! recovered `to_toml` emits before `Settings::write` removes the file.
 
-/// A parsed value.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Bool(bool),
-    Num(f64),
-    Str(String),
-    Arr(Vec<Value>),
-    /// insertion ordered, so a rewrite keeps the file's order
-    Obj(Vec<(String, Value)>),
+use serde::{Deserialize, Serialize};
+
+/// The document `rewards.toml` holds: the serde `Raw` of `Settings::parse`.
+///
+/// **ESTABLISHED**: `struct Raw` at `0x10241af27` expects exactly these three
+/// field names (`0x10241aee8` … `0x10241aef5`).  `time` is an `Option` (the
+/// parser tests its tag at `0x1014c8908`), `skip` an array of strings and
+/// `store` a bool (`ldrb w8, [x20, #0x20]` in `to_toml`, `0x1014c94fc`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Raw {
+    /// `time = "19:15"` — when to claim, as the game's clock spells it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// `skip = ["Aelith", "GS4:Bob"]` — characters not to claim for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<String>,
+    /// `store = true` — claim the account's monthly SimuCoins too.
+    #[serde(default)]
+    pub store: bool,
 }
 
-impl Value {
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Value::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    pub fn as_array(&self) -> Option<&[Value]> {
-        match self {
-            Value::Arr(a) => Some(a),
-            _ => None,
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        match self {
-            Value::Obj(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    pub fn bool_of(&self, key: &str) -> bool {
-        matches!(self.get(key), Some(Value::Bool(true)))
-    }
+/// Parse a `rewards.toml` into [`Raw`] with `toml::from_str`.
+///
+/// **ESTABLISHED**: `Settings::parse` (`0x1014c87c8`) deserialises the text
+/// (`toml::de::Deserializer` for `Raw`) and answers the error's `Display`
+/// unchanged, which is why a bad document produces the `toml` crate's own
+/// message here.
+pub fn parse(text: &str) -> Result<Raw, String> {
+    ::toml::from_str::<Raw>(text).map_err(|e| e.to_string())
 }
 
-/// Parse the subset described above.  The error is a one-line message.
-pub fn parse(text: &str) -> Result<Value, String> {
-    let mut doc: Vec<(String, Value)> = Vec::new();
-    for (number, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() || line.starts_with('[') {
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {}: expected `key = value`", number + 1))?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(format!("line {}: empty key", number + 1));
-        }
-        let key = key
-            .strip_prefix('"')
-            .and_then(|k| k.strip_suffix('"'))
-            .unwrap_or(key);
-        let value = parse_value(value.trim())
-            .ok_or_else(|| format!("line {}: cannot read the value", number + 1))?;
-        doc.push((key.to_string(), value));
-    }
-    Ok(Value::Obj(doc))
-}
-
-/// Render a document.
-pub fn to_toml(value: &Value) -> String {
-    let mut out = String::new();
-    if let Value::Obj(pairs) = value {
-        for (key, value) in pairs {
-            match value {
-                Value::Arr(items) => {
-                    let items: Vec<String> = items.iter().map(scalar).collect();
-                    out.push_str(&format!("{key} = [{}]\n", items.join(", ")));
-                }
-                other => out.push_str(&format!("{key} = {}\n", scalar(other))),
-            }
-        }
-    }
-    out
-}
-
-fn scalar(value: &Value) -> String {
-    match value {
-        Value::Bool(b) => b.to_string(),
-        Value::Num(n) => {
-            if n.fract() == 0.0 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{n}")
-            }
-        }
-        Value::Str(s) => format!("\"{}\"", escape(s)),
-        Value::Arr(_) | Value::Obj(_) => "\"\"".to_string(),
-    }
-}
-
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Drop a `#` comment that is not inside a string.
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '#' => return &line[..i],
-            _ => {}
-        }
-    }
-    line
-}
-
-fn parse_value(text: &str) -> Option<Value> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Some(inner) = text.strip_prefix('[') {
-        let inner = inner.strip_suffix(']')?;
-        let mut items = Vec::new();
-        for item in split_items(inner) {
-            let item = item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            items.push(parse_value(item)?);
-        }
-        return Some(Value::Arr(items));
-    }
-    if text.starts_with('"') {
-        return unquote(text).map(Value::Str);
-    }
-    match text {
-        "true" => return Some(Value::Bool(true)),
-        "false" => return Some(Value::Bool(false)),
-        _ => {}
-    }
-    text.parse::<f64>().ok().map(Value::Num)
-}
-
-fn split_items(inner: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for c in inner.chars() {
-        if in_string {
-            current.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                current.push(c);
-            }
-            ',' => out.push(std::mem::take(&mut current)),
-            _ => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-fn unquote(text: &str) -> Option<String> {
-    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => return None,
-        }
-    }
-    Some(out)
+/// Render a [`Raw`] with `toml::to_string`.
+///
+/// **ESTABLISHED**: `Settings::to_toml` (`0x1014c946c`) builds the `Raw` and
+/// serialises it (`0x1014c952c`); its error arm answers a `String` built from
+/// an empty literal (`0x1014c9538`), which is what this answers when the crate
+/// refuses — it cannot for this document.
+pub fn to_toml(raw: &Raw) -> String {
+    ::toml::to_string(raw).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -241,53 +83,80 @@ mod tests {
 
     #[test]
     fn it_reads_the_three_keys() {
-        let doc = parse(
+        let raw = parse(
             "# the login reward\ntime = \"19:15\"\nskip = [\"Aelith\", \"GS4:Bob\"]\nstore = true\n",
         )
         .unwrap();
-        assert_eq!(doc.get("time").unwrap().as_str(), Some("19:15"));
-        assert_eq!(
-            doc.get("skip").unwrap().as_array().unwrap().len(),
-            2
-        );
-        assert!(doc.bool_of("store"));
+        assert_eq!(raw.time.as_deref(), Some("19:15"));
+        assert_eq!(raw.skip, vec!["Aelith".to_string(), "GS4:Bob".to_string()]);
+        assert!(raw.store);
+    }
+
+    #[test]
+    fn a_missing_key_is_the_empty_value() {
+        let raw = parse("time = \"09:05\"\n").unwrap();
+        assert_eq!(raw.time.as_deref(), Some("09:05"));
+        assert!(raw.skip.is_empty());
+        assert!(!raw.store);
+        // and a document with no keys at all is the default
+        assert_eq!(parse("").unwrap(), Raw::default());
+        assert_eq!(parse("# nothing but a comment\n").unwrap(), Raw::default());
     }
 
     #[test]
     fn comments_and_blank_lines_are_ignored() {
-        let doc = parse("\n# hi\n\nstore = false  # off\n").unwrap();
-        assert!(!doc.bool_of("store"));
+        let raw = parse("\n# hi\n\nstore = false  # off\n").unwrap();
+        assert!(!raw.store);
     }
 
     #[test]
     fn a_hash_inside_a_string_is_kept() {
-        let doc = parse("time = \"19:15 # not a comment\"\n").unwrap();
-        assert_eq!(
-            doc.get("time").unwrap().as_str(),
-            Some("19:15 # not a comment")
-        );
+        let raw = parse("time = \"19:15 # not a comment\"\n").unwrap();
+        assert_eq!(raw.time.as_deref(), Some("19:15 # not a comment"));
     }
 
     #[test]
-    fn a_bad_line_is_an_error() {
+    fn an_unknown_key_is_read_past() {
+        // serde's derived `visit_map` drops a field it does not know; the
+        // recovered `Raw` had no `deny_unknown_fields` (its three names are
+        // the whole visitor, `0x10241aee8` … `0x10241aef5`).
+        let raw = parse("time = \"19:15\"\nalarm = 7\nstore = true\n").unwrap();
+        assert_eq!(raw.time.as_deref(), Some("19:15"));
+        assert!(raw.store);
+        // a rewrite is a fresh `Raw`, so the unknown key is not carried over
+        assert_eq!(to_toml(&raw), "time = \"19:15\"\nstore = true\n");
+    }
+
+    #[test]
+    fn a_bad_document_is_an_error() {
         assert!(parse("time\n").is_err());
         assert!(parse("time = \n").is_err());
+        // a value of the wrong type is the crate's message, not a silent default
+        let err = parse("store = \"yes\"\n").unwrap_err();
+        assert!(err.contains("invalid type"), "{err}");
     }
 
     #[test]
     fn it_writes_what_it_reads() {
         let text = "time = \"19:15\"\nskip = [\"Aelith\", \"GS4:Bob\"]\nstore = true\n";
-        let doc = parse(text).unwrap();
-        assert_eq!(to_toml(&doc), text);
-        assert_eq!(parse(&to_toml(&doc)).unwrap(), doc);
+        let raw = parse(text).unwrap();
+        assert_eq!(to_toml(&raw), text);
+        // the key order is the visitor's: time, skip, store
+        assert_eq!(parse(&to_toml(&raw)).unwrap(), raw);
+    }
+
+    #[test]
+    fn an_empty_document_is_one_line() {
+        assert_eq!(to_toml(&Raw::default()), "store = false\n");
     }
 
     #[test]
     fn escapes_survive_a_round_trip() {
-        let doc = Value::Obj(vec![(
-            "note".to_string(),
-            Value::Str("a \"quoted\" \\ back\nslash".to_string()),
-        )]);
-        assert_eq!(parse(&to_toml(&doc)).unwrap(), doc);
+        let raw = Raw {
+            time: None,
+            skip: vec!["a \"quoted\" \\ back\nslash".to_string()],
+            store: false,
+        };
+        assert_eq!(parse(&to_toml(&raw)).unwrap(), raw);
     }
 }

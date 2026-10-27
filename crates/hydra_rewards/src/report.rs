@@ -30,8 +30,11 @@ pub const LAST: u32 = 10;
 /// (`0x10169b550`) into the `Err` of the `Result<Vec<String>, String>` these
 /// functions answer.
 ///
-/// **Departure**: `hydra_ledger` is not reconstructed, so the four reads are
-/// declared here and the error is `String` instead of `rusqlite::Error`.
+/// **KEPT (Phase 1 seam)**: `hydra_ledger` is being rewritten around
+/// `rusqlite` in a parallel worktree, so its rows are mid-change — today's
+/// `Reader::rewards` answers `Vec<hydra_ledger::row::Reward>`, not this
+/// crate's [`Heard`].  The four reads therefore stay declared here and the
+/// error stays `String` instead of `rusqlite::Error`; see `NOTES.md` §5.2.
 pub trait Source {
     /// The character's latest rewards, newest first.
     fn rewards(&self, who: &Who, limit: u32) -> Result<Vec<Heard>, String>;

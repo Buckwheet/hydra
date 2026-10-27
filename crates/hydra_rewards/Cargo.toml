@@ -4,5 +4,11 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# The crates the original linked (see NOTES.md, "Phase 1 reconnection"): all
+# pinned in the workspace root and used offline.
+serde = { workspace = true }
+toml = { workspace = true }
+jiff = { workspace = true }
+tokio = { workspace = true }
 hydra_net = { path = "../hydra_net" }
 hydra_session = { path = "../hydra_session" }

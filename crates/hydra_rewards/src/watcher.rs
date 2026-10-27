@@ -197,8 +197,14 @@ pub enum Said {
 ///
 /// The binary's struct is `hydra_protocol::frame::vocabulary::Frame` (a
 /// 0x118-byte tagged frame; its 0x110-byte payload is what `hear` walks).
-/// This reconstruction does not reconstruct the frame, so the two facts the
-/// watcher needs are passed directly.
+///
+/// **KEPT (Phase 1 seam)**: `hydra_protocol` is reconnected, but its recovered
+/// `Frame` is a *simplified* model of that enum (its own `NOTES.md` says so)
+/// and has no "line ends here" fact — `Frame::plain()` would answer the text
+/// and silently claim every frame ends its line.  So the two facts the watcher
+/// needs stay passed directly, here and in
+/// [`OwnedChunk`](crate::recorder::OwnedChunk); whoever owns the session's
+/// stream is the one that knows the flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chunk<'a> {
     /// The bytes this frame adds to the line.

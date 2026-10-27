@@ -4,6 +4,8 @@
 //! Recovered from `hydra_travel::walk::instability::*`
 //! (`0x101555f40`..`0x101557924`) and the persisted `Seen` row.
 
+use serde::{Deserialize, Serialize};
+
 use crate::json;
 
 /// The element an instability is made of.
@@ -77,13 +79,18 @@ pub const ATTUNE: &str = "ATTUNE SET";
 /// `struct Seen with 3 elements` (`0x10241dfd6`) and the field names are
 /// `room`, `element`, `seen` (`0x10241f4ee`); `Seen::serialize`
 /// (`0x10155634c`) writes them in that order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// **Phase 1 reconnection:** the derives below are the original's. `seen` is
+/// `#[serde(default)]` because the previous reader let the row omit it; `room`
+/// and `element` stay required, so a row with neither is not a `Seen`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     /// The room the instability was met in.
     pub room: u32,
     /// The element's name.
     pub element: String,
     /// How many times it has been seen / how it was answered.
+    #[serde(default)]
     pub seen: u32,
 }
 
@@ -100,23 +107,13 @@ impl Seen {
         Element::parse(&self.element)
     }
 
+    /// The row as the serializer writes it (`room`, `element`, `seen`).
     pub fn to_json(&self) -> json::Value {
-        let mut obj = std::collections::BTreeMap::new();
-        obj.insert("room".to_string(), json::Value::Number(self.room as f64));
-        obj.insert(
-            "element".to_string(),
-            json::Value::string(self.element.clone()),
-        );
-        obj.insert("seen".to_string(), json::Value::Number(self.seen as f64));
-        json::Value::Object(obj)
+        serde_json::to_value(self).unwrap_or(json::Value::Null)
     }
 
     pub fn from_json(value: &json::Value) -> Option<Seen> {
-        Some(Seen {
-            room: value.get("room")?.as_u32()?,
-            element: value.get("element")?.as_str()?.to_string(),
-            seen: value.get("seen").and_then(|v| v.as_u32()).unwrap_or_default(),
-        })
+        serde_json::from_value(value.clone()).ok()
     }
 }
 
@@ -238,10 +235,37 @@ mod tests {
         let seen = Seen::new(1234, Element::Water, 2);
         assert_eq!(seen.element, "water");
         let json = seen.to_json();
-        assert_eq!(json.get("room").unwrap().as_u32(), Some(1234));
+        assert_eq!(json.get("room").unwrap().as_u64(), Some(1234));
         assert_eq!(json.get("element").unwrap().as_str(), Some("water"));
-        assert_eq!(json.get("seen").unwrap().as_u32(), Some(2));
+        assert_eq!(json.get("seen").unwrap().as_u64(), Some(2));
         assert_eq!(Seen::from_json(&json), Some(seen));
+    }
+
+    /// The recovered serializer (`0x10155634c`) writes `room`, `element`, `seen`
+    /// in that order; `serde` now produces exactly that row.
+    #[test]
+    fn seen_serialises_in_the_recovered_order() {
+        let seen = Seen::new(4412, Element::Water, 2);
+        assert_eq!(
+            serde_json::to_string(&seen).unwrap(),
+            r#"{"room":4412,"element":"water","seen":2}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Seen>(r#"{"room":4412,"element":"water","seen":2}"#).unwrap(),
+            seen
+        );
+    }
+
+    /// `seen` was the one field the previous reader defaulted; `room` and
+    /// `element` stayed required, and an unknown field is ignored.
+    #[test]
+    fn seen_defaults_and_ignores_unknown_fields() {
+        let seen: Seen =
+            serde_json::from_str(r#"{"room":4412,"element":"air","when":"today"}"#).unwrap();
+        assert_eq!(seen, Seen::new(4412, Element::Air, 0));
+        // Missing `element` is not a `Seen` — `from_json` says so, it does not
+        // invent one.
+        assert_eq!(Seen::from_json(&serde_json::json!({"room": 4412})), None);
     }
 
     #[test]

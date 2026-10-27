@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::json;
 use crate::walk::instability::Seen;
 
@@ -80,8 +82,16 @@ impl From<Refused> for std::io::Error {
 /// `"last_room"` (length 9, index `0x18`) and `"memories"` (length 8, index
 /// `0x16`); the *types* come from `drop_in_place<Spot>` (`0x10150a8c4`), which
 /// drops a `BTreeMap<String, serde_json::Value>` and a
-/// `BTreeMap<String, Vec<u32>>`.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// `BTreeMap<String, Vec<u32>>`. The declaration order below is the field-index
+/// order (`0x16`, `0x17`, `0x18`), which is also the order the serializer
+/// writes them in.
+///
+/// **Phase 1 reconnection:** the derive *is* the original's
+/// `Deserialize`/`Serialize` (the visitor symbol above). The struct-level
+/// `#[serde(default)]` keeps the recovered leniency: a spot that is missing a
+/// field reads as an empty map / room `0` rather than failing the whole file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Spot {
     /// Remembered places: whatever the walker learned about them. The original
     /// stored free-form `serde_json::Value`s, so this build stores
@@ -98,19 +108,35 @@ pub struct Spot {
 /// **ESTABLISHED**: `Shared::serialize` (`0x101506304`) writes
 /// `schema_version`, `characters` and `instabilities` (`0x10241bc46`,
 /// `0x10241bc54`, `0x10241bc2c`), and `drop_in_place<Shared>` (`0x10150abc0`)
-/// drops a `BTreeMap<String, Vec<Seen>>` for the instabilities.
-#[derive(Clone, Debug, PartialEq)]
+/// drops a `BTreeMap<String, Vec<Seen>>` for the instabilities. Those three
+/// names are written in exactly that order.
+///
+/// **Phase 1 reconnection:** the derive is the original's — its visitor reports
+/// `struct Shared with 4 elements` (`0x10241dfac`), i.e. a plain struct derive
+/// with no `flatten`/`untagged` machinery. `schema_version` stays required (a
+/// file without it is not a `travel.json` this build wrote); the three maps are
+/// `#[serde(default)]` so a file may omit them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shared {
     pub schema_version: u32,
+    #[serde(default)]
     pub characters: BTreeMap<String, Spot>,
+    #[serde(default)]
     pub instabilities: BTreeMap<String, Vec<Seen>>,
     /// **UNKNOWN:** the deserializer's field list says
     /// `struct Shared with 4 elements` (`0x10241dfac`) but only three names are
     /// served by the serializer. The `memories` literal at `0x10241dff8`
     /// directly after the count string is the only surviving candidate for the
     /// fourth, so it is kept here as free-form JSON and preserved on rewrite.
-    /// Nothing in the recovered code reads it.
+    /// Nothing in the recovered code reads it. It is written only when it holds
+    /// something, which is what the previous stand-in did.
+    #[serde(default, skip_serializing_if = "is_empty")]
     pub memories: BTreeMap<String, json::Value>,
+}
+
+/// `skip_serializing_if` helper for [`Shared::memories`].
+fn is_empty<T>(map: &BTreeMap<String, T>) -> bool {
+    map.is_empty()
 }
 
 impl Default for Shared {
@@ -126,102 +152,22 @@ impl Default for Shared {
 
 impl Shared {
     /// Render back to the wire format `serde_json` produced.
+    ///
+    /// **Phase 1 reconnection:** this is `serde_json::to_value` over the
+    /// recovered derives, so the names, the nesting and the defaults are the
+    /// serializer's rather than hand-assembled. (`to_value` cannot fail here:
+    /// no map key is non-string and no number is non-finite.)
     pub fn to_json(&self) -> json::Value {
-        let mut characters = BTreeMap::new();
-        for (name, spot) in &self.characters {
-            let mut obj = BTreeMap::new();
-            obj.insert("memories".to_string(), json::Value::Object(spot.memories.clone()));
-            let mut targets = BTreeMap::new();
-            for (target, rooms) in &spot.targets {
-                targets.insert(
-                    target.clone(),
-                    json::Value::Array(
-                        rooms
-                            .iter()
-                            .map(|r| json::Value::Number(*r as f64))
-                            .collect(),
-                    ),
-                );
-            }
-            obj.insert("targets".to_string(), json::Value::Object(targets));
-            obj.insert(
-                "last_room".to_string(),
-                json::Value::Number(spot.last_room as f64),
-            );
-            characters.insert(name.clone(), json::Value::Object(obj));
-        }
-        let mut instabilities = BTreeMap::new();
-        for (name, seen) in &self.instabilities {
-            instabilities.insert(
-                name.clone(),
-                json::Value::Array(seen.iter().map(Seen::to_json).collect()),
-            );
-        }
-        let mut root = BTreeMap::new();
-        root.insert(
-            "schema_version".to_string(),
-            json::Value::Number(self.schema_version as f64),
-        );
-        root.insert("characters".to_string(), json::Value::Object(characters));
-        root.insert(
-            "instabilities".to_string(),
-            json::Value::Object(instabilities),
-        );
-        if !self.memories.is_empty() {
-            root.insert(
-                "memories".to_string(),
-                json::Value::Object(self.memories.clone()),
-            );
-        }
-        json::Value::Object(root)
+        serde_json::to_value(self).unwrap_or(json::Value::Null)
     }
 
     /// Read the wire format back.
+    ///
+    /// `None` is "this is not a `travel.json`" — the same answer the previous
+    /// hand-written reader gave when `schema_version` was missing or not a
+    /// `u32`.
     pub fn from_json(value: &json::Value) -> Option<Shared> {
-        let schema_version = value.get("schema_version")?.as_u32()?;
-        let mut characters = BTreeMap::new();
-        if let Some(map) = value.get("characters").and_then(|v| v.as_object()) {
-            for (name, spot) in map {
-                let mut out = Spot::default();
-                if let Some(memories) = spot.get("memories").and_then(|v| v.as_object()) {
-                    out.memories = memories.clone();
-                }
-                if let Some(targets) = spot.get("targets").and_then(|v| v.as_object()) {
-                    for (target, rooms) in targets {
-                        let rooms: Vec<u32> = rooms
-                            .as_array()
-                            .map(|a| a.iter().filter_map(|r| r.as_u32()).collect())
-                            .unwrap_or_default();
-                        out.targets.insert(target.clone(), rooms);
-                    }
-                }
-                out.last_room = spot
-                    .get("last_room")
-                    .and_then(|v| v.as_u32())
-                    .unwrap_or_default();
-                characters.insert(name.clone(), out);
-            }
-        }
-        let mut instabilities = BTreeMap::new();
-        if let Some(map) = value.get("instabilities").and_then(|v| v.as_object()) {
-            for (name, seen) in map {
-                let seen: Vec<Seen> = seen
-                    .as_array()
-                    .map(|a| a.iter().filter_map(Seen::from_json).collect())
-                    .unwrap_or_default();
-                instabilities.insert(name.clone(), seen);
-            }
-        }
-        let mut memories = BTreeMap::new();
-        if let Some(map) = value.get("memories").and_then(|v| v.as_object()) {
-            memories = map.clone();
-        }
-        Some(Shared {
-            schema_version,
-            characters,
-            instabilities,
-            memories,
-        })
+        serde_json::from_value(value.clone()).ok()
     }
 }
 
@@ -272,12 +218,13 @@ pub fn key_in<'a>(spot: &'a mut Spot, key: &str) -> &'a mut json::Value {
 /// Both failures are turned into a `String` (the `io::Error` or
 /// `serde_json::Error` `Display` text) and returned as [`Refused::Read`]; a
 /// schema word above [`SCHEMA`] becomes [`Refused::Newer`].
+///
+/// **Phase 1 reconnection:** the middle step is now really
+/// `serde_json::from_str::<Shared>` over the recovered derives.
 pub fn read(dir: &Path) -> Result<Shared, Refused> {
     let path = travel_path(dir);
     let text = std::fs::read_to_string(&path).map_err(|e| Refused::Read(e.to_string()))?;
-    let value = json::parse(&text).map_err(|e| Refused::Read(e.to_string()))?;
-    let shared = Shared::from_json(&value)
-        .ok_or_else(|| Refused::Read("missing schema_version".to_string()))?;
+    let shared: Shared = serde_json::from_str(&text).map_err(|e| Refused::Read(e.to_string()))?;
     if shared.schema_version > SCHEMA {
         return Err(Refused::Newer(shared.schema_version));
     }
@@ -285,23 +232,32 @@ pub fn read(dir: &Path) -> Result<Shared, Refused> {
 }
 
 /// Write `travel.json` for `dir`.
+///
+/// **Phase 1 reconnection:** `serde_json::to_string` over the recovered
+/// serializer, so the document carries the recovered field order
+/// (`schema_version`, `characters`, `instabilities`, then `memories` when it is
+/// not empty) instead of the alphabetical order a `BTreeMap`-backed
+/// stand-in produced. The file is still written with one trailing newline.
 pub fn write(dir: &Path, shared: &Shared) -> Result<(), Refused> {
     let path = travel_path(dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Refused::Read(e.to_string()))?;
     }
-    std::fs::write(&path, shared.to_json().write() + "\n")
-        .map_err(|e| Refused::Read(e.to_string()))
+    let text = serde_json::to_string(shared).map_err(|e| Refused::Read(e.to_string()))?;
+    std::fs::write(&path, text + "\n").map_err(|e| Refused::Read(e.to_string()))
 }
 
 /// Read the file, let `edit` change it, write it back.
 ///
-/// **`std`-only departure:** the original called
+/// **Kept seam (Phase 1):** the original called
 /// `hydra_session::store::changing(path, closure)` (the three monomorphisations
 /// `0x10152b9e8`, `0x10152c4d4`, `0x10152c8d8`, `0x10152d230`) which reads the
 /// JSON, hands the closure the parsed value and rewrites the file when the
-/// closure reports a change. That function is not part of the reconstructed
-/// `hydra_session`, so the same read/edit/write cycle lives here.
+/// closure reports a change. The reconnected `hydra_session` has no `changing`
+/// (`store` there exposes `safe_component`, `character_path`, `temp_extension`,
+/// `thread_hash` and `save_bytes`), so the same read/edit/write cycle still
+/// lives here — it is now `serde_json` on both ends. If `changing` returns to
+/// `hydra_session`, this becomes a two-line call to it.
 fn changing<T>(dir: &Path, edit: impl FnOnce(&mut Shared) -> T) -> Result<T, Refused> {
     let mut shared = match read(dir) {
         Ok(shared) => shared,
@@ -525,6 +481,213 @@ mod tests {
         .unwrap();
         assert_eq!(read(&dir), Err(Refused::Newer(9)));
         assert_eq!(load(&dir), Shared::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---------------------------------------------------------------------
+     * Phase 1 reconnection: the tests below cover behaviour that is now
+     * `serde` + `serde_json`'s rather than the hand-written `src/json.rs`.
+     * ------------------------------------------------------------------- */
+
+    fn spotted() -> Spot {
+        let mut spot = Spot::default();
+        spot.memories
+            .insert("black_swan".to_string(), serde_json::json!(true));
+        spot.memories
+            .insert("delay".to_string(), serde_json::json!(0));
+        spot.memories.insert(
+            "hinterwilds_location".to_string(),
+            serde_json::json!("Icemule Trace"),
+        );
+        // Free-form: the original stored whatever the setting was, nested.
+        spot.memories.insert(
+            "talondown_origin".to_string(),
+            serde_json::json!({"room": 4412, "note": "big hall", "seen": [1, 2, null]}),
+        );
+        spot.targets.insert("den".to_string(), vec![284, 300]);
+        spot.last_room = 10862;
+        spot
+    }
+
+    /// `Spot` round-trips through the recovered derive, free-form `memories`
+    /// included, and the field order is the visitor's
+    /// (`memories` `0x16`, `targets` `0x17`, `last_room` `0x18`).
+    #[test]
+    fn spot_round_trips_through_serde() {
+        let spot = spotted();
+        let text = serde_json::to_string(&spot).unwrap();
+        assert_eq!(
+            text,
+            // `delay` and `room` are integers: the hand-written `Value` kept
+            // every number as `f64`, `serde_json` keeps the integer. The keys
+            // inside a nested object are `serde_json`'s default `Map`
+            // (`BTreeMap`), so they come out sorted — the same normalisation
+            // the hand-written `Value` applied.
+            concat!(
+                r#"{"memories":{"black_swan":true,"delay":0,"#,
+                r#""hinterwilds_location":"Icemule Trace","#,
+                r#""talondown_origin":{"note":"big hall","room":4412,"seen":[1,2,null]}},"#,
+                r#""targets":{"den":[284,300]},"last_room":10862}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<Spot>(&text).unwrap(), spot);
+    }
+
+    /// `Shared` round-trips through the recovered derive, and its three written
+    /// field names come out in the serializer's order.
+    #[test]
+    fn shared_round_trips_through_serde() {
+        let mut shared = Shared::default();
+        shared.characters.insert(spot_name("Aelith", "GS4"), spotted());
+        shared.instabilities.insert(
+            spot_name("Aelith", "GS4"),
+            vec![Seen::new(1234, crate::walk::instability::Element::Air, 3)],
+        );
+        let text = serde_json::to_string(&shared).unwrap();
+        assert!(
+            text.starts_with(r#"{"schema_version":3,"characters":{"aelith_gs4":"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Shared>(&text).unwrap(), shared);
+        assert_eq!(Shared::from_json(&shared.to_json()), Some(shared));
+    }
+
+    /// A spot may omit any of its fields (they default) and an unknown field is
+    /// ignored — but `schema_version` is still required, so a foreign document
+    /// is not silently adopted.
+    #[test]
+    fn absent_fields_default_and_unknown_fields_are_ignored() {
+        let shared: Shared = serde_json::from_str(
+            r#"{"schema_version":3,
+                "characters":{"aelith_gs4":{"last_room":10862}},
+                "something_new":{"x":1}}"#,
+        )
+        .unwrap();
+        let spot = &shared.characters["aelith_gs4"];
+        assert!(spot.memories.is_empty());
+        assert!(spot.targets.is_empty());
+        assert_eq!(spot.last_room, 10862);
+        assert!(shared.instabilities.is_empty());
+        assert!(shared.memories.is_empty());
+
+        assert!(serde_json::from_str::<Shared>(r#"{"characters":{}}"#).is_err());
+        assert_eq!(Shared::from_json(&serde_json::json!({"characters": {}})), None);
+        assert_eq!(
+            Shared::from_json(&serde_json::json!({"schema_version": "3"})),
+            None
+        );
+    }
+
+    /// Schema 3 is what this build reads and writes; anything above it is
+    /// refused, anything below it is read.
+    #[test]
+    fn schema_three_is_read_and_anything_newer_is_refused() {
+        let dir = tempdir("schema");
+        write(&dir, &Shared::default()).unwrap();
+        assert_eq!(read(&dir).unwrap(), Shared::default());
+
+        let mut newer = Shared::default();
+        newer.schema_version = SCHEMA + 1;
+        write(&dir, &newer).unwrap();
+        assert_eq!(read(&dir), Err(Refused::Newer(SCHEMA + 1)));
+
+        // An older file is still a file this build can read.
+        std::fs::write(travel_path(&dir), r#"{"schema_version":1,"characters":{}}"#).unwrap();
+        assert_eq!(read(&dir).unwrap().schema_version, 1);
+
+        // A broken document is a `Refused::Read` carrying `serde_json`'s
+        // message, which is what the recovered `file::read` formatted.
+        std::fs::write(travel_path(&dir), r#"{"schema_version":3,"#).unwrap();
+        match read(&dir) {
+            Err(Refused::Read(why)) => {
+                assert!(why.contains("line 1"), "{why}");
+            }
+            other => panic!("expected a read refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The on-disk document is the recovered field order, one line, and a
+    /// trailing newline; a non-empty root `memories` is the fourth and last key.
+    #[test]
+    fn on_disk_document_is_the_recovered_field_order() {
+        let dir = tempdir("shape");
+        save_target(&dir, "Aelith", "GS4", "den", &[284, 300]).unwrap();
+        save_last_room(&dir, "Aelith", "GS4", 10862).unwrap();
+        save_instabilities(
+            &dir,
+            "Aelith",
+            "GS4",
+            &[Seen::new(1234, crate::walk::instability::Element::Air, 3)],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(travel_path(&dir)).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"schema_version":3,"characters":{"aelith_gs4":{"memories":{},"#,
+                r#""targets":{"den":[284,300]},"last_room":10862}},"#,
+                r#""instabilities":{"aelith_gs4":[{"room":1234,"element":"air","seen":3}]}}"#,
+                "\n"
+            )
+        );
+
+        let mut shared = read(&dir).unwrap();
+        shared
+            .memories
+            .insert("mural".to_string(), serde_json::json!({"verse": 3}));
+        write(&dir, &shared).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(travel_path(&dir)).unwrap(),
+            concat!(
+                r#"{"schema_version":3,"characters":{"aelith_gs4":{"memories":{},"#,
+                r#""targets":{"den":[284,300]},"last_room":10862}},"#,
+                r#""instabilities":{"aelith_gs4":[{"room":1234,"element":"air","seen":3}]},"#,
+                r#""memories":{"mural":{"verse":3}}}"#,
+                "\n"
+            )
+        );
+        // Writing what was just read produces the same bytes.
+        let before = std::fs::read_to_string(travel_path(&dir)).unwrap();
+        write(&dir, &read(&dir).unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(travel_path(&dir)).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The free-form `memories` values survive a read/modify/write cycle
+    /// unchanged, and `take_settings` reads the setting words back out of them.
+    #[test]
+    fn free_form_memories_survive_a_change() {
+        let dir = tempdir("memories");
+        std::fs::write(
+            travel_path(&dir),
+            concat!(
+                r#"{"schema_version":3,"characters":{"aelith_gs4":{"memories":{"#,
+                r#""black_swan":true,"delay":0,"#,
+                // A free-form object's keys are `serde_json`'s `BTreeMap`
+                // (`Value`'s default `Map`), so they come out sorted — the
+                // same normalisation the hand-written `Value` applied.
+                r#""talondown_origin":{"note":"big hall","room":4412,"seen":[1,2,null]}},"#,
+                r#""targets":{},"last_room":1}},"instabilities":{}}"#
+            ),
+        )
+        .unwrap();
+        // A change goes through `read` → edit → `write`, so anything the
+        // document held that this crate does not model has to come back out.
+        save_last_room(&dir, "Aelith", "GS4", 10862).unwrap();
+        let shared = read(&dir).unwrap();
+        let spot = &shared.characters["aelith_gs4"];
+        assert_eq!(spot.last_room, 10862);
+        assert_eq!(spot.memories["black_swan"], serde_json::json!(true));
+        assert_eq!(spot.memories["delay"], serde_json::json!(0));
+        assert_eq!(
+            spot.memories["talondown_origin"],
+            serde_json::json!({"room": 4412, "note": "big hall", "seen": [1, 2, null]})
+        );
+
+        let settings = take_settings(&dir, "Aelith", "GS4");
+        assert_eq!(settings.get("black_swan").as_deref(), Some("on"));
+        assert_eq!(settings.get("delay").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

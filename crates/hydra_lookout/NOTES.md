@@ -90,7 +90,7 @@ Recovered from `Lookout::new` (`0x101ab4220`–`0x101ab4330`), `Lookout::set`
 | `+0x128` | `known: HashSet<u64>` (48) | `count` `contains_key`, `forget`/`always` insert, `clear` resets |
 | `+0x158` | `counting: HashMap<u64, Counting>` (48) | `count` inserts `(day, occasions)`, `snapshot` prunes by day, `encode` writes it |
 | `+0x188` | `recent: HashMap<u64, Recent>` (48) | `count` inserts `(f64, u32, u8)`, prunes above `0x1000` |
-| `+0x1b8` | `ignore` (`Option<RegexSet>` → `Vec<Pattern>`) | `set` drops/stores a 32-byte value |
+| `+0x1b8` | `ignore` (`Option<RegexSet>`; a real `RegexSet` since Phase 1) | `set` drops/stores a 32-byte value |
 | `+0x1d8` | `stats` (`Option<Regex>`) | `new` compiles `STAT_PATTERN` into it; `judge` uses it |
 | `+0x1f8` | `owns` (`Option<Regex>`) | `own` drops/stores a 32-byte value |
 | `+0x218` | `written: u64` | `write`/`save_now_and_then` store the generation; `counts_all` copies it |
@@ -246,15 +246,18 @@ handle) is not recoverable, this crate exposes the same join as
 
 ## 6. Std-only departures
 
+Struck through = **reconnected in Phase 1** (see §7 for the versions and what
+changed behaviourally); everything left un-struck is still a stand-in.
+
 | original | here | why |
 | --- | --- | --- |
-| `regex::RegexSet` for the ignore set | `Vec<hydra_model::pattern::Pattern>`, compiled one pattern at a time | no `regex`; `hydra_model::pattern` is the workspace's std-only matcher and the original already linked `hydra_model` (`0x101ab4184` calls `hydra_model::pattern::compile`) |
-| `regex::Regex` for `STAT_PATTERN` | `hydra_model::pattern::Pattern`, compiled **without** the leading `\b` | `hydra_model::pattern` has no word-boundary assertion (verified: `\bAS` never matches), so the recovered `\b` prefix is stripped — `without_boundary` |
-| `serde` + `toml` for `lookout.toml` | a 60-line `key = value` reader/writer for exactly these twelve keys | no external crates; the writer emits `toml::to_string_pretty`'s shape (declaration order, same skips) |
-| `serde` for the state file | not needed: the file is a hand-rolled binary format | `file::decode`/`encode` are recovered in full |
-| `tokio`-free already | `std::thread` for the autosave | the original also spawns a plain `std` thread |
-| `Regex`/`Option<Regex>` fields | `Pattern` / `Vec<Pattern>` | see above |
-| `hashbrown` maps with a pass-through hasher for the FNV keys | `HashSet<u64>`/`HashMap<u64, _>` with the default hasher | the key is already an FNV hash; the extra hash is harmless and keeps the type std |
+| ~~`regex::RegexSet` for the ignore set~~ | ~~`Vec<hydra_model::pattern::Pattern>`, compiled one pattern at a time~~ | **Reconnected.** `Lookout+0x1b8` is a real `regex::RegexSet` over the recovered pattern literals. |
+| ~~`regex::Regex` for `STAT_PATTERN`~~ | ~~`hydra_model::pattern::Pattern`, compiled **without** the leading `\b`~~ | **Reconnected.** `Lookout+0x1d8` is a real `regex::Regex`, compiled from the recovered `\b`-prefixed literal through `hydra_model::pattern::ascii` (`0x101ab4184`), so the boundary is rewritten to `(?-u:\b)`, never stripped. |
+| ~~`serde` + `toml` for `lookout.toml`~~ | ~~a 60-line `key = value` reader/writer for exactly these twelve keys~~ | **Reconnected.** `Settings` derives `Serialize`/`Deserialize` and the file goes through `toml::from_str`/`toml::to_string`. |
+| ~~`serde` for the state file~~ | ~~not needed~~ | Not a stand-in: the file is a hand-rolled binary format, and `file::decode`/`encode` are recovered in full. No crate is involved, then or now. |
+| `tokio`-free already | `std::thread` for the autosave | Not a stand-in either: the original also spawns a plain `std` thread. |
+| ~~`Regex`/`Option<Regex>` fields~~ | ~~`Pattern` / `Vec<Pattern>`~~ | **Reconnected.** `ignore: RegexSet`, `stats: Regex`, `owns: Option<Regex>` — the recovered field types. |
+| `hashbrown` maps with a pass-through hasher for the FNV keys | `HashSet<u64>`/`HashMap<u64, _>` with the default hasher | **Still a stand-in.** `hashbrown` is not in the workspace pins, and the key is already an FNV hash, so the extra hash is harmless. |
 
 Unresolved details, marked `// UNKNOWN:` in the source: the `Shown` field names
 (three `String`s + `Vec<String>`, established; roles inferred), `Object`'s two
@@ -263,9 +266,128 @@ element type, the meaning of `judge`'s first struct field (`Line::mark`), and
 whether the settings file requires every key (we keep defaults for missing
 keys).
 
-## 7. Tests
+## 7. Phase 1 reconnection
 
-40 tests, all asserting values read out of the binary:
+Three crates were put back, all at the workspace pins in the root
+`Cargo.toml [workspace.dependencies]`, declared here as `x = { workspace =
+true }` and built with `cargo --offline`:
+
+| real crate (pin) | replaced | where |
+| --- | --- | --- |
+| `regex` **1.13.1** | `Vec<hydra_model::pattern::Pattern>` for the ignore set, `Pattern` for the stat pattern | `Lookout::{ignore, stats, owns}`, `ignore_set`, `compile`/`stat_pattern` |
+| `serde` **1.0.229** (feature `derive`) | the hand-written twelve-key reader | `settings::Settings` (`Serialize` + `Deserialize`) |
+| `toml` **1.1.6** | the hand-written `key = value` writer | `settings::{read, write, parse, to_toml}` |
+
+`Cargo.lock` gained the three dependency edges of `hydra_lookout` and nothing
+else.  `hydra_model` is **kept**, and is now used only for
+`pattern::ascii` — see the first conflict below.
+
+### 7.1 What changed behaviourally
+
+**The ignore set.** `Lookout::set` builds one `RegexSet` (`0x101ab4754` stores a
+32-byte value at `+0x1b8`) instead of a `Vec` of per-pattern matchers, so
+`Lookout::ignore`/`Lookout::reads`-adjacent consumers see `is_match`,
+`matches(..).matched(i)` and `len()` over the whole set in one pass.  The
+recovered literals go in **verbatim**: the original's field is a `RegexSet`, so
+these patterns keep `regex`'s Unicode `\d`/`\s` (they are not run through the
+stat pattern's ASCII rewrite).  A pattern that does not compile is now *left out*
+of the set (the same `[hydra] lookout: … does not read` line is logged); before,
+it was kept as a `Pattern` with `error: Some(..)` that never matched, so
+`ignore.len()` answered the length of the settings list.  One bad pattern in a
+hand-edited `lookout.toml` still does not cost the other twenty-seven.
+
+**The stat pattern.** The recovered `\b` is compiled, not stripped, so a token
+inside a word is no longer a stat: `CLASS: 12` and `GLASS: 12` stop being stat
+lines, which the std matcher could not tell apart.  `stat_reach` is now the
+first capture of the pattern (`0x101ab52f8` hands `Regex::create_captures` to
+the comparison) parsed as a saturating signed integer, where the stand-in took
+the largest number anywhere in the line — a line whose biggest number was not
+preceded by a stat token could be skipped as "below the floor" before and is not
+now.  `stat_reach` moved from a free function to a `Lookout` method (it needs
+the compiled pattern); it was private then and is private now.
+
+**`own`.** `(?i)\b(?:<names>)\b` is compiled by the real engine, so `(?i)` and
+both word boundaries are real: `AELITH` matches a lookout that owns `Aelith`,
+`Aelithia` does not.  A name that is not a valid pattern still leaves `owns` as
+`None` instead of panicking, but a name holding regex metacharacters is now
+interpreted as a pattern — which is what the original's raw interpolation of the
+name into the pattern string does.
+
+**`lookout.toml`.** The twelve names, their declaration order (which is the
+written order — asserted key by key) and the four skips (`off`/`always`/`seeded`
+when empty, `ignore` when `None`) are unchanged, and so is
+`Settings::{read,write,ignore_list,is_off,set_reads}`.  What the crate brings:
+
+* real TOML syntax — comments, multi-line arrays, `_` in numbers, single-quoted
+  strings, escapes — none of which the stand-in could read;
+* an unknown key is still rejected (serde's `deny_unknown_fields` is the
+  recovered `unknown_field` call at `0x101ac94a0`), but the error is now the
+  `toml` crate's, with a line/column span: `parse` answers
+  `TOML parse error at line 2, column 1 … unknown field `nonsense`, expected one
+  of …`, so the test asserts `contains(..)` where it used to assert
+  `starts_with(..)`;
+* a missing key still keeps its recovered default (`#[serde(default)]` on the
+  container, `parse` of `""` is `Settings::default()`);
+* a value that does not fit its field is now an **error** rather than silently
+  clamped: `occasions = 300` used to become `255`, and is now
+  `invalid value: integer 300, expected u8`; likewise `paused = "yes"` is
+  `invalid type: string, expected a boolean`;
+* floats are TOML spellings: `window = 2.0` (not `2`), and the special values
+  are `nan`/`inf` where the stand-in wrote `NaN` (which is not TOML at all);
+* `Settings` is now `Serialize`/`Deserialize` (a public API addition), so a
+  sibling can `toml::to_string(&settings)` without going through
+  `crate::settings::to_toml`.
+
+`Settings::write` keeps the `toml` error instead of writing a partial document
+on the (unreachable for this struct) serialisation failure.
+
+**Removed:** `hydra_lookout::without_boundary`, the shim that stripped the
+recovered `\b`.  It was public but is used by nothing in the workspace, and
+keeping it would invite exactly the bug it existed to paper over.
+
+### 7.2 What is still `std`-only, and why
+
+* `hashbrown`'s maps with a pass-through hasher (the FNV keys are hashed once
+  more by `RandomState`) — `hashbrown` is **not** a workspace pin, and the keys
+  are already hashes, so the extra hash changes nothing observable.
+* The state file stays the hand-rolled `HYDRALK1` codec: the original hand-rolled
+  it too, so there is no departure here (`file::decode`/`encode` are recovered in
+  full, including the atomic write-then-rename and the `.pid-n.tmp` name).
+* The autosave stays a plain `std::thread` named `hydra-lookout`: the original
+  spawns a `std` thread as well, so `tokio` was not added.
+
+### 7.3 Conflicts found
+
+1. **The NOTES table was stale about `hydra_model`.** It claimed
+   `hydra_model::pattern` has no word-boundary assertion; L2 reconnected that
+   module to real `regex`, which *does* have one (`\b` is rewritten to
+   `(?-u:\b)`, not dropped).  So the reason for the `without_boundary` shim was
+   gone.  `hydra_model` is nevertheless kept, because `0x101ab4184` is a real
+   call to `hydra_model::pattern::compile` for the stat pattern and only the
+   `ascii` half of that compiler is reproducible there — `compile` returns a
+   `Pattern` wrapper, while the recovered field at `+0x1d8` is the 32-byte
+   `Regex` the compiler produced.  `crate::compile` therefore takes the two
+   documented steps (`pattern::ascii` then `Regex::new`) and keeps the `Regex`.
+   Dropping the dependency instead would have meant compiling `STAT_PATTERN`
+   with Unicode `\d`/`\s`/`\b` semantics, i.e. a different automaton from the
+   original's.
+2. **The ignore set and the stat pattern were compiled differently in the
+   original**, and the reconnection keeps that split: a `RegexSet` over verbatim
+   literals for the ignore list, the ASCII-rewritten `Regex` for the stat
+   pattern.  Using one compiler for both would be tidier and less faithful.
+3. **`Lookout::ignore` is compiled but never consulted.** No recovered body reads
+   it (`reads` is `paused` + `is_off`, `judge` adds the stat floor and the
+   counting), so this crate keeps compiling it and leaves the consumer where it
+   is in the binary — outside the functions recovered here.  Not changed, but
+   worth knowing before anyone assumes `judge` filters on it.
+4. **`toml` refuses nothing this struct can hold.** The plan was to prove the
+   real writer keeps the old file when serialisation fails; TOML 1.0 does spell
+   `nan`/`inf`, so the guarded-failure test became a float-spelling test instead.
+
+## 8. Tests
+
+50 tests (40 before the reconnection), all asserting values read out of the
+binary:
 
 * `key`: the article list, the punctuation-only-word filter, the exact
   lower-casing and space collapsing, the `'‹'` span separator.
@@ -275,7 +397,24 @@ keys).
 * `settings`: the twelve defaults (and that `Settings` is 128 bytes), the 28
   default patterns, `is_off`'s first-colon/ASCII-case-insensitive matching,
   `set_reads` add/remove, a TOML round trip, unknown-key rejection.
+
+  Phase 1 added: the exact on-disk document for the defaults (the eight
+  always-written keys, in declaration order, no `off`/`ignore`/`always`/
+  `seeded`), the written key order with all twelve present, that an empty
+  `Some(vec![])` `ignore` is written while `None` is skipped, real TOML input
+  (comments, a multi-line array, `1_500`, an integer where a float is declared),
+  the crate's errors for an out-of-range integer and a wrong type, and the
+  `2.0`/`nan`/`inf` float spellings.
 * `lib`: `key_hash` against a hand-computed FNV-1a, the five-occasion threshold,
   the quiet window (same tag counts, a changed tag inside `window` does not),
   `own`'s de-duplication, judge/forget marking keys known, `clear` keeping the
   settings, and `open` returning the same `Arc` for the same directory.
+
+  Phase 1 added: the `RegexSet` over the twenty-eight built-ins (`is_match`,
+  `matches(..).matched(i)` — an alternation is one entry, the `(?i)` pattern is
+  a real flag), a broken custom ignore pattern being dropped while the rest
+  survive, the stat pattern's verbatim match set (all eight tokens, `+`/`-`,
+  a `\b` that refuses `CLASS:`/`GLASS:`), that the stat pattern is
+  `pattern::ascii(STAT_PATTERN)` (so `\b` → `(?-u:\b)`, `\s` is the ASCII set
+  and `\d` is `[0-9]`), `stat_reach` as the first saturating capture, and
+  `owns` as the real `(?i)\b(?:…)\b` regex (`AELITH` yes, `Aelithia` no).

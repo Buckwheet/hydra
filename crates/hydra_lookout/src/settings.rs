@@ -9,6 +9,14 @@
 //! and `always` when they are empty, `ignore` when it is `None` and `seeded`
 //! when it is empty.
 //!
+//! **Reconnected (Phase 1)**: the document is a `serde` derive again, read and
+//! written by the real `toml` crate at the workspace pins (`serde` 1.0.229 with
+//! `derive`, `toml` 1.1.6) — the `Deserialize` derive and its
+//! `unknown_field` call (`0x101ac94a0`), the `Serialize` derive's
+//! declaration-order walk (`0x101ac867c`) and the `toml` error `Display` that
+//! [`Settings::read`] formats.  The `std` `key = value` reader/writer this
+//! stood in for is gone.
+//!
 //! The defaults come from the default constructor that both `Settings::read`
 //! (`0x101ac8afc`) and `Lookout::new` (`0x101ab40e8`) inline:
 //!
@@ -26,8 +34,9 @@
 //! `ignore` is an `Option<Vec<String>>`: when it is `None`,
 //! [`Settings::ignore_list`] returns the 28 built-in patterns instead.
 
-use std::fmt::Write as _;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::file;
 
@@ -71,10 +80,18 @@ pub const IGNORED_BY_DEFAULT: [&str; 28] = [
 
 /// The lookout's settings (`lookout.toml`).
 ///
-/// The field order below is the *declaration* order (the order the `Serialize`
-/// impl walks); the comment on each field is its offset in the 128-byte
-/// struct, which Rust reordered for alignment.
-#[derive(Debug, Clone, PartialEq)]
+/// The field order below is the *declaration* order the recovered `Serialize`
+/// impl walks and therefore the order the keys land on disk in; the comment on
+/// each field is its offset in the 128-byte struct, which Rust reordered for
+/// alignment.
+///
+/// `#[serde(default)]` on the container is the "a missing key keeps its
+/// recovered default" rule the hand-written reader had (a hand-edited
+/// `lookout.toml` is the obvious use of the file); `deny_unknown_fields` is the
+/// `unknown_field` call at `0x101ac94a0`, which makes an unknown key an error
+/// rather than something silently dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// How many times a key must be seen before it is learnt (`+0x7b`, 5).
     pub occasions: u8,
@@ -91,11 +108,20 @@ pub struct Settings {
     /// A paused lookout reads nothing (`+0x79`, false).
     pub paused: bool,
     /// The lines the lookout never reads (`+0x00`, empty).
+    ///
+    /// Skipped when empty — the `Serialize` walk at `0x101ac88a0` tests the
+    /// `Vec`'s length before writing it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub off: Vec<String>,
     /// The patterns it ignores; `None` means [`IGNORED_BY_DEFAULT`]
     /// (`+0x30`).
+    ///
+    /// Skipped when `None`: the `+0x30` niche is `isize::MIN`, not an empty
+    /// list, so an empty `Some(vec![])` is written out and `None` is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore: Option<Vec<String>>,
     /// The lines it always reads (`+0x18`, empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub always: Vec<String>,
     /// Whether the trigger has been added (`+0x7a`, false).
     pub trigger_added: bool,
@@ -105,6 +131,7 @@ pub struct Settings {
     /// `Seq` impl than `off`/`always` (`0x101ac8920` vs `0x101ac88a0`), so the
     /// original is not a `Vec<String>`; `Vec<u64>` matches the `u64` keys the
     /// lookout uses everywhere else.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub seeded: Vec<u64>,
 }
 
@@ -161,7 +188,8 @@ impl Settings {
     /// Read `lookout.toml` out of `dir` (`0x101ac89d0`).
     ///
     /// A missing file is the default settings; a file that cannot be read or
-    /// parsed is `"<path>: <error>"`.
+    /// parsed is `"<path>: <error>"`, where the error is the `toml` crate's
+    /// own (line, column, span).
     pub fn read(dir: &Path) -> Result<Settings, String> {
         let path = dir.join(FILE);
         let text = match std::fs::read_to_string(&path) {
@@ -178,8 +206,12 @@ impl Settings {
     }
 
     /// Write `lookout.toml` into `dir` (`0x101ac8c94`).
+    ///
+    /// Serialisation goes through the real `toml` crate; the error arm keeps the
+    /// crate's message rather than writing a half document, although nothing in
+    /// this twelve-key struct can actually make it fail.
     pub fn write(&self, dir: &Path) -> Result<(), String> {
-        let text = to_toml(self);
+        let text = serialise(self)?;
         file::write(&dir.join(FILE), text.as_bytes()).map_err(|problem| problem.text)
     }
 
@@ -202,195 +234,30 @@ impl Settings {
     }
 }
 
-/// Render `settings` the way `toml::to_string_pretty` does.
+/// Render `settings` with `toml::to_string`, the shape the recovered
+/// `Serialize` walk writes.
 ///
 /// Only the twelve recovered keys are written, in declaration order, and the
-/// ones `Serialize` skips are skipped here too.
+/// ones `Serialize` skips (an empty `off`/`always`/`seeded`, an absent
+/// `ignore`) are skipped here too.
 pub fn to_toml(settings: &Settings) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "occasions = {}", settings.occasions);
-    let _ = writeln!(out, "window = {}", float(settings.window));
-    let _ = writeln!(out, "stat_floor = {}", settings.stat_floor);
-    let _ = writeln!(out, "forget_days = {}", settings.forget_days);
-    let _ = writeln!(out, "quiet_secs = {}", settings.quiet_secs);
-    let _ = writeln!(out, "mark = {}", settings.mark);
-    let _ = writeln!(out, "paused = {}", settings.paused);
-    if !settings.off.is_empty() {
-        let _ = writeln!(out, "off = {}", strings(&settings.off));
-    }
-    if let Some(ignore) = &settings.ignore {
-        let _ = writeln!(out, "ignore = {}", strings(ignore));
-    }
-    if !settings.always.is_empty() {
-        let _ = writeln!(out, "always = {}", strings(&settings.always));
-    }
-    let _ = writeln!(out, "trigger_added = {}", settings.trigger_added);
-    if !settings.seeded.is_empty() {
-        let numbers: Vec<String> = settings.seeded.iter().map(|n| n.to_string()).collect();
-        let _ = writeln!(out, "seeded = [{}]", numbers.join(", "));
-    }
-    out
+    serialise(settings).unwrap_or_default()
 }
 
-/// `2.0` rather than `2` — what a TOML float looks like.
-fn float(value: f64) -> String {
-    let text = format!("{}", value);
-    if text.contains(['.', 'e', 'E', 'n', 'i']) {
-        text
-    } else {
-        format!("{text}.0")
-    }
+/// `toml::to_string`, keeping the crate's error.
+fn serialise(settings: &Settings) -> Result<String, String> {
+    ::toml::to_string(settings).map_err(|error| error.to_string())
 }
 
-fn strings(values: &[String]) -> String {
-    let quoted: Vec<String> = values.iter().map(|value| quoted(value)).collect();
-    format!("[{}]", quoted.join(", "))
-}
-
-fn quoted(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Parse the settings file: `key = value` lines, `#` comments, nothing else.
+/// Parse the settings file with `toml::from_str`.
 ///
-/// **UNKNOWN**: whether the original's TOML requires every key.  `serde`'s
-/// derive would report a missing field, but a hand-edited `lookout.toml` is the
-/// obvious use of the file, so a missing key keeps its default here.  An
-/// unknown key is an error, exactly as the `unknown_field` call at
-/// `0x101ac94a0` makes it for the original.
+/// **UNKNOWN**: whether the original's TOML requires every key.  The recovered
+/// field visitor starts from the default block `0x101ac8afc` and overwrites
+/// what it reads, so a missing key keeps its default here
+/// (`#[serde(default)]`); an unknown key is an error, exactly as the
+/// `unknown_field` call at `0x101ac94a0` makes it.
 pub fn parse(text: &str) -> Result<Settings, String> {
-    let mut settings = Settings::default();
-    for (number, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("line {}: expected `key = value`", number + 1));
-        };
-        let key = key.trim();
-        let value = value.trim();
-        match key {
-            "occasions" => settings.occasions = integer(value)?.clamp(0, u8::MAX as i64) as u8,
-            "window" => settings.window = decimal(value)?,
-            "stat_floor" => {
-                settings.stat_floor = integer(value)?.clamp(0, i64::MAX) as u64
-            }
-            "forget_days" => {
-                settings.forget_days = integer(value)?.clamp(0, u32::MAX as i64) as u32
-            }
-            "quiet_secs" => settings.quiet_secs = integer(value)?.clamp(0, u32::MAX as i64) as u32,
-            "mark" => settings.mark = integer(value)?.clamp(0, u8::MAX as i64) as u8,
-            "paused" => settings.paused = boolean(value)?,
-            "trigger_added" => settings.trigger_added = boolean(value)?,
-            "off" => settings.off = string_array(value)?,
-            "always" => settings.always = string_array(value)?,
-            "ignore" => settings.ignore = Some(string_array(value)?),
-            "seeded" => settings.seeded = number_array(value)?,
-            other => {
-                return Err(format!(
-                    "unknown field `{other}`, expected one of `occasions`, `window`, \
-                     `stat_floor`, `forget_days`, `quiet_secs`, `mark`, `paused`, `off`, \
-                     `ignore`, `always`, `trigger_added`, `seeded`"
-                ))
-            }
-        }
-    }
-    Ok(settings)
-}
-
-fn integer(value: &str) -> Result<i64, String> {
-    value
-        .replace('_', "")
-        .parse::<i64>()
-        .map_err(|_| format!("expected an integer, found `{value}`"))
-}
-
-fn decimal(value: &str) -> Result<f64, String> {
-    value
-        .replace('_', "")
-        .parse::<f64>()
-        .map_err(|_| format!("expected a float, found `{value}`"))
-}
-
-fn boolean(value: &str) -> Result<bool, String> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!("expected a boolean, found `{other}`")),
-    }
-}
-
-fn string_array(value: &str) -> Result<Vec<String>, String> {
-    let inner = value
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .ok_or_else(|| format!("expected an array, found `{value}`"))?;
-    let mut out = Vec::new();
-    let mut chars = inner.chars().peekable();
-    loop {
-        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ',') {
-            chars.next();
-        }
-        match chars.peek() {
-            None => return Ok(out),
-            Some('"') => {
-                chars.next();
-            }
-            Some(other) => return Err(format!("expected a string, found `{other}`")),
-        }
-        let mut piece = String::new();
-        loop {
-            match chars.next() {
-                None => return Err("unterminated string".to_string()),
-                Some('"') => break,
-                Some('\\') => match chars.next() {
-                    Some('n') => piece.push('\n'),
-                    Some('t') => piece.push('\t'),
-                    Some('r') => piece.push('\r'),
-                    Some('"') => piece.push('"'),
-                    Some('\\') => piece.push('\\'),
-                    Some(other) => return Err(format!("unknown escape `\\{other}`")),
-                    None => return Err("unterminated escape".to_string()),
-                },
-                Some(other) => piece.push(other),
-            }
-        }
-        out.push(piece);
-    }
-}
-
-fn number_array(value: &str) -> Result<Vec<u64>, String> {
-    let inner = value
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .ok_or_else(|| format!("expected an array, found `{value}`"))?;
-    let mut out = Vec::new();
-    for piece in inner.split(',') {
-        let piece = piece.trim().replace('_', "");
-        if piece.is_empty() {
-            continue;
-        }
-        out.push(
-            piece
-                .parse::<u64>()
-                .map_err(|_| format!("expected an integer, found `{piece}`"))?,
-        );
-    }
-    Ok(out)
+    ::toml::from_str::<Settings>(text).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -491,15 +358,59 @@ mod tests {
     }
 
     #[test]
-    fn the_written_file_is_what_a_toml_reader_expects() {
-        let text = to_toml(&Settings::default());
-        // the empty lists and the absent ignore list are skipped
-        assert!(!text.contains("off ="));
-        assert!(!text.contains("always ="));
-        assert!(!text.contains("ignore ="));
-        assert!(!text.contains("seeded ="));
-        assert_eq!(text.lines().count(), 8);
-        assert!(text.starts_with("occasions = 5\nwindow = 2.0\n"));
+    fn the_written_file_is_the_declaration_order_with_the_recovered_skips() {
+        // the empty lists and the absent ignore list are skipped, so the
+        // defaults are exactly the eight always-written keys
+        assert_eq!(
+            to_toml(&Settings::default()),
+            "occasions = 5\n\
+             window = 2.0\n\
+             stat_floor = 1500\n\
+             forget_days = 30\n\
+             quiet_secs = 60\n\
+             mark = 0\n\
+             paused = false\n\
+             trigger_added = false\n"
+        );
+        // an empty `Some` ignore list is written, unlike `None`
+        let empty = Settings {
+            ignore: Some(Vec::new()),
+            ..Settings::default()
+        };
+        assert!(to_toml(&empty).contains("ignore = []\n"));
+    }
+
+    #[test]
+    fn the_keys_are_written_in_the_declaration_order() {
+        let text = to_toml(&Settings {
+            off: vec!["one".to_string()],
+            ignore: Some(vec!["two".to_string()]),
+            always: vec!["three".to_string()],
+            seeded: vec![4],
+            ..Settings::default()
+        });
+        let keys: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(" = ").map(|(key, _)| key))
+            .collect();
+        // the twelve recovered names, in the order the visitor declares them
+        assert_eq!(
+            keys,
+            vec![
+                "occasions",
+                "window",
+                "stat_floor",
+                "forget_days",
+                "quiet_secs",
+                "mark",
+                "paused",
+                "off",
+                "ignore",
+                "always",
+                "trigger_added",
+                "seeded",
+            ]
+        );
     }
 
     #[test]
@@ -528,7 +439,10 @@ mod tests {
     #[test]
     fn an_unknown_key_is_rejected() {
         let error = parse("paused = true\nnonsense = 1\n").expect_err("unknown");
-        assert!(error.starts_with("unknown field `nonsense`"), "{error}");
+        // the toml crate's own message: a span, then serde's `unknown field`
+        assert!(error.contains("unknown field `nonsense`"), "{error}");
+        // and it points at the line it failed on, which the stand-in could not
+        assert!(error.contains("line 2"), "{error}");
     }
 
     #[test]
@@ -537,5 +451,63 @@ mod tests {
         assert_eq!(settings.window, 4.5);
         assert_eq!(settings.stat_floor, 1500);
         assert_eq!(settings.forget_days, 30);
+        // a document with nothing in it is the defaults
+        assert_eq!(parse("").expect("empty"), Settings::default());
+        assert_eq!(
+            parse("# only a comment\n").expect("comment"),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn real_toml_arrives_comments_multiline_arrays_and_underscores() {
+        // none of this was readable by the `key = value` stand-in
+        let settings = parse(
+            "# Ydella's choices\n\
+             window = 2.5  # seconds\n\
+             stat_floor = 1_500\n\
+             off = [\n    \"the kobold\",\n    \"a goblin\",\n]\n",
+        )
+        .expect("parsed");
+        assert_eq!(settings.window, 2.5);
+        assert_eq!(settings.stat_floor, 1500);
+        assert_eq!(
+            settings.off,
+            vec!["the kobold".to_string(), "a goblin".to_string()]
+        );
+        // an integer where a float is declared is still a float (serde's rule)
+        assert_eq!(parse("window = 3\n").expect("integer").window, 3.0);
+    }
+
+    #[test]
+    fn a_value_that_does_not_fit_the_field_is_an_error() {
+        // the stand-in clamped `occasions = 300` to 255 without saying so
+        let error = parse("occasions = 300\n").expect_err("out of range");
+        assert!(error.contains("invalid value"), "{error}");
+        let error = parse("paused = \"yes\"\n").expect_err("wrong type");
+        assert!(error.contains("invalid type"), "{error}");
+        // and a document that is not TOML at all fails with the crate's span
+        let error = parse("occasions 5\n").expect_err("not toml");
+        assert!(error.contains("line 1"), "{error}");
+    }
+
+    #[test]
+    fn floats_are_written_the_way_toml_spells_them() {
+        // `2.0`, not `2`: a TOML float keeps its fraction
+        assert!(to_toml(&Settings::default()).contains("window = 2.0\n"));
+        // the stand-in wrote `NaN`/`inf`, which is not TOML; the crate writes
+        // the lowercase literals TOML 1.0 defines and reads them back
+        let nan = Settings {
+            window: f64::NAN,
+            ..Settings::default()
+        };
+        assert!(to_toml(&nan).contains("window = nan\n"), "{}", to_toml(&nan));
+        assert!(parse(&to_toml(&nan)).expect("parsed").window.is_nan());
+        let inf = Settings {
+            window: f64::INFINITY,
+            ..Settings::default()
+        };
+        assert!(to_toml(&inf).contains("window = inf\n"), "{}", to_toml(&inf));
+        assert_eq!(parse(&to_toml(&inf)).expect("parsed").window, f64::INFINITY);
     }
 }

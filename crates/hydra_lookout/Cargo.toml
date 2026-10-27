@@ -4,8 +4,13 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-# The original linked `regex` / `regex_automata` for the ignore set and for the
-# stat pattern, and called `hydra_model::pattern::compile` for the stat pattern
-# (`Lookout::new`, 0x101ab4184).  This workspace's `hydra_model` ships a
-# std-only matcher for the same subset, so the dependency is kept.
+# The original linked all three: `regex`/`regex_automata` for the ignore set and
+# the stat pattern, `serde` + `toml` for `lookout.toml`.  Phase 1 put the real
+# crates back.  `hydra_model` stays for `pattern::ascii`, the ASCII rewrite the
+# binary's pattern compiler (`0x101ab4184`) runs over the stat pattern before
+# `regex::Regex::new`; the ignore set goes to `RegexSet` verbatim (see
+# NOTES.md §6 and the Phase 1 section).
 hydra_model = { path = "../hydra_model" }
+regex = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

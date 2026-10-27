@@ -3,11 +3,13 @@
 //!
 //! The lookout watches the game's lines: it learns which creatures and objects
 //! are worth remembering, keeps a small set of counters on disk, and lets a
-//! player mask ("off") or pin ("always") individual lines.  Everything is
-//! std-only here: the original linked `regex`/`regex_automata` for the ignore
-//! set and the stat pattern, `serde`/`toml` for `lookout.toml`, and `serde` for
-//! the state file; the state file turned out to be a hand-rolled binary format
-//! (`HYDRALK1`), so only the settings file needs a (small) TOML reader here.
+//! player mask ("off") or pin ("always") individual lines.
+//!
+//! **Reconnected (Phase 1)**: the original linked `regex`/`regex_automata` for
+//! the ignore set and the stat pattern, and `serde` + `toml` for
+//! `lookout.toml`; all three are the real crates again here (`regex` 1.13.1,
+//! `serde` 1.0.229, `toml` 1.1.6 — the workspace pins).  The state file needs
+//! no crate: it is a hand-rolled binary format (`HYDRALK1`), recovered in full.
 
 #![allow(dead_code)]
 
@@ -20,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hydra_model::pattern::{self, Pattern};
+use hydra_model::pattern;
+use regex::{Regex, RegexSet};
 use settings::Settings;
 
 /// How many days a counted key survives without being seen again
@@ -171,13 +174,60 @@ pub struct Line {
     pub text: String,
 }
 
-/// `pattern` with the leading `\b` dropped.
+/// The compiled stat pattern, [`STAT_PATTERN`] as it was compiled in the
+/// original — the recovered leading `\b` included.
 ///
-/// `hydra_model::pattern` has no word-boundary assertion (only anchors, `.`,
-/// classes, groups and repetitions), so the recovered stat pattern is compiled
-/// without its leading `\b`.  Every other construct in it is supported.
-pub fn without_boundary(pattern: &str) -> &str {
-    pattern.strip_prefix(r"\b").unwrap_or(pattern)
+/// `Lookout::new` compiles it with `hydra_model::pattern::compile` at
+/// `0x101ab4184`, i.e. the ASCII rewrite (`\b` → `(?-u:\b)`, `\d` → `[0-9]`,
+/// `\s` → `[\t\n\x0B\x0C\r ]`) and then `regex::Regex::new`.  The `std`
+/// matcher this crate used to carry had no word-boundary assertion at all, so
+/// the source was compiled with its `\b` **stripped** (a `without_boundary`
+/// shim); the real `regex` honours the boundary, so `CLASS: 12` is no longer a
+/// stat line.
+pub fn stat_pattern() -> Regex {
+    compile(STAT_PATTERN).expect(
+        "the recovered stat pattern compiles (see `the_stat_pattern_compiles_with_its_recovered_word_boundary`)",
+    )
+}
+
+/// Compile `source` the way the original's pattern compiler did:
+/// `hydra_model::pattern::ascii` (the recovered `Edits` visitor) then
+/// `regex::Regex::new`.
+///
+/// `hydra_model::pattern::compile` answers a [`hydra_model::pattern::Pattern`]
+/// wrapper, but `Lookout+0x1d8`/`+0x1f8` are the 32-byte `Regex` the compiler
+/// produced (`Option<Regex>` in the original), so the two steps are taken
+/// directly and the real `Regex` is kept.
+fn compile(source: &str) -> Result<Regex, regex::Error> {
+    Regex::new(&pattern::ascii(source))
+}
+
+/// Compile the ignore list into the real `RegexSet` at `Lookout+0x1b8`.
+///
+/// `Lookout::set` (`0x101ab4754`) builds the whole set in one go, over the
+/// recovered pattern strings **as they are** — the original's field is a
+/// `RegexSet`, so these keep `regex`'s Unicode `\d`/`\s` rather than going
+/// through the stat pattern's ASCII rewrite.  A pattern that does not compile
+/// is reported with the recovered `[hydra] lookout: … does not read` line and
+/// left out, so one bad pattern in a hand-edited `lookout.toml` does not throw
+/// away the other twenty-seven.
+fn ignore_set(patterns: &[String]) -> RegexSet {
+    match RegexSet::new(patterns) {
+        Ok(set) => set,
+        Err(_) => {
+            let mut good: Vec<&str> = Vec::with_capacity(patterns.len());
+            for source in patterns {
+                match Regex::new(source) {
+                    Ok(_) => good.push(source),
+                    Err(_) => eprintln!(
+                        "[hydra] lookout: the ignore pattern `{}` does not read\n",
+                        source
+                    ),
+                }
+            }
+            RegexSet::new(&good).unwrap_or_else(|_| RegexSet::empty())
+        }
+    }
 }
 
 /// The FNV-1a hash of `tag` followed by `text`.
@@ -318,9 +368,9 @@ pub fn reload(dir: &Path) {
 /// | `+0x128` | `known: HashSet<u64>` (48) |
 /// | `+0x158` | `counting: HashMap<u64, Counting>` (48) |
 /// | `+0x188` | `recent: HashMap<u64, Recent>` (48) |
-/// | `+0x1b8` | `ignore: Vec<Pattern>` (the original's `Option<RegexSet>`) |
-/// | `+0x1d8` | `stats: Pattern` (the original's `Option<Regex>`) |
-/// | `+0x1f8` | `owns: Option<Pattern>` (`Option<Regex>`) |
+/// | `+0x1b8` | `ignore: RegexSet` (the original's `Option<RegexSet>`) |
+/// | `+0x1d8` | `stats: Regex` (the original's `Option<Regex>`) |
+/// | `+0x1f8` | `owns: Option<Regex>` (`Option<Regex>`) |
 /// | `+0x218` | `written: u64` |
 /// | `+0x220` | `snaps: u64` |
 /// | `+0x228` | `dirty: bool` |
@@ -347,11 +397,11 @@ pub struct Lookout {
     /// The quiet-window bookkeeping, in memory only.
     pub recent: HashMap<u64, Recent>,
     /// The compiled ignore set.
-    pub ignore: Vec<Pattern>,
+    pub ignore: RegexSet,
     /// The compiled stat pattern (`STAT_PATTERN`).
-    pub stats: Pattern,
+    pub stats: Regex,
     /// The compiled name pattern, when [`Lookout::own`] has been given a name.
-    pub owns: Option<Pattern>,
+    pub owns: Option<Regex>,
     /// The generation of the last state file written.
     pub written: u64,
     /// How many snapshots this lookout has taken.
@@ -388,8 +438,8 @@ impl Lookout {
             known: HashSet::new(),
             counting: HashMap::new(),
             recent: HashMap::new(),
-            ignore: Vec::new(),
-            stats: pattern::compile(without_boundary(STAT_PATTERN)),
+            ignore: RegexSet::empty(),
+            stats: stat_pattern(),
             owns: None,
             written: 0,
             snaps: 0,
@@ -410,19 +460,7 @@ impl Lookout {
     /// Replace the settings and rebuild what derives from them
     /// (`0x101ab4754`).
     pub fn set(&mut self, settings: &Settings) {
-        let ignore = settings.ignore_list();
-        let patterns: Vec<Pattern> = ignore.iter().map(|p| pattern::compile(p)).collect();
-        if let Some((_, source)) = patterns
-            .iter()
-            .zip(ignore.iter())
-            .find(|(compiled, _)| !compiled.is_ok())
-        {
-            eprintln!(
-                "[hydra] lookout: the ignore pattern `{}` does not read\n",
-                source
-            );
-        }
-        self.ignore = patterns;
+        self.ignore = ignore_set(&settings.ignore_list());
         self.always = settings
             .always
             .iter()
@@ -478,8 +516,9 @@ impl Lookout {
         self.own.push(name.to_string());
         let alternation = self.own.join("|");
         let source = format!("(?i)\\b(?:{})\\b", alternation);
-        let compiled = pattern::compile(&source);
-        self.owns = if compiled.is_ok() { Some(compiled) } else { None };
+        // the same compiler as the stat pattern (a name that is not a valid
+        // pattern leaves `owns` empty rather than panicking)
+        self.owns = compile(&source).ok();
     }
 
     /// Count `key` once (`0x101ab4d34`).
@@ -531,10 +570,12 @@ impl Lookout {
     /// `settings.paused`, an ignored line, an empty line), that the stat regex
     /// is applied to the line and that a stat value below
     /// `settings.stat_floor` is not a judgement (`0x101ab5894`), and that the
-    /// surviving lines are counted through [`Lookout::count`].  The exact set
-    /// of keys one line produces is inlined across 4 KB of `regex_automata`
-    /// capture handling and is *not* recovered; we count the sentence key and
-    /// every object key the sentence mentions.
+    /// surviving lines are counted through [`Lookout::count`].  The stat value
+    /// is the first capture of [`STAT_PATTERN`] (`Lookout::stat_reach`), which
+    /// is what `0x101ab52f8`'s `Regex::create_captures` hands the comparison.
+    /// The exact set of keys one line produces is inlined across 4 KB of
+    /// `regex_automata` capture handling and is *not* recovered; we count the
+    /// sentence key and every object key the sentence mentions.
     pub fn judge(&mut self, said: &str, line: &Line, now: f64) -> bool {
         if self.shut || self.settings.paused {
             return false;
@@ -548,11 +589,10 @@ impl Lookout {
         }
         let day = (now / SECONDS_PER_DAY).max(0.0) as u32;
         let mut counted = false;
-        if self.stats.is_ok()
-            && self.stats.is_match(text)
-            && stat_reach(text).is_some_and(|reach| reach < self.settings.stat_floor)
-        {
-            return false;
+        if let Some(reach) = self.stat_reach(text) {
+            if reach < self.settings.stat_floor {
+                return false;
+            }
         }
         let sentence = key::sentence(text);
         if !sentence.is_empty() {
@@ -578,6 +618,19 @@ impl Lookout {
             self.dirty = true;
         }
         counted
+    }
+
+    /// The stat a line carries, as a magnitude — the number the lookout
+    /// compares with `settings.stat_floor` (`0x101ab584c`).
+    ///
+    /// The recovered body applies [`STAT_PATTERN`] to the line with `regex`'s
+    /// captures (`0x101ab52f8` `Regex::create_captures`), parses the capture as
+    /// a signed integer (saturating, `0x101ab5754`) and compares it with the
+    /// floor.  Only the **first** stat of a line is looked at, which is what
+    /// `captures` answers.
+    fn stat_reach(&self, text: &str) -> Option<u64> {
+        let capture = self.stats.captures(text)?;
+        Some(signed(capture.get(1)?.as_str())?.unsigned_abs())
     }
 
     /// Pin a record: add its sentence to `settings.always`, save the settings
@@ -707,41 +760,27 @@ fn write_newest(path: &Path, bytes: &[u8], generation: u64) -> Result<(), String
     Ok(())
 }
 
-/// The largest absolute stat value in `text`, if any — the number the lookout
-/// compares with `settings.stat_floor` (`0x101ab584c`).
-fn stat_reach(text: &str) -> Option<u64> {
-    let mut reach: Option<u64> = None;
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let start = index;
-        let mut sign = 1i64;
-        if bytes[index] == b'+' || bytes[index] == b'-' {
-            let negative = bytes[index] == b'-';
-            index += 1;
-            if index >= bytes.len() || !bytes[index].is_ascii_digit() {
-                index = start + 1;
-                continue;
-            }
-            if negative {
-                sign = -1;
-            }
-        }
-        if !bytes[index].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-        let mut value = 0i64;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            value = value
-                .saturating_mul(10)
-                .saturating_add((bytes[index] - b'0') as i64);
-            index += 1;
-        }
-        let value = (value * sign).unsigned_abs();
-        reach = Some(reach.map_or(value, |have| have.max(value)));
+/// A signed integer from a capture, saturating at `i64::MIN`/`i64::MAX`.
+///
+/// The recovered body parses the capture with `str::parse`'s saturating
+/// counterpart (`0x101ab5754`), so a stat of twenty digits is the bound rather
+/// than an error — a rubber-banded `AS` is still a stat line.
+fn signed(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    reach
+    let mut value: u64 = 0;
+    for byte in digits.bytes() {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'));
+    }
+    let value = value.min(i64::MAX as u64) as i64;
+    Some(if negative { -value } else { value })
 }
 
 #[cfg(test)]
@@ -892,9 +931,95 @@ mod tests {
     }
 
     #[test]
-    fn a_stat_reach_is_the_largest_absolute_value() {
-        assert_eq!(stat_reach("AS: -42, DS: 7"), Some(42));
-        assert_eq!(stat_reach("nothing here"), None);
+    fn a_stat_reach_is_the_first_stat_of_the_line() {
+        let lookout = lookout("reach");
+        // `captures` answers the leftmost stat; the magnitude is what the floor
+        // is compared with
+        assert_eq!(lookout.stat_reach("AS: -42, DS: 7"), Some(42));
+        assert_eq!(lookout.stat_reach("nothing here"), None);
+        // the recovered parse saturates rather than failing
+        assert_eq!(
+            lookout.stat_reach("AS: 9999999999999999999999"),
+            Some(i64::MAX as u64)
+        );
+        // a word that merely ends in a stat token is not one (`\b`)
+        assert_eq!(lookout.stat_reach("CLASS: 40"), None);
+    }
+
+    #[test]
+    fn the_stat_pattern_compiles_with_its_recovered_word_boundary() {
+        let stats = stat_pattern();
+        // `Lookout::new` would panic if the literal stopped compiling
+        for token in ["AS", "DS", "CS", "TD", "UAF", "UDF", "AvD", "CvA"] {
+            assert!(stats.is_match(&format!("{token}: 1")), "{token}");
+            assert!(stats.is_match(&format!("{token}:+1")), "{token}");
+            assert!(
+                stats.is_match(&format!("{token} : -1")),
+                "{token} allows space before the colon"
+            );
+        }
+        // the capture is the signed number, which is what the floor reads
+        assert_eq!(&stats.captures("AS: -42, DS: 7").unwrap()[1], "-42");
+        // the recovered leading `\b`: a stat token inside a word is not a stat
+        assert!(!stats.is_match("CLASS: 25"));
+        assert!(!stats.is_match("GLASS: 25"));
+    }
+
+    #[test]
+    fn the_stat_pattern_goes_through_the_recovered_ascii_rewrite() {
+        // `0x101ab4184` compiles the literal with `hydra_model::pattern::compile`,
+        // whose first step rewrites `\b`/`\s`/`\d` for ASCII semantics; the
+        // boundary is rewritten, never stripped (the stand-in stripped it).
+        assert_eq!(stat_pattern().as_str(), pattern::ascii(STAT_PATTERN));
+        assert!(stat_pattern().as_str().contains(r"(?-u:\b)"));
+        // so `\s` is the ASCII set and `\d` is `[0-9]`
+        assert!(!stat_pattern().is_match("AS:\u{a0}12"), "NBSP is not \\s");
+        assert!(
+            !stat_pattern().is_match("AS: \u{664}\u{642}"),
+            "Arabic-Indic digits are not \\d"
+        );
+    }
+
+    #[test]
+    fn the_ignore_set_is_a_real_regex_set() {
+        // no settings were written, so the twenty-eight built-ins are compiled
+        let lookout = lookout("ignore");
+        assert_eq!(lookout.ignore.len(), 28);
+        assert!(lookout.ignore.is_match("Obvious exits: north"));
+        assert!(lookout.ignore.matches("Obvious exits: north").matched(0));
+        assert!(lookout.ignore.is_match("[LNet] Ydella says"));
+        // an alternation inside one pattern is one entry, not several
+        let matched: Vec<usize> = lookout.ignore.matches("[Merchant] hi").iter().collect();
+        assert_eq!(matched, vec![2]);
+        // `^\s*>\s*$` is the prompt line
+        assert!(lookout.ignore.is_match("  >  "));
+        // the `(?i)` in the list is a real flag
+        assert!(lookout.ignore.is_match("you notice a trap"));
+        assert!(!lookout.ignore.is_match("A kobold scratches you."));
+    }
+
+    #[test]
+    fn a_broken_ignore_pattern_is_dropped_and_the_rest_still_work() {
+        let mut lookout = lookout("ignore-bad");
+        lookout.set(&Settings {
+            ignore: Some(vec!["^Obvious".to_string(), "(unclosed".to_string()]),
+            ..Settings::default()
+        });
+        // one bad pattern in a hand-edited `lookout.toml` does not cost the
+        // other ones (`set` reports it and compiles the rest)
+        assert_eq!(lookout.ignore.len(), 1);
+        assert!(lookout.ignore.is_match("Obvious exits: north"));
+    }
+
+    #[test]
+    fn owning_a_name_builds_the_recovered_word_bounded_pattern() {
+        let mut lookout = lookout("own-re");
+        lookout.own("Aelith");
+        let owns = lookout.owns.as_ref().expect("compiled");
+        assert_eq!(owns.as_str(), pattern::ascii("(?i)\\b(?:Aelith)\\b"));
+        // `(?i)` is a real flag, and both `\b`s are real boundaries
+        assert!(owns.is_match("AELITH waves."));
+        assert!(!owns.is_match("Aelithia waves."));
     }
 
     #[test]

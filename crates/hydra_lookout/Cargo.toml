@@ -2,3 +2,10 @@
 name = "hydra_lookout"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# The original linked `regex` / `regex_automata` for the ignore set and for the
+# stat pattern, and called `hydra_model::pattern::compile` for the stat pattern
+# (`Lookout::new`, 0x101ab4184).  This workspace's `hydra_model` ships a
+# std-only matcher for the same subset, so the dependency is kept.
+hydra_model = { path = "../hydra_model" }

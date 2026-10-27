@@ -420,6 +420,65 @@ Both are implemented in `parser/read.rs` in exactly this shape, including the
 | `MerchantStatus` tags: `Start = isize::MIN`, `Rules = isize::MIN+1`, `Stop = …`, other → owned lowercased string; input trimmed and ASCII-lowercased in place | `0x101c2f898` (`star`+`t`, `rule`+`s`, `stop`) |
 | `InventoryItem::in_capacity`: words at `+0x118`/`+0x11c`; `(1,0)` → tag 2 (`Unknown`); else tag `= (w2 % 10 != 0)`, payload `(w2 % 10, w2 / 10)` | `0x101c2f84c` |
 
+### `parse_line` and the tag dispatch (Phase 5a)
+
+`Parser::parse_line` (`0x101c1a760`, 6352 B) is now reconstructed as the
+left-to-right scanner it is, and the tag dispatch table its callee
+`parser::dispatch::dispatch` (`0x101c1d7f8`, 6656 B) implements is reproduced.
+The oracle for every rule below is the reference binary's own `Debug for Frame`
+output (`hydra replay FILE`, one frame per line), which prints the variant name
+and its payload — that is how the variant names, the frame *order* and each
+payload's distinguishing attribute were read, line by line, from hand-written
+inputs.
+
+| family | tags | frame(s) |
+|---|---|---|
+| inline markup (`is_markup`) | `a b d style preset output pushBold popBold` | one `Structural` per occurrence, open and close alike |
+| swallowed elements (`is_paired` + `compDef`) | `component compDef inv egMerchant inventoryManager cmdlist objectives menu compass left right spell prompt worldEvent inventoryViewItem` | one frame, the body and `</tag>` belong to it |
+| thin tags | everything else with a handler (`label progressBar indicator link sep skin …`, `roommeta`, `container`, `openDialog`, `dialogData`, `streamWindow`, `nav`, …) | a frame on the open/self-closing tag, `Structural` at the close, body scanned normally |
+| known, no handler | `mode dir task group reward room roomDesc action …` | `WindowHints` |
+| unknown | anything outside `tags::is_known` | `UnknownTag` per occurrence, plus the `== unknown tags` footer tally |
+
+Details that are not guessable and are now covered by unit tests:
+
+* a line with **no** tags is exactly one `Text` frame, even when empty; a
+  line with tags emits a `Text` frame per non-empty segment, so
+  `AA<b>BB</b>CC` is `Text Structural Text Structural Text`;
+* the text is entity-decoded but **not** tag-stripped: prose such as
+  `a < b > c` keeps its angle brackets;
+* `<!-- … -->` is dropped in place without flushing the pending text, and an
+  unterminated one is a `MalformedTag`; `<!-- CLIENT --><c>…<!-- ENDCLIENT -->`
+  is one `ClientCommand` (that is `wire::client_region`'s text variant, frame
+  tag `0x35`), while a head without `<c>` yields no frame at all;
+* an element whose `</tag>` is missing from the line is a `MalformedTag`
+  holding the rest of the line;
+* `castTime`/`roundTime`/`timer` are `MalformedTag` when `value` is absent or
+  not a `u32` (`timer` → `AimTime`);
+* `openDialog …resident="true"` is `DialogPanelOpen`, any other `resident`
+  value `DialogOpen`; `<dialogData …/>` is `ClearDialogData`, a paired one
+  `DialogOpen`, preceded by `ClearDialogData` when `clear` is `"t"`/`"true"`;
+* `resource` is `RoomPicture` only with a `picture` attribute;
+* element bodies use `parser::inner`, which is *not* the top-level dispatcher:
+  inline markup is dropped, `crtrStatus` still frames (in a component, an
+  `inv` and an `egMerchant`), `objective`/`mi` elements are swallowed by their
+  parents, and every other known tag becomes a `Structural` — that includes
+  `label` inside `<inv>`, which is why it is not a `Label` there;
+* two pieces of state cross lines: the **stream stack**
+  (`pushStream`/`<stream>` push, `popStream`/`</stream>` pop — the latter pops
+  the innermost *element*, wherever it sits — then `StreamResume` names the new
+  top, and `<prompt>` empties the stack as one `StreamPopForced` per entry), and
+  the **open dialog**, which makes `emit::flush` drop whitespace-only text
+  (an indented `<openDialog …> </openDialog>` line produces no `Text` frame,
+  while `<label …> </label>` still does).
+
+`Frame` gains one variant, `Frame::Event { kind, text }`, carrying the
+original's own variant name for the ~40 dedicated frames the reconstruction
+does not model structurally; `Frame::kind()` returns those names, so the
+`--summary` histogram is the reference build's.  `crates/hydra`'s `render`/
+`replay` print it (`{count:>8}  {Variant}`, sorted, non-zero only, then the
+unknown-tag block) — see `tools/diff_replay.sh`, which compares both binaries
+over every fixture and reports a per-kind delta table.
+
 ### Writer (`write`)
 
 * `escape` compares `"` `&` `'` `<` `>` (`0x22 0x26 0x27 0x3c 0x3e`) and emits

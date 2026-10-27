@@ -89,6 +89,9 @@ pub struct Summary {
     pub frames: usize,
     /// Per-kind counts.
     pub counts: Counts,
+    /// Every tag name the parser did not recognise, with its occurrence count
+    /// (open *and* close counted separately), as the footer prints it.
+    pub unknown: std::collections::BTreeMap<String, usize>,
 }
 
 /// Read `file` and replay it, writing the report to stdout.
@@ -101,28 +104,32 @@ pub fn replay_show(file: &str, show: Show) -> Result<Summary, String> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let summary = replay_bytes(&data, show, &mut out).map_err(|err| err.to_string())?;
-    // The reference build ignores a failing stdout in the same way (it drops
-    // the `io::Error` at 0x1002067fc / 0x1002068fc); `flush` is the one place
-    // we surface it, because a half-written report on success would be a lie.
-    out.flush().map_err(|err| err.to_string())?;
+    // The reference build drops a failing stdout on the floor (the `io::Error`
+    // at 0x1002067fc / 0x1002068fc is discarded), so a closed pipe is not an
+    // error there either; match it, or the exit status would differ.
+    let _ = out.flush();
     Ok(summary)
 }
 
 /// The replay core: feed `data` through a fresh [`hydra_protocol::Parser`] and
 /// write the report to `out`.
 ///
-/// Split out from [`replay`] so tests can drive it without a file or a terminal.
+/// Split out from [`replay_show`] so tests can drive it without a file or a
+/// terminal.  Per-frame lines are written as they are decoded (the default and
+/// `--text` modes); the footer — the recovered `\n== {frames} frames from
+/// {bytes} bytes`, the per-kind histogram and the unknown-tag block — is
+/// written in every mode, exactly as the reference build does.
 pub fn replay_bytes<W: Write>(data: &[u8], show: Show, out: &mut W) -> io::Result<Summary> {
     let mut parser = Parser::new();
     let mut source = Replay::new(data.to_vec());
     let mut counts = Counts::default();
     let mut index = 0usize;
-    let mut failure = None;
+    let mut broken = false;
 
     let frames = pump(&mut source, &mut parser, |frame| {
         index += 1;
         counts.add(&frame);
-        if failure.is_some() {
+        if broken {
             return;
         }
         let written = match show {
@@ -133,34 +140,49 @@ pub fn replay_bytes<W: Write>(data: &[u8], show: Show, out: &mut W) -> io::Resul
             },
             Show::Summary => Ok(()),
         };
-        if let Err(err) = written {
-            failure = Some(err);
+        // A failing stdout stops the per-frame lines but is not an error: the
+        // reference build drops the `io::Error` (0x1002067fc / 0x1002068fc).
+        if written.is_err() {
+            broken = true;
         }
     });
-    if let Some(err) = failure {
-        return Err(err);
-    }
 
-    if show == Show::Summary {
-        for (kind, count) in counts.pairs() {
-            if count > 0 {
-                writeln!(out, "{kind}\t{count}")?;
-            }
-        }
-    }
-    // The recovered footer: `"\n== "`, `" frames from "`, `" bytes\n"`.
-    writeln!(
-        out,
-        "\n== {} frames from {} bytes",
-        frames,
-        data.len()
-    )?;
+    let unknown = parser.unknown_tags().clone();
+    // The footer is best-effort for the same reason.
+    let _ = write_footer(out, frames, data.len(), &counts, &unknown);
 
     Ok(Summary {
         bytes: data.len(),
         frames,
         counts,
+        unknown,
     })
+}
+
+/// The recovered footer: `"\n== "`, `" frames from "`, `" bytes\n"`, the
+/// per-kind histogram `"{count:>8}  {Variant}"` for the non-zero kinds in name
+/// order, and then either `"== no unknown tags"` or the `"== unknown tags"`
+/// block with one `"{count:>8}  <{tag}>"` line per name.
+fn write_footer<W: Write>(
+    out: &mut W,
+    frames: usize,
+    bytes: usize,
+    counts: &Counts,
+    unknown: &std::collections::BTreeMap<String, usize>,
+) -> io::Result<()> {
+    writeln!(out, "\n== {frames} frames from {bytes} bytes")?;
+    for (kind, count) in counts.pairs() {
+        writeln!(out, "{count:>8}  {kind}")?;
+    }
+    if unknown.is_empty() {
+        writeln!(out, "== no unknown tags")?;
+    } else {
+        writeln!(out, "== unknown tags")?;
+        for (name, count) in unknown {
+            writeln!(out, "{count:>8}  <{name}>")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -209,7 +231,8 @@ mod tests {
         assert_eq!(summary.frames, 0);
         assert_eq!(summary.bytes, 0);
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, "\n== 0 frames from 0 bytes\n");
+        assert_eq!(text, "\n== 0 frames from 0 bytes\n== no unknown tags\n");
+        assert!(summary.unknown.is_empty());
     }
 
     #[test]
@@ -221,15 +244,18 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                "1\ttext\t-\tyou feel better\n",
-                "2\tprompt\t-\t>\n",
-                "\n== 2 frames from 40 bytes\n"
+                "1\tText\t-\tyou feel better\n",
+                "2\tPrompt\t-\t>\n",
+                "\n== 2 frames from 40 bytes\n",
+                "       1  Prompt\n",
+                "       1  Text\n",
+                "== no unknown tags\n"
             )
         );
         assert_eq!(summary.frames, 2);
         assert_eq!(summary.bytes, 40);
-        assert_eq!(summary.counts.of("text"), 1);
-        assert_eq!(summary.counts.of("prompt"), 1);
+        assert_eq!(summary.counts.of("Text"), 1);
+        assert_eq!(summary.counts.of("Prompt"), 1);
     }
 
     #[test]
@@ -238,7 +264,15 @@ mod tests {
         let mut out = Vec::new();
         let summary = replay_bytes(data, Show::Summary, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, "text\t2\nprompt\t1\n\n== 3 frames from 30 bytes\n");
+        assert_eq!(
+            text,
+            concat!(
+                "\n== 3 frames from 30 bytes\n",
+                "       1  Prompt\n",
+                "       2  Text\n",
+                "== no unknown tags\n"
+            )
+        );
         assert_eq!(summary.counts.total(), 3);
     }
 
@@ -248,7 +282,19 @@ mod tests {
         let mut out = Vec::new();
         replay_bytes(data, Show::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, "bold words\n>\n\n== 2 frames from 54 bytes\n");
+        // `--text` writes the readable text, then the same recovered footer.
+        assert_eq!(
+            text,
+            concat!(
+                "bold words\n",
+                ">\n",
+                "\n== 4 frames from 54 bytes\n",
+                "       1  Prompt\n",
+                "       2  Structural\n",
+                "       1  Text\n",
+                "== no unknown tags\n"
+            )
+        );
     }
 
     #[test]

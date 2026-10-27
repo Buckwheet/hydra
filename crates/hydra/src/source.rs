@@ -204,19 +204,26 @@ mod tests {
         let mut data = vec![b'a'; REPLAY_CHUNK - 3];
         data.extend_from_slice(b"<b>bold</b>\n");
         let frames = drain(&mut Replay::new(data));
-        assert_eq!(frames.len(), 1, "one text frame, not two halves");
+        // `<b>` and `</b>` are inline markup: one `Structural` each, and the
+        // line's text arrives as one frame on either side of the first tag.
+        let kinds: Vec<&str> = frames.iter().map(hydra_protocol::Frame::kind).collect();
+        assert_eq!(kinds, vec!["Text", "Structural", "Text", "Structural"]);
         let text = frames[0].plain();
         assert!(text.starts_with("aaa"), "{text:?}");
-        assert!(text.ends_with("bold"), "{text:?}");
+        assert_eq!(frames[2].plain(), "bold", "the tail is not cut in half");
     }
 
     #[test]
     fn the_lich_feed_reaches_the_same_parser() {
         let script = b"<b>hello</b>\r\n<a exist=\"1\" noun=\"gem\">a gem</a>\r\n".to_vec();
         let frames = drain(&mut Lich::listen(Cursor::new(script.clone())));
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].plain(), "hello");
-        assert_eq!(frames[1].plain(), "a gem");
+        let kinds: Vec<&str> = frames.iter().map(hydra_protocol::Frame::kind).collect();
+        assert_eq!(
+            kinds,
+            vec!["Structural", "Text", "Structural", "Structural", "Text", "Structural"]
+        );
+        assert_eq!(frames[1].plain(), "hello");
+        assert_eq!(frames[4].plain(), "a gem");
 
         // The same bytes as a recording, chunked by the replay source, give the
         // same frames: the two feeds share one state machine.

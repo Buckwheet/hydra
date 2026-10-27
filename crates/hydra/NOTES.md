@@ -316,17 +316,38 @@ printed at `0x100206b1c`) — i.e. `== {frames} frames from {bytes} bytes`.
 ```
 
 * `index` — 1-based, in stream order;
-* `kind` — `text`, `prompt`, `echo`, `raw`, `merchant`, `tag`, `structural`,
-  `client-text` or `client-region` (the last three are the audit pass's new
-  `Frame` variants, kept after the original six so the report stays stable);
+* `kind` — the original `Frame` variant name (`Text`, `Prompt`, `Structural`,
+  `UnknownTag`, `ClientCommand`, and every dedicated one such as `Component`,
+  `DialogWidgets` or `MalformedTag`), as `hydra_protocol::Frame::kind()` spells
+  it;
 * `tag` — the tag name for `tag` frames, `-` otherwise;
 * `text` — the frame's plain text (for `raw` frames, the raw line),
   escaped so one frame is one line: `\\`, `\t`, `\n`, `\r`, other C0/DEL →
   `\xNN`. UTF-8 is passed through untouched.
 
-`--summary` suppresses the per-frame lines and prints `{kind}\t{count}` for the
-nonzero kinds, then the footer. `--text` prints the plain text of each non-empty
-frame, then the footer. `Frame::plain()` is what makes all three modes
+**Phase 5a changed the footer to the reference build's, byte for byte**, and it
+is printed in *every* mode (the reference build does too; `--summary` only
+suppresses the per-frame lines):
+
+```text
+␊== {frames} frames from {bytes} bytes␊
+{count:>8}  {Variant}␊            # the non-zero kinds, sorted by variant name
+== no unknown tags␊               # or:
+== unknown tags␊
+{count:>8}  <{tag}>␊              # sorted, one line per name, open+close counted
+```
+
+`{Variant}` is the original `Frame` variant name (`Component`, `Text`,
+`DialogWidgets`, `StreamPopForced`, `MalformedTag`, …), which
+`hydra_protocol::Frame::kind()` returns; the tally comes from
+`Parser::unknown_tags()`.  `--summary` is byte-identical to the reference build
+on every fixture in `$HYDRA_FIXTURES` (default `~/evidence161`);
+`tools/diff_replay.sh` re-checks that and prints a per-kind delta table.
+
+`--text` prints the plain text of each non-empty frame before that footer.  Its
+*text* is still ours (the reference build goes through
+`hydra::render::Renderer::frame`, §7.1) — text parity is the next phase; the
+histogram in `--text` mode already matches. `Frame::plain()` is what makes all three modes
 deterministic: it concatenates the runs' text without markup.
 
 ### 7.1 `hydra::render::Renderer::frame` (`0x1002593ec`) — recorded, not ported
@@ -383,7 +404,7 @@ reports (`0x10021dffc`).
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **61 passing** (49 unit + 12 integration).
+`cargo test -p hydra --offline` → **62 passing** (50 unit + 12 integration).
 
 Unit tests (in the modules):
 

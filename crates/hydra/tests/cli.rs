@@ -40,15 +40,35 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
 }
 
-/// The exact report for `small_stream.xml` (316 bytes, 6 frames).
+/// The exact default report for `small_stream.xml` (316 bytes, 16 frames).
+///
+/// The per-frame line is this crate's own documented format; the histogram
+/// after it is the reference build's byte-for-byte.
 const REPORT: &str = concat!(
-    "1\ttext\t-\tTown Square\n",
-    "2\ttext\t-\tYou see a fountain here, its water <cold> and clear.\n",
-    "3\ttext\t-\ta blue gem glitters on the ground.\n",
-    "4\ttext\t-\tVaalor’s gate creaks.\n",
-    "5\ttext\t-\t<questState id=\"7\">ready</questState>\n",
-    "6\tprompt\t-\t>\n",
-    "\n== 6 frames from 316 bytes\n",
+    "1\tStructural\t-\t\n",
+    "2\tText\t-\tTown Square\n",
+    "3\tStructural\t-\t\n",
+    "4\tWindowHints\t-\t42\n",
+    "5\tText\t-\tYou see a fountain here, its water <cold> and clear.\n",
+    "6\tStructural\t-\t\n",
+    "7\tText\t-\ta blue gem\n",
+    "8\tStructural\t-\t\n",
+    "9\tText\t-\t glitters on the ground.\n",
+    "10\tStructural\t-\t\n",
+    "11\tText\t-\tVaalor’s gate creaks.\n",
+    "12\tStructural\t-\t\n",
+    "13\tUnknownTag\tquestState\t\n",
+    "14\tText\t-\tready\n",
+    "15\tUnknownTag\tquestState\t\n",
+    "16\tPrompt\t-\t>\n",
+    "\n== 16 frames from 316 bytes\n",
+    "       1  Prompt\n",
+    "       6  Structural\n",
+    "       6  Text\n",
+    "       2  UnknownTag\n",
+    "       1  WindowHints\n",
+    "== unknown tags\n",
+    "       2  <questState>\n",
 );
 
 #[test]
@@ -73,15 +93,18 @@ fn the_room_tag_is_dropped_and_the_unknown_tag_is_kept_verbatim() {
     let path = fixture("small_stream.xml");
     let output = run(&["--replay", path.to_str().unwrap()]);
     let text = stdout(&output);
-    // `<room name=".." id=".."/>` is a *known* structural tag: the recovered
-    // parser consumes it and emits nothing for it, so it is not a frame.
+    // `<room name=".." id=".."/>` is a known tag the parser does not model:
+    // the original frames it as `WindowHints` (named by its `id`), it never
+    // reaches the text.
     assert!(!text.contains("room name"), "{text}");
-    // An unknown tag is preserved as literal text inside the frame it sits on
-    // (`hydra_protocol::Frame` has no `Unknown` emission path for this line).
+    assert!(text.contains("4\tWindowHints\t-\t42\n"), "{text}");
+    // An unknown tag is framed as `UnknownTag` (once per occurrence, open and
+    // close) and listed in the footer.
     assert!(
-        text.contains("5\ttext\t-\t<questState id=\"7\">ready</questState>\n"),
+        text.contains("13\tUnknownTag\tquestState\t\n"),
         "{text}"
     );
+    assert!(text.contains("       2  <questState>\n"), "{text}");
     // The entity was decoded and the UTF-8 passed through untouched.
     assert!(text.contains("water <cold> and clear"), "{text}");
     assert!(text.contains("Vaalor’s gate creaks."), "{text}");
@@ -96,12 +119,21 @@ fn replay_text_shows_readable_text_only() {
         stdout(&output),
         concat!(
             "Town Square\n",
+            "42\n",
             "You see a fountain here, its water <cold> and clear.\n",
-            "a blue gem glitters on the ground.\n",
+            "a blue gem\n",
+            " glitters on the ground.\n",
             "Vaalor’s gate creaks.\n",
-            "<questState id=\"7\">ready</questState>\n",
+            "ready\n",
             ">\n",
-            "\n== 6 frames from 316 bytes\n",
+            "\n== 16 frames from 316 bytes\n",
+            "       1  Prompt\n",
+            "       6  Structural\n",
+            "       6  Text\n",
+            "       2  UnknownTag\n",
+            "       1  WindowHints\n",
+            "== unknown tags\n",
+            "       2  <questState>\n",
         )
     );
 }
@@ -111,7 +143,20 @@ fn replay_summary_counts_the_frame_kinds() {
     let path = fixture("small_stream.xml");
     let output = run(&["--replay", path.to_str().unwrap(), "--summary"]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output), "text\t5\nprompt\t1\n\n== 6 frames from 316 bytes\n");
+    // Byte-identical to the reference build's `--summary`.
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "\n== 16 frames from 316 bytes\n",
+            "       1  Prompt\n",
+            "       6  Structural\n",
+            "       6  Text\n",
+            "       2  UnknownTag\n",
+            "       1  WindowHints\n",
+            "== unknown tags\n",
+            "       2  <questState>\n",
+        )
+    );
 }
 
 #[test]
@@ -119,7 +164,10 @@ fn replaying_an_empty_recording_succeeds_with_no_frames() {
     let path = fixture("empty.xml");
     let output = run(&["--replay", path.to_str().unwrap()]);
     assert!(output.status.success(), "status: {:?}", output.status);
-    assert_eq!(stdout(&output), "\n== 0 frames from 0 bytes\n");
+    assert_eq!(
+        stdout(&output),
+        "\n== 0 frames from 0 bytes\n== no unknown tags\n"
+    );
     assert_eq!(stderr(&output), "");
 }
 

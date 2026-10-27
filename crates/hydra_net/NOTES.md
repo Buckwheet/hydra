@@ -7,10 +7,12 @@ where the next symbol begins.  The original crate lives at
 sibling modules that are *not* in the symbol table are named there too:
 `eaccess/handshake.rs`, `eaccess/game.rs`, `live.rs`.
 
-This crate is a **std-only** reconstruction: the original linked `tokio`,
-`tokio-rustls`, `rustls`, `reqwest`, `tokio-tungstenite`, `jiff`, `regex`,
-`base64` and `url`.  Nothing outside `std` is used here, so the async plumbing is
-expressed as owned data structures plus synchronous helpers.
+This crate was a **std-only** reconstruction; Phase 1 has put the real crates back.
+The original linked `tokio`, `tokio-rustls`, `rustls`, `reqwest`,
+`tokio-tungstenite`, `jiff`, `regex`, `base64` and `url`.  Of those, `tokio`,
+`tokio-tungstenite`, `reqwest`, `jiff`, `regex` and `base64` are reconnected here
+at the workspace-pinned versions (see §3); `tokio-rustls`/`rustls`, `url` and
+`tracing` are *not* workspace pins, so their stand-ins stay and are documented.
 
 Legend:
 
@@ -33,6 +35,14 @@ registers and the sret structs (`Vec`/`String` is cap/ptr/len — cap at +0, ptr
 niche, which shows as `i64::MIN`).
 
 ### 1.1 `eastern.rs` — Eastern-time civil date math (ESTABLISHED)
+
+**Phase 1**: this module runs on `jiff` again — civil dates are
+`jiff::civil::Date`, the zone is `America/New_York` from the time zone database,
+and the DST rule is the database's own.  The recovered day-number arithmetic
+(Hinnant, inlined in the binary) survives as the *fallback* for years outside
+jiff's `-9999..=9999` range, and the recovered fixed US rule survives as the
+fallback for a machine with no time zone database at all; neither runs otherwise.
+The public API is unchanged: `Date` still holds three `i64`s.
 
 The binary has Howard Hinnant's `days_from_civil` / `civil_from_days` inlined
 verbatim (`0x101c5858c`, `0x101c58408`), and the DST rule is folded into
@@ -61,7 +71,11 @@ Facts established by running the original:
   `dst_start` is 02:00 EST on the **second Sunday of March** (07:00 UTC,
   `n*86400 + 25200`) and `dst_end` is 02:00 EDT on the **first Sunday of
   November** (06:00 UTC, `n*86400 + 21600`).  The year is the Eastern civil year
-  of the timestamp.  Verified for 2023 and 2024, around each boundary.
+  of the timestamp.  Verified for 2023 and 2024, around each boundary.  This is
+  the post-2007 US rule and is now only the no-time-zone-database fallback: the
+  tests assert that `jiff`'s `America/New_York` agrees with it for every hour of
+  2007..2027, and that the database also knows what the rule cannot (January 1945
+  was War Time, UTC-4, and the 1974 experiment was year-round daylight time).
 * `date(t)` = `civil_from_days((t + offset(t)).div_euclid(86400))`.
 * `midnight(d)` = `D*86400 - offset(D*86400 + 18000)`, so the switch days come
   out right (2024-03-10 → 05:00 UTC, 2024-11-03 → 04:00 UTC).
@@ -70,10 +84,11 @@ Facts established by running the original:
   walks backwards one day at a time, stopping on a Sunday or on day 1, so a week
   that straddles a month boundary is clipped to the 1st.
 * `format` is `{:04}-{:02}-{:02}` (the `fmt::Arguments` piece table is at
-  `0x103bfa729`).
+  `0x103bfa729`); the rendering is now jiff's own ISO 8601 printer, which pads
+  the year to four digits exactly as that literal does.
 * `parse` splits on `-`, requires field widths 4/2/2 and no fourth field, parses
   each as a signed integer (`str::parse::<i64>`, so `+3`/`-1` are accepted), then
-  round-trips through the two day-number functions so `2023-02-30` is rejected
+  round-trips through `jiff::civil::Date::new` so `2023-02-30` is rejected
   instead of normalised.
 
 ### 1.2 `eaccess::wire` — the login wire protocol
@@ -132,9 +147,11 @@ Facts established by running the original:
 * match → `[stage: cert_pin] certificate matches the pin at {}` (logged in the
   original; the string is kept as documentation).
 
-`base64_encode`/`base64_decode` are a std reimplementation of `base64-0.22`'s
-default (padded, standard alphabet); `pem_encode`/`pem_decode` wrap them with the
-PEM markers.
+**Phase 1**: `base64_encode`/`base64_decode` are `base64-0.22.1`'s default engine
+(`general_purpose::STANDARD`: `+/` alphabet, `=` padding) again, with the same
+public signatures; the only thing on top of the engine is that whitespace is
+dropped before decoding (a PEM body arrives wrapped).  `pem_encode`/`pem_decode`
+wrap the engine with the PEM markers at 64 columns.
 
 ### 1.4 `eaccess::refusal` — launch refusals
 
@@ -178,7 +195,9 @@ grew one.`).
   `/{}/play/home.asp`, both with the instance's web code (the format tables are
   at `0x103e7faa4`/`0x103e7fab9`; the leading `/` is a literal piece).
 * `http::location_of` / `status_of`: the original read `Location` off a `reqwest`
-  response; this scans the header block.
+  response.  **Phase 1**: `location_of_response`/`status_of_response` do exactly
+  that on a real `reqwest::Response` again (`HeaderMap` lookup, empty value → no
+  location); the text spellings stay for a caller that only kept the bytes.
 * `scrape::*`: `classify_login_redirect` compares against the instance's error
   and ok pages and recognises `signin_needed.asp`; `is_subscription_needed`
   looks for `/play/subscription`; `find_char_code` walks `id="W_` rows and their
@@ -190,9 +209,15 @@ grew one.`).
   key`, `… duplicate host, port or key`, `… port is not a number`,
   `… host or port is not this instance's {}`).
 * `shim`: `shim_request` = `wss://{}/shim/{}`; `shim_host` = `https://{}` with
-  the path dropped; `shim_query` keeps the recovered `spcircname{}` key;
-  `ws_to_io` pairs two halves into one `Duplex` (DEPARTURE: the original wrapped
-  `tokio-tungstenite`'s `WebSocketStream`).
+  the path dropped; `shim_query` keeps the recovered `spcircname{}` key.
+  **Phase 1**: `ws_to_io` no longer *needs* to stand in for
+  `tokio-tungstenite` — `shim_over(stream, host, character)` performs the real
+  handshake over a connection the caller already holds (the original's was TLS
+  through `tokio-rustls`) and hands back `tokio_tungstenite::WebSocketStream`,
+  and `shim_plain` dials a plaintext `ws://` shim.  A `wss://` dial needs a TLS
+  feature on `tokio-tungstenite`, which is not in the pins, so it is done through
+  `shim_over` with the caller's TLS stream.  `Duplex`/`ws_to_io` stay as the
+  synchronous compatibility shape for the std-only siblings in this workspace.
 
 ### 1.7 `store::page`, `store::http`
 
@@ -203,13 +228,18 @@ grew one.`).
 * `is_claimed` / `is_waiting` fold the page case and search the needles found in
   `0x101c5a3c4` (`clai…`) and `0x101c5a590` (`next sub`, `on bonus`).
   INFERRED: the exact longer spellings.
-* `token` reads `__RequestVerificationToken` and its nearest `value=`.
+* `token` reads `__RequestVerificationToken` and its nearest `value=`.  **Phase 1**:
+  the value itself is a `regex` pattern (`^\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
+  anchored just past the recovered `value=` literal, so the literal searches
+  around it are unchanged.
 * `asks_to_sign_in` / `signed_in`: INFERRED markers (the original compares a set
-  of page fragments that are re-encoded through the entity table).
+  of page fragments that is re-encoded through the entity table).
 * `next_available` / `next_in`: the original parses the store's "next available"
   text through inlined month-name and HTML-entity tables
   (`0x103bfa7b7`..`0x103bfa808`).  UNKNOWN: only `M/D/YYYY` (and `M-D-YYYY`) is
-  recovered here; anything else yields `None`.
+  recovered here; anything else yields `None`.  **Phase 1**: the run of digits
+  and separators is found with a `regex` pattern that ends where the run ends, so
+  a fourth field or a five-digit year is still one invalid run.
 * `store::http`: `Family::of` classifies a failure message (ESTABLISHED: it
   returns a small fieldless enum; the phrase lists come from
   `the store could not be read: {}` / `the store could not be reached: {}`),
@@ -218,17 +248,28 @@ grew one.`).
   `{}/Store/ClaimReward`, `{}/store/purchase/{}`) and messages
   (`{}: the store's sign-in came to nothing`, `{}: the store did not take the
   password`, `{}: the store answered the claim with `{}``).
+  **Phase 1**: `fetch`/`fetch_with` are the `reqwest` request again (following
+  redirects, which the sign-in flow needs), `Family::of_reqwest` classifies
+  `reqwest`'s own error instead of its message, `hop_client` is the
+  redirect-free client the sign-in hops used, and `fetch_blocking` is the
+  synchronous bridge for the still-sync siblings.  The status line in a
+  non-success answer (`the store answered {} for {}`) is INFERRED text.
 
 ### 1.8 `trainer::{page,goals,http}`
 
 * `page::page_url` = `https://www.play.net/gs4/play/cm/{}` (ESTABLISHED).
 * `quoted_var` / `number_var` / `array_var` are the three recovered regexes
   (`var\s+NAME\s*=\s*"([^"]*)"\s*;`, `var\s+NAME\s*=\s*(-?\d+)\s*;`,
-  `var\s+NAME\s*=\s*new\s+Array\(([^)]*)\)`) as hand-written scanners (no
-  `regex` dependency).
+  `var\s+NAME\s*=\s*new\s+Array\(([^)]*)\)`), compiled with `regex-1.13.1` per
+  name (the name is `regex::escape`d).  **Phase 1**: the hand-written scanners are
+  gone; the patterns are the recovered literals, which is why `var skill` still
+  cannot match `var skills` — the name is followed by `\s*=`.
 * `read_page` reads the skill table
   (`(?is)<b class="normS2">{}</b></td>\s*<td[^>]*><b class="normS1">([^<]+)</b>`)
-  and refuses a page with no rows (`the page has no {}`).
+  and refuses a page with no rows (`the page has no {}`).  **Phase 1**: that
+  literal is the pattern now (with a capture in place of the per-skill `{}`), so
+  the `</td> … <td>` bridge is required — the old hand-written scan merely looked
+  past it.  Every recovered test page has the bridge.
 * `answer` reads the `var start_…` values; `resolved`/`landed` accept only a
   trainer page.
 * `SkillGoals` is a sorted map of skill → target rank with the recovered
@@ -240,6 +281,13 @@ grew one.`).
   trained).  UNKNOWN: `cost_of_next` — the original's per-skill cost table is a
   static array not reachable from the symbol table, so this reports the flat cost
   of one rank.
+* `trainer::http`: **Phase 1** — `Trainer::get_page` and `Trainer::post_goals`
+  are the recovered `reqwest` requests again (GET the page, POST the goal form
+  with `application/x-www-form-urlencoded`, both carrying the session cookie as
+  the explicit `Cookie:` header the recovered `cookie_header` built; no cookie
+  jar, because the `cookies` feature is not pinned).  `get_page_at` /
+  `post_goals_at` take another origin, which is what lets the tests drive them
+  over a loopback socket; the recovered URL stays the literal in `page::page_url`.
 
 ### 1.9 `sink::{config,redactions,writer}`
 
@@ -310,27 +358,61 @@ Session log layout:
 
 ---
 
-## 3. Departures from the original (std only)
+## 3. Dependencies: what Phase 1 reconnected, and what it kept
 
-| original | here |
-| --- | --- |
-| `jiff` (`Zoned`, `SignedDuration`) | `eastern.rs` + `SystemTime`, fixed US DST rule |
-| `tokio` + `tokio-rustls` + `rustls` | synchronous helpers; `LiveSource` carries the DER |
-| `reqwest` + cookie jar | URL/header helpers only (`store::http`, `weblogin::http`) |
-| `tokio-tungstenite` | `shim::Duplex` over two halves |
-| `regex` | hand-written scanners (`trainer::page`, `store::page`) |
-| `base64-0.22` | `eaccess::pin::{base64_encode,base64_decode}` |
-| `tracing` log lines | the recovered literal text, returned instead of logged |
-| `url` | string splitting |
+### 3.1 Phase 1 reconnection
 
-No sibling Hydra crate is a dependency: everything is `std` (so there is no
-cycle and nothing here needs `hydra_protocol`/`gs_base`).
+All at the versions pinned in the root `Cargo.toml`
+(`[workspace.dependencies]`), declared here as `x = { workspace = true }`.
+
+| real crate | pin | replaced |
+| --- | --- | --- |
+| `base64` | `0.22.1` | the hand-written encoder/decoder behind `eaccess::pin::{base64_encode,base64_decode}` (`general_purpose::STANDARD`, same public signatures) |
+| `jiff` | `0.2.37` | the whole hand-rolled date layer in `eastern.rs`: Hinnant's day numbers, the fixed US DST rule, the `{:04}-{:02}-{:02}` printer and the round-trip date check (now `jiff::civil::Date` + `America/New_York`) |
+| `regex` | `1.13.1` | the hand-written scanners in `trainer::page` (three `var` patterns, the `(?is)` skill-table pattern) and in `store::page` (the verification token's value, the "next available" date run) |
+| `reqwest` | `0.12.28` | the header-text stand-ins: `store::http::{fetch,fetch_with,hop_client,Family::of_reqwest}`, `trainer::http::Trainer::{get_page,get_page_at,post_goals,post_goals_at}`, `weblogin::http::{location_of_response,status_of_response}` |
+| `tokio` | `1.53.1` (`full`) | the async runtime behind the `reqwest`/`tokio-tungstenite` helpers and `#[tokio::test]` |
+| `tokio-tungstenite` | `0.29.0` | `gemstone::shim::{shim_over,shim_plain}` return a real `WebSocketStream` again; `Duplex`/`ws_to_io` remain for the sync callers |
+
+Extra feature flags: **none**.  `reqwest`'s `blocking` feature was wanted — the
+store/trainer helpers are synchronous — but it pulls `futures-io`, which is not
+in this offline registry, so resolution fails; the HTTP helpers are `async` and
+`store::http::fetch_blocking` bridges the synchronous callers with a private
+current-thread `tokio` runtime (it refuses to be called from inside a runtime
+instead of panicking or deadlocking).  `reqwest`'s `cookies` feature is not
+pinned either, so the session cookie travels as the explicit `Cookie:` header the
+recovered code built.
+
+`Cargo.lock` was pinned back to `hyper-util 0.1.20` (`cargo update -p hyper-util
+--precise 0.1.20 --offline`): resolving `reqwest` otherwise picked `hyper-util
+0.1.21`, which needs `base64 0.23.1` — not in the offline registry, and not the
+workspace's `hyper-util` pin.
+
+### 3.2 Kept stand-ins
+
+| original | here | why |
+| --- | --- | --- |
+| `tokio-rustls` + `rustls` | `LiveSource::peer_certificate_der` carries the DER the TLS layer handed over; no TLS client is built here | not in the workspace pins, and the registry has no `tokio-rustls` at all.  `gemstone::shim::shim_over` therefore takes an already-established stream, which is exactly the seam the original's `ws_to_io` sat on |
+| `url` | string splitting (`shim_host`, `next_hop`, the scrape helpers) | not in the workspace pins.  `reqwest` re-exports `url::Url`, but using it would be using the unpinned crate through a side door |
+| `tracing` | the recovered literal text, returned instead of logged | not in the workspace pins; no sibling crate logs yet |
+| `futures-util` (`StreamExt`/`SinkExt`) | not used: `shim_over`/`shim_plain` return the `WebSocketStream` and leave the frame pump to the caller | not in the workspace pins, and it is the one thing needed to drive frames.  **Integration risk**: whoever writes the relay needs it pinned (or a `send`/`recv` helper added once it is) |
+| `jiff::SignedDuration` in `sink::config::stamp_ago` | the arrangement is text, built from the recovered format strings | `jiff` is pinned now, so this can be converted; it was left alone because the exact arrangement is UNKNOWN (§5) and converting it would encode a guess |
+| `socket2`-style TCP keepalive (`live`) | `TCP_NODELAY` only, and the keepalive warning text stays a documented helper | `std` has no keepalive knob, and `socket2` is not a workspace pin |
+
+No sibling Hydra crate is a dependency: nothing here needs `hydra_protocol` or
+`gs_base`, so there is no cycle.
 
 ---
 
 ## 4. Tests
 
-`cargo test -p hydra_net` — 117 assertions across:
+`cargo test -p hydra_net --offline` — 146 tests, all green.  **No test touches the
+network**: every `reqwest` and `tokio-tungstenite` round trip is answered by a
+loopback socket the test itself opened (`http::loopback::serve_once`, a one-shot
+HTTP/1.1 server, or a `tokio::net::TcpListener` running the real
+`tokio_tungstenite::accept_async`).
+
+The original 117 assertions are all still there:
 
 * `eastern`: known day numbers and round-trips (epoch, leap days, 1967/2100),
   the Sunday frame, the 2023/2024 DST boundaries on both sides, midnight on the
@@ -353,6 +435,45 @@ cycle and nothing here needs `hydra_protocol`/`gs_base`).
   line, `hand_over`.
 * `behind`/`live`/`record`: the lag warning text, `settle_all`, the recording
   thread, `TCP_NODELAY`, both directions recorded.
+
+Added in Phase 1, for what the real crates now provide:
+
+* `eastern`: the time zone database is the one answering (`America/New_York`
+  resolves; January 1945 is War Time UTC-4 and 1974's February is daylight time,
+  neither of which the recovered rule can produce); `jiff` and the recovered rule
+  agree on the offset of **every hour from 2007 to 2027**; `midnight` agrees with
+  the recovered arithmetic on every day of 2024; `week_start` is a Sunday 0..=6
+  days back on every day of 1990..2030; jiff's printer matches the recovered
+  `{:04}-{:02}-{:02}` on every day of 2024; out-of-range years still round-trip
+  through the Hinnant fallback.
+* `eaccess::pin`: the engine is the standard one (`+/` alphabet, URL-safe
+  rejected), canonical padding required (`YQ`, `YQ=`, `YQ===` all rejected), all
+  256 byte values round-trip, whitespace inside a body is ignored, a PEM block
+  wraps at 64 columns and decodes flat or with surrounding text.
+* `trainer::page`: the recovered patterns verbatim — the trailing `;`, `\s+` after
+  `var`, no match for `vara`, an escaped name (`a.b` does not match `axb`), array
+  items that are not numbers dropped; the skill table needs the recovered
+  `</td> … <td>` bridge, matches case insensitively, and a non-numeric rank reads
+  as zero.
+* `store::page`: token values single-quoted, unquoted, unterminated (no value),
+  `value =` with a space (no value), and a quoted token containing a line break;
+  the "next available" run is read whole (a fourth field or a five-digit year is
+  one invalid run).
+* `store::http`: a real `reqwest` GET of a page (the request line checked from the
+  server side), a 503 naming its status, a refused connection classified as
+  `Unreachable` from `reqwest`'s own error, a bad URL as `Unusable`, the
+  synchronous bridge both fetching and refusing inside a runtime, and the sign-in
+  hop seam (`get_with` + `hop_client` → `location_of_response`) reading a real
+  302 without following it.
+* `trainer::http`: a real `reqwest` GET carrying the cookie and parsing the page,
+  and a real POST whose urlencoded body (`skill0=3&train=1`) is checked from the
+  server side; an unreachable page is `is_connect()`.
+* `gemstone::shim`: a real `tokio-tungstenite` handshake over a loopback socket
+  (`shim_over`, and `shim_plain`'s `ws://` dial), with the server's handshake
+  handler confirming the recovered `/shim/Dridarn` path, and an absent shim
+  reported as an I/O error.
+* `weblogin::http`: a real 302 response's `Location` and status read off the
+  `HeaderMap`, and a 200 that has no `Location`, in both spellings.
 
 ---
 

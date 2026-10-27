@@ -6,6 +6,9 @@
 //! certificate is recorded and later logins must match it.  There is no
 //! "trust this time" path — an unreadable or unpinnable pin refuses the login.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::{DecodeError, Engine as _};
+
 use std::path::{Path, PathBuf};
 
 /// The literal that opens a PEM certificate block (the module's literals sit in
@@ -129,65 +132,27 @@ pub fn pem_decode(text: &str) -> Result<Vec<u8>, String> {
     base64_decode(&body).map_err(|why| format!("invalid base64: {why}"))
 }
 
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 /// Standard (padded) base64, as `base64-0.22`'s default engine produces.
+///
+/// The original called `base64`'s default engine — the `+/` alphabet with `=`
+/// padding — so this is that engine (`general_purpose::STANDARD`) and not a
+/// reimplementation.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let mut buf = [0u8; 3];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        let n = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | buf[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    STANDARD.encode(bytes)
 }
 
 /// Standard (padded) base64 decode.
+///
+/// Whitespace is dropped before decoding: PEM bodies arrive wrapped in newlines,
+/// and the recovered `pem_decode` hands the block over with its line breaks
+/// intact.  Everything else — a byte outside the alphabet, an impossible
+/// length, mis-placed padding — is `base64-0.22`'s own rejection, and its
+/// `DecodeError` `Display` is what fills the recovered `invalid base64: {}`.
 pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
     let bytes: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if bytes.len() % 4 != 0 {
-        return Err("length is not a multiple of four".to_string());
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for quad in bytes.chunks(4) {
-        let mut n = 0u32;
-        let mut seen_pad = false;
-        let mut pad = 0usize;
-        for (i, &b) in quad.iter().enumerate() {
-            let value = if b == b'=' {
-                if i < 2 {
-                    return Err("padding in the wrong place".to_string());
-                }
-                seen_pad = true;
-                pad += 1;
-                0
-            } else {
-                if seen_pad {
-                    return Err("data after padding".to_string());
-                }
-                match ALPHABET.iter().position(|&a| a == b) {
-                    Some(v) => v as u32,
-                    None => return Err(format!("bad byte 0x{b:02x}")),
-                }
-            };
-            n = (n << 6) | value;
-        }
-        let triple = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&triple[..3 - pad]);
-    }
-    Ok(out)
+    STANDARD
+        .decode(bytes)
+        .map_err(|error: DecodeError| error.to_string())
 }
 
 #[cfg(test)]
@@ -227,6 +192,52 @@ mod tests {
         assert!(pem.starts_with(BEGIN));
         assert!(pem.trim_end().ends_with(END));
         assert_eq!(pem_decode(&pem).unwrap(), der);
+    }
+
+    #[test]
+    fn the_base64_engine_is_the_standard_one() {
+        // The standard alphabet (`+/`), not the URL-safe one (`-_`).
+        assert_eq!(base64_encode(&[0xfb, 0xff]), "+/8=");
+        assert!(base64_decode("-_8=").is_err());
+
+        // Padding is required and canonical: `base64-0.22`'s default engine.
+        assert_eq!(base64_decode("YQ==").unwrap(), b"a");
+        assert!(base64_decode("YQ").is_err());
+        assert!(base64_decode("YQ=").is_err());
+        assert!(base64_decode("YQ===").is_err());
+        assert!(base64_decode("YQ==YQ==").is_err());
+
+        // Every byte value survives the trip.
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(base64_decode(&base64_encode(&all)).unwrap(), all);
+
+        // Whitespace is dropped before decoding, which is what makes a wrapped
+        // PEM body readable at all.
+        assert_eq!(
+            base64_decode("YW55IGNh\ncm5hbCBwbGVhc3Vy\nZS4=").unwrap(),
+            b"any carnal pleasure."
+        );
+    }
+
+    #[test]
+    fn a_pem_block_wraps_at_sixty_four_columns() {
+        let der: Vec<u8> = (0..200u8).collect();
+        let pem = pem_encode(&der);
+        let body: Vec<&str> = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        assert!(body.len() > 1, "{pem}");
+        assert!(body.iter().all(|line| line.len() <= 64), "{pem}");
+        assert_eq!(pem_decode(&pem).unwrap(), der);
+
+        // The same DER as one long line decodes just as well.
+        let flat = format!("{BEGIN}\n{}\n{END}\n", base64_encode(&der));
+        assert_eq!(pem_decode(&flat).unwrap(), der);
+
+        // A certificate file with surrounding text is read from the block.
+        let wrapped = format!("subject=CN=eaccess\n{pem}extra\n");
+        assert_eq!(pem_decode(&wrapped).unwrap(), der);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! | `Zones::inside` | `0x1007cf478` | partly |
 
 use crate::json::{self, Value};
-use crate::seam::Vec2;
+use crate::seam::{rect, rect_from_min_max, Color32, Painter, Rect, Vec2};
 
 /// A drawer's edge.
 ///
@@ -256,6 +256,69 @@ impl Drawers {
         }
         drawers
     }
+
+    /// The drawer on one edge.
+    pub fn get(&self, zone: Zone) -> Drawer {
+        match zone {
+            Zone::Top => self.top,
+            Zone::Bottom => self.bottom,
+            Zone::Left => self.left,
+            Zone::Right => self.right,
+            Zone::Main => Drawer::default(),
+        }
+    }
+
+    /// Paint the open drawers whose [`Mode`] is in `modes`, and report what was
+    /// painted.
+    ///
+    /// The rects are the recovered zone extents ([`Zones::of`]: the 40.0 floor,
+    /// the 60/144 reserves, the proportional scaling), each coloured with the
+    /// theme's drawer fill scaled by the drawer's `opacity`
+    /// (`Color32::gamma_multiply`).
+    ///
+    /// `mode` decides *when* a drawer is painted, not *where*: `Drawn` and
+    /// `Pushing` are part of the window layout and are painted behind the play
+    /// area, `Clipping` "lies over the main area" (the drawer options' own
+    /// caption) and is therefore painted after it.
+    // UNKNOWN: `Zones::of` subtracts *every* open drawer's extent, so a
+    // `Clipping` drawer still shrinks the main area in this reconstruction; the
+    // recovered zone maths has no mode branch. Only the paint order differs.
+    pub fn paint(
+        &self,
+        painter: &Painter,
+        window: Rect,
+        fill: Color32,
+        modes: &[Mode],
+    ) -> Vec<Placed> {
+        let zones = Zones::of(self, window.size());
+        let mut painted = Vec::new();
+        for (index, drawer) in self.every().iter().enumerate() {
+            let zone = Zone::of_index(index);
+            if !drawer.open || !modes.contains(&drawer.mode) {
+                continue;
+            }
+            let strip = zones.strip(zone, window);
+            if strip.width() <= 0.0 || strip.height() <= 0.0 {
+                continue;
+            }
+            let opacity = if drawer.opacity.is_finite() {
+                drawer.opacity.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            painter.rect_filled(
+                strip,
+                egui::CornerRadius::ZERO,
+                fill.gamma_multiply(opacity),
+            );
+            painted.push(Placed {
+                zone,
+                at: Vec2::new(strip.min.x, strip.min.y),
+                size: strip.size(),
+            });
+        }
+        painted
+    }
 }
 
 /// One carved-out zone: which edge it is, and its extent along that edge.
@@ -380,14 +443,53 @@ impl Zones {
     }
 
     /// Where the main area ends up, inside the window.
-    pub fn main_rect(&self) -> crate::seam::Rect {
-        crate::seam::Rect::from_min_size(
+    pub fn main_rect(&self) -> Rect {
+        rect(
             Vec2::new(
                 self.keep(Zone::Left).map(|p| p.size.x).unwrap_or(0.0),
                 self.keep(Zone::Top).map(|p| p.size.y).unwrap_or(0.0),
             ),
             self.main,
         )
+    }
+
+    /// [`Zones::main_rect`] moved into a window whose top-left is `window.min`.
+    pub fn main_rect_in(&self, window: Rect) -> Rect {
+        let main = self.main_rect();
+        rect_from_min_max(
+            Vec2::new(window.min.x + main.min.x, window.min.y + main.min.y),
+            Vec2::new(window.min.x + main.max.x, window.min.y + main.max.y),
+        )
+    }
+
+    /// The strip one drawer takes inside `window`.
+    ///
+    /// `Top` and `Left` hang off the window's top-left corner, `Bottom` and
+    /// `Right` off the opposite one — the placement `Zones::of` records for
+    /// each zone (`at` for `Top` is `(0, size)`, for `Bottom` `(0, h - size)`,
+    /// for `Left` `(size, 0)` and for `Right` `(w - size, 0)`). A shut drawer
+    /// leaves an empty rect.
+    pub fn strip(&self, zone: Zone, window: Rect) -> Rect {
+        let size = self.keep(zone).map(|p| p.size).unwrap_or(Vec2::ZERO);
+        match zone {
+            Zone::Top => rect_from_min_max(
+                window.min.to_vec2(),
+                Vec2::new(window.max.x, window.min.y + size.y),
+            ),
+            Zone::Bottom => rect_from_min_max(
+                Vec2::new(window.min.x, window.max.y - size.y),
+                window.max.to_vec2(),
+            ),
+            Zone::Left => rect_from_min_max(
+                window.min.to_vec2(),
+                Vec2::new(window.min.x + size.x, window.max.y),
+            ),
+            Zone::Right => rect_from_min_max(
+                Vec2::new(window.max.x - size.x, window.min.y),
+                window.max.to_vec2(),
+            ),
+            Zone::Main => self.main_rect_in(window),
+        }
     }
 }
 
@@ -480,7 +582,7 @@ mod tests {
         drawers.left.open = true;
         let zones = Zones::of(&drawers, Vec2::new(1000.0, 800.0));
         let rect = zones.main_rect();
-        assert_eq!(rect.min, Vec2::new(240.0, 160.0));
+        assert_eq!(rect.min, crate::seam::pos(Vec2::new(240.0, 160.0)));
         assert_eq!(rect.size(), Vec2::new(1000.0 - 240.0, 800.0 - 160.0));
     }
 
@@ -528,5 +630,121 @@ mod tests {
         assert!(drawers.top.open);
         assert_eq!(drawers.top.size, 160.0);
         assert_eq!(drawers.left, Drawers::default().left);
+    }
+
+    fn window() -> Rect {
+        crate::seam::rect(Vec2::ZERO, Vec2::new(660.0, 520.0))
+    }
+
+    #[test]
+    fn the_strips_are_the_recovered_extents() {
+        let mut drawers = Drawers::default();
+        drawers.top.open = true;
+        drawers.bottom.open = true;
+        drawers.left.open = true;
+        drawers.right.open = true;
+        let zones = Zones::of(&drawers, window().size());
+        // 660 × 520: 160 + 160 = 320 fits under 520 - 60 = 460 and
+        // 240 + 240 = 480 fits under 660 - 144 = 516, so nothing is scaled.
+        let side = 240.0;
+        assert_eq!(
+            zones.strip(Zone::Top, window()),
+            crate::seam::rect_from_min_max(Vec2::ZERO, Vec2::new(660.0, 160.0))
+        );
+        assert_eq!(
+            zones.strip(Zone::Bottom, window()),
+            crate::seam::rect_from_min_max(Vec2::new(0.0, 360.0), Vec2::new(660.0, 520.0))
+        );
+        assert_eq!(
+            zones.strip(Zone::Left, window()),
+            crate::seam::rect_from_min_max(Vec2::ZERO, Vec2::new(side, 520.0))
+        );
+        assert_eq!(
+            zones.strip(Zone::Right, window()),
+            crate::seam::rect_from_min_max(Vec2::new(660.0 - side, 0.0), Vec2::new(660.0, 520.0))
+        );
+        // The main area is what is left, offset into the window.
+        assert_eq!(
+            zones.main_rect_in(window()),
+            crate::seam::rect_from_min_max(Vec2::new(side, 160.0), Vec2::new(660.0 - side, 360.0))
+        );
+    }
+
+    #[test]
+    fn a_shut_drawer_leaves_an_empty_strip() {
+        let drawers = Drawers::default();
+        let zones = Zones::of(&drawers, window().size());
+        for zone in [Zone::Top, Zone::Bottom, Zone::Left, Zone::Right] {
+            let strip = zones.strip(zone, window());
+            assert!(
+                strip.width() == 0.0 || strip.height() == 0.0,
+                "{zone:?} is shut"
+            );
+        }
+        assert_eq!(zones.main_rect_in(window()), window());
+    }
+
+    #[test]
+    fn paint_draws_the_open_drawers_in_their_strips() {
+        let mut drawers = Drawers::default();
+        drawers.top.open = true;
+        drawers.left.open = true;
+        let fill = Color32::from_rgb(10, 20, 30);
+        let (painted, out) = crate::headless::one_frame(|ui| {
+            drawers.paint(ui.painter(), window(), fill, &[Mode::Drawn, Mode::Pushing])
+        });
+        assert_eq!(painted.len(), 2);
+        assert_eq!(painted[0].zone, Zone::Top);
+        assert_eq!(painted[1].zone, Zone::Left);
+        let rects = crate::headless::rect_fills(&out);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            rects[0].rect,
+            crate::seam::rect_from_min_max(Vec2::ZERO, Vec2::new(660.0, 160.0))
+        );
+        assert_eq!(
+            rects[1].rect,
+            crate::seam::rect_from_min_max(Vec2::ZERO, Vec2::new(240.0, 520.0))
+        );
+        assert_eq!(rects[0].fill, fill);
+        assert_eq!(rects[1].fill, fill);
+    }
+
+    #[test]
+    fn paint_scales_the_fill_by_the_drawers_opacity() {
+        let mut drawers = Drawers::default();
+        drawers.top.open = true;
+        drawers.top.opacity = 0.5;
+        let fill = Color32::from_rgb(10, 20, 30);
+        let (_, out) = crate::headless::one_frame(|ui| {
+            drawers.paint(ui.painter(), window(), fill, &[Mode::Drawn])
+        });
+        let rects = crate::headless::rect_fills(&out);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].fill, fill.gamma_multiply(0.5));
+        assert_eq!(rects[0].fill.a(), 128);
+    }
+
+    #[test]
+    fn paint_only_draws_the_modes_it_is_given() {
+        let mut drawers = Drawers::default();
+        drawers.top.open = true;
+        drawers.top.mode = Mode::Clipping;
+        drawers.bottom.open = true;
+        drawers.bottom.mode = Mode::Pushing;
+        let fill = Color32::WHITE;
+        // The first pass (behind the play area) skips the clipping drawer.
+        let (first, out_a) = crate::headless::one_frame(|ui| {
+            drawers.paint(ui.painter(), window(), fill, &[Mode::Drawn, Mode::Pushing])
+        });
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].zone, Zone::Bottom);
+        assert_eq!(crate::headless::rect_fills(&out_a).len(), 1);
+        // The second pass paints only the clipping drawer.
+        let (second, out_b) =
+            crate::headless::one_frame(|ui| drawers.paint(ui.painter(), window(), fill, &[Mode::Clipping]));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].zone, Zone::Top);
+        assert_eq!(crate::headless::rect_fills(&out_b).len(), 1);
     }
 }

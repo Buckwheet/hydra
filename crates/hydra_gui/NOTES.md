@@ -6,8 +6,14 @@ Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hy
 `grep -Rn 'todo!\|unimplemented!' crates/hydra_gui/src` is empty — and
 
 * `cargo check -p hydra_gui` — clean, no warnings
-* `cargo test -p hydra_gui` — **80 tests pass**
+* `cargo test -p hydra_gui` — **108 tests pass**
 * `cargo check --workspace` — clean (no other crate was touched)
+
+Phase 4 replaced the `egui`/`eframe` seams with the real thing: the drawing goes
+through the pinned `egui` (git `3da022d`) and the window is an `eframe` window.
+What that changed, what it pinned down and what is still a stand-in is in
+**Phase 4: real egui/eframe** below; `docs/EGUI.md` is the version research it
+builds on.
 
 ---
 
@@ -101,9 +107,11 @@ matter and they are all here:
 * **the logged-on flag** — `cmp w5, #0x0; cset w26, ne` @`0x100512fbc`, carried
   into the app value at `0x338` (`strb w26` @`0x10051324c`).
 
-[`app::run`] therefore returns a [`app::RunPlan`] holding the title, placement,
-size, graphics folder, data folder, flag, renderer and the 0x70-byte app size.
-No event loop is started — see **departures**.
+[`app::plan`] therefore returns an [`app::RunPlan`] holding the title,
+placement, size, graphics folder, data folder, flag, renderer and the 0x70-byte
+app size; [`app::build`] turns that into the real `NativeOptions` plus a boxed
+[`app::Hub`], and [`app::run`] is the recovered `run_native` call (never invoked
+by a test). See **Phase 4: real egui/eframe**.
 
 ### `badge.rs`
 
@@ -170,7 +178,7 @@ field names/order (`fills`, `place`, `says`, `color`, `overlay`, `background`,
 | symbol | addr | status | recovered signature and behaviour |
 |---|---|---|---|
 | `Stack::words` | `0x10065abe4` | **full** | Four labelled percentages joined with `", "` (the 2-byte literal at `0x10214036a`). Labels in record order `0x50`, `0x68`, `0x80`, `0x98`: `Sp`, `HP`, `MP`, `SP` (the 8 bytes at `0x102140362`). Each record's first word is compared with `2` — "unknown" (`cmp w9, #2` @`0x10065ac2c`) → `format!("{} ?", label)` (pieces at `0x103e2b848`); otherwise the word at `+0x10` is the percentage, clamped to 100, formatted `format!("{} {}%", …)` (pieces at `0x103e2b84d`). |
-| `Stack::paint` | `0x10065a828` | **partly** | Inscribed square: `centre = (min+max)*0.5`, `radius = min(w,h)*0.5`, bail out when empty (`fcmgt.2s v0, v11, v8` @`0x10065a884`). The rest draws egui arcs with style lookups; the seam records one circle per known vital. |
+| `Stack::paint` | `0x10065a828` | **partly** | Inscribed square: `centre = (min+max)*0.5`, `radius = min(w,h)*0.5`, bail out when empty (`fcmgt.2s v0, v11, v8` @`0x10065a884`). Its body looks the style up (`Context::global_style` @`0x10065a890`) and calls `bar::shape::paint` once per vital (four `bl`s to `0x100524814`); that helper is not reconstructed, so each vital is painted here as a stroked track, an arc of `percent/100` of the turn and its `Vital::word` label. |
 
 UNKNOWN: the word at `+0x14` of each record (`ldr w8, [x20, #0x64]`
 @`0x10065a8d0`), kept as `Vital::clock`.
@@ -180,7 +188,7 @@ UNKNOWN: the word at `+0x14` of each record (`ldr w8, [x20, #0x64]`
 | symbol | addr | status | recovered signature and behaviour |
 |---|---|---|---|
 | `running` | `0x1004c7f7c` | **full** | `fn(sizes: impl IntoIterator<Item = u64>) -> Vec<f32>`: cumulative stop positions, `out[0] = 0.0`, `out[i+1] = Σsizes[..=i] / Σsizes`, and the last element forced to `1.0` only when the sum is non-zero. |
-| `paint` | `0x1004c7da0` | not reconstructed | The seam draws one rect per segment. |
+| `paint` | `0x1004c7da0` | not reconstructed | One `rect_filled` per segment of [`vessel::running`]'s cumulative stops; `vessel::segments` exposes the same rects without painting. |
 
 ### `keys.rs`
 
@@ -188,7 +196,7 @@ UNKNOWN: the word at `+0x14` of each record (`ldr w8, [x20, #0x64]`
 |---|---|---|---|
 | `Keys::does` | `0x1003d7be8` | **partly** | `fn does(&self, kind: Option<&T>, chord: &Chord) -> Option<&Macro>`: the byte at offset `0xf0` of `kind` (clipped with `min(_, 9)`) selects one of **10** maps at `self + 0x18` (`umaddl x8, w0, w9(=0x18), x8` @`0x1003d7e48`, bounds panic on `crates/hydra-gui/src/keys.rs:342`); a hit returns that layer's `Option<&Macro>` (a `None` action shadows the shared map), a miss falls back to the `BTreeMap` at `self + 0x00` (`ldr x22, [x26]` @`0x1003d7f14`). The chord is `{key: String @0, mods: u8 @0x18}`: the lookup compares `x2 + 8`/`x2 + 0x10` (the `String`'s ptr/len) and `x2 + 0x18`. |
 | `Keys::bound` | `0x1003d81f0` | **partly** | The iterator form of the same lookup: builds a 1- or 2-byte "layer key" buffer (`min(byte, 9)`), then `BTreeSet::from_iter`. |
-| `Keys::take` | `0x1003d8050` | **full** | `Vec::retain` over 72-byte `egui::Event`s, pulling out the ones whose discriminant is `0xc` (`cmp w8, #0xc` @`0x1003d80d4`) into a `Vec<Macro>`. |
+| `Keys::take` | `0x1003d8050` | **full** | `Vec::retain` over 72-byte `egui::Event`s: every `Event::Text` is dropped (discriminant `0xc`, `cmp w8, #0xc` @`0x1003d80d4`) and every bound `Event::Key { pressed: true, .. }` (discriminant `0xd`, retain closure @`0x100398dd0`) is turned into a `Macro` and removed. See **Phase 4** for the discriminant proof. |
 | `Chord::parse` | `0x1003d831c` | **full** | Split on `'+'`, modifiers for all but the last token, `names::known` for the last, three recovered messages. |
 | `Chord::written` | `0x1003d8a64` | **partly** | Formats the modifiers then the key. |
 | `names::known` | `0x10065b430` | **full** | 16-entry `(name, alias)` table at `0x104394298` (numpad keys ↔ `num_*`), compared case-insensitively against both columns and returning the *name*; then `winit_name` over the 117-byte permutation at `0x1021403e1`. |
@@ -235,6 +243,8 @@ and, independently, `vellum::Spelled::of` @`0x1004cefd8`).
 | `Zone::serialize` | `0x1007ce860` | **full** | Unit variant names `main`/`top`/`bottom`/`left`/`right` at `0x102157570`..`0x102157581`. |
 | `Mode::deserialize` | `0x1007ce910` | fieldless enum | Names `pushing`/`clipping` at `0x10217d7df`/`0x10217e6c0`; the option captions in `play::options::window::drawers_set` @`0x10081d644` give the third, "Drawn". |
 | `Zones::of` | `0x1007cef40` | **partly** | See below. |
+| `Zones::strip`/`main_rect_in` | — | the reconstruction | The same zone extents, as rects inside a window: `Top`/`Left` hang off the top-left corner, `Bottom`/`Right` off the opposite one. |
+| `Drawers::paint` | — | the reconstruction | Fills each open drawer's strip with the theme fill scaled by `opacity`, for the modes it is given (`Drawn`/`Pushing` behind the play area, `Clipping` over it), and returns what it painted. |
 | `Zones::fit`/`keep`/`inside` | `0x1007cf34c`/`0x1007cf3f8`/`0x1007cf478` | **partly** | 20-byte placed records (`ldrb w11, [x9, #0x10]; add x9, x9, #0x14` in `fit`). |
 
 `is_default` in full:
@@ -277,6 +287,7 @@ ask for more they are both scaled by `room / (a + b)`.
 | `TitleBar as Default` | `0x1003ccb64` | **full** | left = the two above, middle = empty, right = the two above, `strh w8 = 0x100` at `0x48` (so `tucked = false`, `settled = true`). |
 | `TitleBar as From<Written>` | `0x1003c6b98` | **full** | Copy the three lists, set the second flag, and insert `Menu` at the first `Settings` in the right list when no list already holds one and `tucked` is clear. |
 | `Item::label` | `0x1003da1ac` | **full** | 19-entry jump table at `0x1020740af`. |
+| `TitleBar::ui` | — | the reconstruction | One real `egui::Button` per item (`ui.button(item.label())`): left + middle left-to-right, the right list right-to-left so `Menu` sits left of `Zoom`. Returns `(Item, Response)` pairs for the caller. |
 | `Item::key` | `0x1003d9d84` | full (names) | `character`, `profession`, `connection`, `room_title`, …, `top_drawer`, `bottom_drawer`, `left_drawer`, `right_drawer`. |
 
 `Item`'s 18 unit variants, in discriminant order and with the recovered labels:
@@ -291,26 +302,138 @@ two flags at 0x48/0x49.
 
 ---
 
-## Departures (egui/eframe/serde/image → std)
+## Phase 4: real egui/eframe
 
-1. **`egui` → `seam`.** `crate::seam` defines `Vec2`, `Rect`, `Color32`,
-   `Galley`, a `Painter` trait with the six primitives the recovered code uses
-   (`rect_filled`, `text`, `line_segment`, `circle_filled`, `image`,
-   `layout_no_wrap`) and a `Ui` trait with `available_size`, `painter` and
-   `text_size`. `RecordingPainter` records every call so tests can assert what
-   would have been drawn; `TestUi` is a fixed-size `Ui` over it.
-   `Color32` keeps `egui`'s memory order (`r, g, b, a`) because the recovered
-   code builds colours as `r | g<<8 | b<<16 | 0xff000000` and `to_u32`/
-   `from_u32` round-trip that.
-2. **No real text metrics.** `egui` measures text with a font atlas. The seam's
-   `layout_no_wrap` uses a fixed monospace metric (0.6 em advance, 1.2 em line
-   height, both settable), so the *recovered* parts of `Bar::fitted` — the
-   padding, the axis choice, the floor — are testable while the measurement
-   itself is a stand-in.
-3. **`eframe` → `RunPlan`.** `app::run` cannot start an event loop here. It
-   returns `RunPlan`, holding exactly the values the original handed to
-   `eframe::run_native` (plus the flags it carried). No drawing happens.
-4. **`serde`/`serde_json` → `json`.** `crate::json` is a small hand-written
+`docs/EGUI.md` established the pin — `github.com/emilk/egui` at git rev
+**`3da022d98072fb631443a72f49973cfb6c93f865`** (every crate labelled `0.35.0`),
+`eframe` with `default_fonts` + `wgpu` and **no** `glow`/`accesskit`/`persistence`.
+The three departures that document replaced (egui → `seam`, no text metrics,
+eframe → `RunPlan`) are now gone.
+
+### The seam is `egui`
+
+`crate::seam` is a re-export layer, not a model: `pub use egui::{Color32, Pos2,
+Rect, Vec2}`, `pub type {Galley, Painter, Ui}` aliases, and three helpers
+(`pos`, `rect`, `rect_from_min_max`) that bridge `Vec2` offsets to `egui::Pos2`
+corners. What the old seam asserted still holds and is asserted again
+(`seam::tests::the_layout_identity_is_the_recovered_one`): `Color32` 4 bytes with
+alpha last, `Vec2` 8, `Pos2` 8, `Rect` 16, **`egui::Event` 72** (the `0x48`
+stride `Keys::take` walks), and the 117-entry `egui::Key` table
+(`H` = 0x35, `I` = 0x36, `IntlBackslash` = 0x74) that `names::winit_name` walks.
+
+`Color32` has no `to_u32`/`from_u32` of its own, so `seam::Color32Ext` adds the
+two recovered conversions (`r | g << 8 | b << 16 | a << 24`) plus `opaque()`,
+the `orr w12, w12, #0xff000000` of `Bar::look` @`0x100708610`. `Look`'s JSON
+still writes the packed word, so the round-trip tests are unchanged.
+
+`RecordingPainter`/`TestUi`/`seam::Draw` are gone: every test that used them now
+runs a real frame (`crate::headless`, a `#[cfg(test)]` module in `lib.rs`: one
+`egui::Context`, one `RawInput` with a fixed `screen_rect`, one
+`Context::run_ui`, then assertions on the `ClippedShape`s — rect fills, circles,
+text galleys). No test opens a window, starts a winit loop or creates a wgpu
+device.
+
+### The app: `Hub`, `Launch`, `build`, `run`
+
+`app::run` @`0x100512f78` is split exactly where the binary splits it:
+
+| piece | what it is |
+|---|---|
+| `pub fn plan(start: &Start) -> RunPlan` | the Phase-1 body: everything the original had before `run_native` (title `"Hydra"`, placement `"hub"`, 660 × 520, graphics folder, placements path, logged-on flag, `app_size` 0x70) |
+| `pub fn run_plan(start: &Start) -> RunPlan` | the Phase-1 name, forwarded |
+| `pub struct Hub` | the boxed app value: `TitleBar`, `Drawers`, `Keys`, `Room`, `Start`, the `0x338` logged-on flag |
+| `pub fn build(start: &Start, logged_on: bool) -> Launch` | `NativeOptions::default()`, `renderer = Renderer::Wgpu` (the only variant this build has — `egui_glow` is not linked), `viewport.with_title("Hydra").with_inner_size([660.0, 520.0]).with_icon(badge)`, `wgpu_options = WgpuConfiguration::default()`, and `Box<Hub>`. Pure value construction: no device, no window |
+| `pub fn run(start: &Start, logged_on: bool) -> eframe::Result` | the recovered call, `eframe::run_native(&title, options, Box::new(move \|_cc\| Ok(app)))`. Nothing in the tests calls it |
+
+`Hub` implements `eframe::App` with this rev's trait method
+`fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame)` (the binary's
+impl is `<App as eframe::epi::App>::ui` @`0x1004f79a0` — `ui`, not `update`), and
+forwards to `Hub::ui_contents`, which is callable headlessly
+(`ctx.run_ui(input, |ui| hub.ui_contents(ui))`).
+
+`Hub::chrome(window) -> Chrome` is the layout, and it is all recovered maths:
+`Zones::of(&drawers, window.size())` (`0x1007cef40`: the 40.0 extent floor, the
+60/144 reserves, the proportional scaling) gives the four strips and the main
+area; the main area splits into a title-bar strip (`Hub::TITLE_BAR_HEIGHT`, no
+recovered literal — UNKNOWN) and the play area. `ui_contents` paints, in order:
+`Drawn`/`Pushing` drawers (behind), the play area in
+`visuals.extreme_bg_color` plus the room title/number/lines/prompt, the title-bar
+strip plus one real `ui.button(item.label())` per recovered `Item`, then the
+`Clipping` drawers over the top. A clicked drawer icon flips its drawer
+(`Hub::press`, the state transition `TitleBar::set` performs).
+
+### Widgets
+
+* **`bar::Bar` is an `egui::Widget`** (`<Bar as egui::widgets::Widget>::ui`
+  @`0x1006f4920`): `fitted` → `allocate_exact_size` → `write`. `Bar::fitted`
+  now measures for real — `ui.available_size()`, the caption from
+  `parts().0`/`words()`, `egui::TextStyle::Body.resolve(ui.style())` (the
+  static handed to `TextStyle::resolve` at `0x100709488` has variant tag `1` =
+  `Body`) and `ui.painter().layout(..)`, then `galley.size().y`, the `+4.0`
+  padding, the `0x26`/`0x18` axis masks and the `8.0` floor, all unchanged.
+  `Bar::write` paints `track`, `background`, the fill (`Bar::fill_rect`, the
+  same axis choice `behind` hit-tests), `outline`, `ring`, the emblem
+  (`min(index, 4)`) and the caption in `text_color`.
+* **`bar::stack::Stack::paint`** draws the inscribed square's four nested rings
+  (`circle_stroke` tracks), one arc per known vital (`Shape::line`, 25 points,
+  from 12 o'clock clockwise, `percent/100` of the turn) and the four
+  `Vital::word` labels (`Sp 50%`, `MP ?` for the unknown tag).
+* **`bar::vessel::paint`** is one `rect_filled` per segment of the recovered
+  cumulative stops (`vessel::running`); `vessel::segments` exposes the same
+  geometry without painting.
+* **`layout::drawers::Drawers::paint`** fills each open drawer's
+  `Zones::strip` with the theme fill scaled by `opacity`
+  (`Color32::gamma_multiply`) and reports what it painted; `Zones::strip` /
+  `Zones::main_rect_in` are the zone rects inside a window.
+* **`play::titlebar::TitleBar::ui`** is one real `ui.button` per item — left and
+  middle left-to-right, right list right-to-left so `Menu` sits left of `Zoom`.
+
+### Things Phase 4 pinned down that the Phase-1 notes guessed
+
+* **`egui::Event`'s discriminants.** The Phase-1 note said tag `0xc` was
+  "Text-like". It is exactly `Event::Text`: at this rev the tags are
+  `Copy` 9, `Cut` 10, `Paste` 11, **`Text` 12**, **`Key` 13**,
+  `PointerMoved` 14 … (a probe on the pinned rev confirmed each value; the
+  niche-based numbering is why they do not start at 0). The binary's own reads
+  match: `Event::Key`'s `pressed` at `+0x4`, `repeat` at `+0x5`, `Modifiers` at
+  `+0x6`, `key` at `+0xb`, `physical_key` at `+0xc` with `0x75` as
+  `Option<Key>`'s `None`. So `Keys::take` drops every `Event::Text` and takes
+  out bound `Event::Key { pressed: true, .. }` presses, naming the chord from
+  `physical_key.unwrap_or(key)` through `names::winit_name` and looking it up
+  with `Keys::does`.
+* **The caption's text style.** `Bar::fitted`'s `TextStyle::resolve` is handed
+  the static at `0x102144b78`, whose first word is `1` — `TextStyle::Body`
+  (which the pinned rev defaults to `FontId::proportional(13.0)`).
+* **`Keys::take`'s shape.** It is
+  `fn(&self, kind: Option<&T>, events: &mut Vec<egui::Event>) -> Vec<Macro>`:
+  the retain closure captured `(self, kind)` and passed both to `Keys::does`
+  (`ldp x25, x26, [x8]`, `mov x0, x25; mov x1, x26` @`0x100398e38`/`@0x100398eac`).
+  `Keys::take` keeps the one-argument form and `Keys::take_on` takes the layer.
+
+### Remaining UNKNOWNs in this crate
+
+* `Hub::TITLE_BAR_HEIGHT` (24.0) and `Hub::PAD` (8.0) — no recovered literal.
+* `Bar::write`'s instruction stream, the emblem's geometry (`min(index, 4)` is
+  recovered, the placement is not), `ring`'s exact drawing, and where each
+  `Place` puts the caption (drawn centred).
+* `bar::shape::paint` @`0x100524814` — the helper `Stack::paint` calls four
+  times — was not reconstructed; the arcs are drawn here instead.
+* `bar::vessel::paint` @`0x1004c7da0`'s body: the segments are recovered, the
+  primitives are the obvious ones.
+* `TitleBar::set`/`page`'s layout (which group is centred, spacing) — the three
+  lists are drawn left/middle/right in one row.
+* `Drawers`' `mode`: `Zones::of` subtracts every open drawer, so a `Clipping`
+  drawer still shrinks the main area here; only the paint order honours the mode.
+* Repeating key presses (`Event::Key { repeat: true, .. }`) take an extra
+  branch in `Keys::take` that was not read; they are treated as first presses.
+* The `emblem` field has no recovered serde name, so `Look`'s JSON does not
+  carry it (the round-trip test says so).
+
+---
+
+## Departures (serde/image → std, and the parallel crates)
+
+1. **`serde`/`serde_json` → `json`.** `crate::json` is a small hand-written
    JSON value/parser/writer; `Drawers`/`Drawer`, `Look`/`Says`, `Written`/`Item`,
    `Chord` and `Keybinds` implement `to_json`/`from_json` by hand in the
    *recovered field order*. Round-trip tests assert byte-exact output. serde's
@@ -318,7 +441,7 @@ two flags at 0x48/0x49.
    (`Written::left`/`right` default to `left_at_first`/`right_at_first`, which
    is why those two functions are reachable from a `Deserialize` caller at
    `0x100462f94`).
-5. **`image` → a pre-decoded asset.** `badge::pixels` used
+2. **`image` → a pre-decoded asset.** `badge::pixels` used
    `image::load_from_memory`/`resize_exact`/`to_rgba8`. The PNG bytes are
    embedded verbatim (`src/badge/badge.png`, 136 269 bytes, the recovered
    asset), and `src/badge/badge.rgba` is the *same* image decoded ahead of time
@@ -328,7 +451,7 @@ two flags at 0x48/0x49.
    (separable Lanczos3, support 3.0, widened by the sampling ratio) so the
    recovered control flow is real code. `badge.png` is kept so the asset is not
    lost if an inflater is ever added.
-6. **`hydra_board` is not a dependency.** The recovered code stores
+3. **`hydra_board` is not a dependency.** The recovered code stores
    `hydra_board::binding::Macro` values (the `drop_in_place` symbol for
    `Keys::layers`'s iterator at `0x1003860e4` spells out
    `BTreeMap<Chord, Option<Macro>>` and `BTreeMap<Chord, Macro>`), calls
@@ -341,12 +464,12 @@ two flags at 0x48/0x49.
    * `app::graphics_dir` keeps the recovered call shape and joins `graphics`
      explicitly (documented in place);
    * `PlayWindow`/`Windows` are not reconstructed at all.
-7. **`Mode`, `Says`, `Look` field types.** The serde *names and order* are
+4. **`Mode`, `Says`, `Look` field types.** The serde *names and order* are
    recovered; the *types* of several `Look` fields are not (they serialise
    through shared monomorphisations). `Color32`, `Place`, `Says` and the flags
    are evidenced; `fill_image`/`second_emblem` are modelled as asset names and
    `threshold` as an `Option<f32>`. Marked `UNKNOWN:` at the definition.
-8. **Struct layouts.** The original `Bar` is 368 bytes, `Look` 0x88, `Stack`
+5. **Struct layouts.** The original `Bar` is 368 bytes, `Look` 0x88, `Stack`
    ~0xb0, `TitleBar`/`Written` 0x50. The reconstructed structs keep the
    *evidenced* fields and offsets in their docs but are not byte-compatible.
 
@@ -388,31 +511,39 @@ The original crate is far larger than the stub list suggests (996 globals):
 `card`, `compass_art`, `doll_art`, `hub`, `logs`, `main_menu`, `menu`, `pad`,
 `placement`, `play::{draw, holders, options}`, `surveyor`, `titlebar_page`,
 `tracked`, `widget::{draw, status, roster, effects, lines, split, minimap, …}`
-and every `eframe` `App`/`egui` widget impl. `lib.rs` keeps the module names the
-stub tree had (`chat`, `reports`, `theme_editor`, `widget::effects`) with the
-types the unresolved-symbol list names, but no behaviour. `Bar::write`,
-`bar::shape::{cap, kit, laid_over, paint, wrapped}`, `bar::vessel::paint`,
+and most `egui` widget impls. `lib.rs` keeps the module names the stub tree had
+(`chat`, `reports`, `theme_editor`, `widget::effects`) with the types the
+unresolved-symbol list names, but no behaviour — they are still stubs after
+Phase 4. `bar::shape::{cap, kit, laid_over, paint, wrapped}`,
 `Item::of_key` beyond the inverse of `Item::key`, `TitleBar::set`/`page`,
 `Place::serialize`, `Keybinds::in_file`/`rows`/`beneath` and
 `keys::{vellum, wrayth, file, page, write}` are named in the tables above where
-they were read but are not implemented.
+they were read but are not implemented. `Bar::write`, `bar::vessel::paint`,
+`bar::stack::Stack::paint`, `TitleBar::ui` and `Drawers::paint` **are**
+implemented now, but from their recovered fields rather than instruction by
+instruction — the `UNKNOWN:` notes say where.
 
 ---
 
 ## Test inventory
 
-80 tests, all asserting recovered values rather than restating the code:
+108 tests, all asserting recovered values rather than restating the code. Every
+drawing test runs one headless `egui` frame (`crate::headless`) and asserts on the
+shapes that frame produced — a filled rect's exact geometry and colour, a
+circle's centre and radius, a text shape's string — never just "it drew
+something".
 
 | file | tests | what they pin down |
 |---|---|---|
 | `json.rs` | 4 | parse/write round-trips, number formatting, error cases |
-| `seam.rs` | 3 | `Color32` packing, `Rect` geometry, painter recording/metrics |
-| `bar.rs` | 16 | `Place` names and the `0x26`/`0x18` axis masks, fraction clamping at 100, `said`/`parts`/`words`, the four `fitted` axis cases plus the 8.0 floor and the `Corner` special case, `behind` hit tests, alpha forcing, `Look` JSON |
-| `bar/stack.rs` | 4 | the `Sp/HP/MP/SP` labels + `", "` separator, `?` for the unknown tag, the inscribed square, one ring per known vital |
-| `bar/vessel.rs` | 5 | cumulative stops, empty input, zero-sum stays flat, hand-computed fractions, segment rects |
+| `seam.rs` | 3 | the egui pin (sizes 4/8/8/16/**72**, `Key::ALL` = 117, `H`/`I`/`IntlBackslash`), `Color32` packing + `opaque`, `Rect`/`Pos2` geometry |
+| `lib.rs` (`headless`) | — | one `Context`, a fixed `RawInput`, shape/rect/circle/text extractors |
+| `bar.rs` | 16 | `Place` names and the `0x26`/`0x18` axis masks, fraction clamping at 100, `said`/`parts`/`words`, `fitted`'s axis cases against the **real galley height** (+4.0 padding, 8.0 floor, `Corner` measuring only the label half), `fill_rect` agreeing with `behind`, the `Corner` growth, alpha forcing + emblem clamp, the painted background/fill/caption rects, track/outline/ring strokes, the emblem disc positions, and the `Widget` impl taking the fitted rect |
+| `bar/stack.rs` | 6 | the `Sp/HP/MP/SP` labels + `", "` separator, `?` for the unknown tag, the inscribed square, the four nesting radii, the arc geometry (25 points, 12 o'clock, clockwise), the painted tracks/arcs/labels and the empty-square bail |
+| `bar/vessel.rs` | 6 | cumulative stops, empty input, zero-sum stays flat, hand-computed fractions, exact segment rects, one `rect_filled` per segment |
 | `badge.rs` | 7 | the verbatim PNG (length, signature, IHDR 256×256/8/RGBA), decoded spot colours, the `square && size != width` guard, the Lanczos3 kernel, solid-colour preservation, alpha-shape preservation |
-| `keys.rs` | 17 | modifier bits and every alias, `+` parsing, the three error strings, `written`→`parse` round-trip, the 11 default moves, alias lookup, the `egui::Key` name table, `winit_name`'s translations and gaps, the 117-byte search order, the five capturable codes, layer clipping `min(_, 9)`, layer-then-shared lookup, `take`, key-file round-trip |
-| `layout/drawers.rs` | 10 | the default 160/160/240/240 table, each field flipping `is_default`, extent floor 40, the 60/144 reserves, proportional scaling, the main rect, zone/mode names, JSON |
+| `keys.rs` | 21 | modifier bits and every alias, `+` parsing, the three error strings, `written`→`parse` round-trip, the 11 default moves, alias lookup, the `egui::Key` name table, `winit_name`'s translations and gaps, the 117-byte search order, the five capturable codes, layer clipping `min(_, 9)`, layer-then-shared lookup, `take` on real `egui::Event`s (bound press removed + its `Macro`, `Text` always dropped, physical key preferred, modifiers read, layers, releases and unbound keys left alone), `Mods::of_egui`, key-file round-trip |
+| `layout/drawers.rs` | 13 | the default 160/160/240/240 table, each field flipping `is_default`, extent floor 40, the 60/144 reserves, proportional scaling, the main rect, zone/mode names, JSON, the four `Zones::strip` rects in a 660×520 window, the painted strips, opacity → alpha, and the mode-filtered paint passes |
 | `layout.rs` | 2 | main rect with shut/open drawers |
-| `play/titlebar.rs` | 10 | the first-paint entries, `Default`, the label/key literals, `of_key` inversion, `From<Written>`'s `Menu` insertion and `tucked`, JSON defaults |
-| `app.rs` | 3 | the title/placement constants, the packed size pair, the run plan |
+| `play/titlebar.rs` | 12 | the first-paint entries, `Default`, the label/key literals, `of_key` inversion, `From<Written>`'s `Menu` insertion and `tucked`, JSON defaults, `items()` order, the four real buttons (their labels as painted text, all inside the strip, `Zoom` flush right) |
+| `app.rs` | 11 | the title/placement/size constants, the run plan, `build`'s `Renderer::Wgpu` + 660×520 + `"Hydra"` + the 256×256 RGBA badge icon, `Hub::chrome` for shut and open drawers, `press`'s drawer toggles, the painted play area (`extreme_bg_color`) and title-bar strip + four items + room text, the four open strips in `panel_fill`, and `Clipping` painting last |

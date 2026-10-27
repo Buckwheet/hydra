@@ -76,6 +76,37 @@ impl Mods {
         self.0 & other.0 != 0
     }
 
+    /// The modifier bits of an `egui::Modifiers`.
+    ///
+    /// `Keys::take`'s retain closure builds the chord's modifiers out of the
+    /// event's `Modifiers`: it tests four flags of the word it loads at `+0x6`
+    /// and ORs the recovered bits in — `tst w8, #0x1` sets `4` (Alt),
+    /// `lsr`/`and` over bit 21 sets `8` (Cmd), and two `bfxil`s take bits `1`
+    /// and `2` (Ctrl and Shift) @`0x100398e7c`..`0x100398e9c`.
+    ///
+    /// The bit *offsets* it reads (`8`, `15`, `16`, `21` of that word) are the
+    /// compiler's inlined view of `Modifiers`, not whole-struct bytes, so the
+    /// mapping kept here is the semantic one: `alt` → `4`, `ctrl` → `1`,
+    /// `shift` → `2`, `mac_cmd`/`command` → `8`. (`command` is the platform
+    /// "command" key: ⌘ on macOS, Ctrl elsewhere; `win`/`super` in
+    /// [`super::Chord::parse`] map to the same bit.)
+    pub fn of_egui(m: egui::Modifiers) -> Mods {
+        let mut mods = Mods::NONE;
+        if m.ctrl {
+            mods = mods | Mods::CTRL;
+        }
+        if m.shift {
+            mods = mods | Mods::SHIFT;
+        }
+        if m.alt {
+            mods = mods | Mods::ALT;
+        }
+        if m.mac_cmd || m.command {
+            mods = mods | Mods::CMD;
+        }
+        mods
+    }
+
     /// Look a modifier name up, case insensitively.
     pub fn of_name(name: &str) -> Option<Mods> {
         let lower = name.to_ascii_lowercase();
@@ -272,32 +303,80 @@ impl Keys {
         keys
     }
 
-    /// Drop every `Event::Text`-style event from a queue, keeping the rest.
+    /// Take this frame's bound key presses out of an `egui` event queue.
     ///
-    /// `Keys::take` @`0x1003d8050` retains the events whose discriminant is not
-    /// `0xc` (`cmp w8, #0xc` @`0x1003d80d4`, 72-byte `egui::Event`s). Modelled on
-    /// a plain event list here.
-    pub fn take<T>(&self, events: &mut Vec<KeyEvent>) -> Vec<T>
-    where
-        T: From<KeyEvent>,
-    {
+    /// `Keys::take` @`0x1003d8050` is a `Vec::retain` over a queue of 72-byte
+    /// `egui::Event`s (`add x21, x21, #0x48` @`0x1003d80dc` — `Event` *is* 72
+    /// bytes at this rev) that keeps everything except:
+    ///
+    /// * `Event::Key { pressed: true, .. }` (`cmp w8, #0xd` in the retain
+    ///   closure @`0x100398dd0`; `Event::Key` is variant 13) whose chord is
+    ///   bound: the chord name comes from `names::winit_name`
+    ///   (`bl` @`0x100398df8`) applied to `physical_key.unwrap_or(key)`
+    ///   (`ldrb w8, [x1, #0xc]; ldrb w9, [x1, #0xb]; cmp w8, #0x75;
+    ///   csel w0, w9, w8, eq` @`0x100398de4` — `0x75` is the `Option<Key>`
+    ///   `None` niche, `Key::ALL.len() == 117`), the modifiers come from the
+    ///   event's `Modifiers` (`tst`/`lsr`/`bfxil` over the bytes at `+0x6`,
+    ///   `+0xa`, @`0x100398e7c`), and the action is `Keys::does`
+    ///   (`bl` @`0x100398eb8`). These events are removed and their [`Macro`]s
+    ///   are returned;
+    /// * every `Event::Text` (`cmp w8, #0xc` @`0x1003d80d4`; `Event::Text` is
+    ///   variant 12), removed without an action, so a bound key does not also
+    ///   type its character.
+    ///
+    /// Everything else stays in the queue for the rest of the GUI.
+    ///
+    // UNKNOWN: the recovered closure takes a second path for
+    // `Event::Key { repeat: true, .. }` (`ldrb w12, [x24, #0x5];
+    // tbz w12, #0x0` @`0x100398ef8`, then a filter on the action word at
+    // `0x100398f04`); repeats are treated like first presses here.
+    pub fn take(&self, events: &mut Vec<egui::Event>) -> Vec<Macro> {
+        self.take_on(None, events)
+    }
+
+    /// [`Keys::take`] with the layer the lookup runs in.
+    ///
+    /// The original's closure captured `(self, kind)` and passed both straight
+    /// to `Keys::does` (`ldp x25, x26, [x8]` then `mov x0, x25; mov x1, x26`
+    /// @`0x100398e38`/`@0x100398eac`), so `take` is
+    /// `fn(&self, kind: Option<&T>, events: &mut Vec<egui::Event>) -> Vec<Macro>`.
+    pub fn take_on(&self, kind: Option<u8>, events: &mut Vec<egui::Event>) -> Vec<Macro> {
         let mut taken = Vec::new();
-        events.retain(|event| {
-            if event.is_text() {
-                taken.push(T::from(event.clone()));
-                false
-            } else {
-                true
+        events.retain(|event| match event {
+            egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let Some(name) = names::winit_name(physical_key.unwrap_or(*key) as u8) else {
+                    return true;
+                };
+                let chord = Chord::new(name, Mods::of_egui(*modifiers));
+                match self.does(kind, &chord) {
+                    Some(action) => {
+                        taken.push(action.clone());
+                        false
+                    }
+                    None => true,
+                }
             }
+            egui::Event::Text(_) => false,
+            _ => true,
         });
         taken
     }
 }
 
-/// A key event, as much of `egui::Event` as the recovered code touches.
+/// A key event, as much of `egui::Event` as the Phase-1 stand-in modelled.
+///
+/// Phase 4 filters real [`egui::Event`]s ([`Keys::take`]); this type is kept so
+/// the older callers still compile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyEvent {
-    /// `egui::Event::Text` — discriminant `0xc` in `Keys::take`.
+    /// `egui::Event::Text` — variant 12 of the 72-byte `egui::Event`, i.e. the
+    /// discriminant `Keys::take` drops (`cmp w8, #0xc` @`0x1003d80d4`).
     Text(String),
     /// Anything else the original passed through untouched.
     Other,
@@ -746,17 +825,138 @@ mod tests {
         assert!(keys.does(None, &chord).is_some());
     }
 
+    fn key(key: egui::Key, physical: Option<egui::Key>, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: physical,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     #[test]
-    fn take_removes_only_text_events() {
+    fn take_pulls_bound_key_presses_out_and_reports_their_actions() {
+        let keys = Keys::with_defaults();
+        let mut events = vec![
+            key(egui::Key::ArrowUp, None, true), // not bound at all
+            key(egui::Key::Num8, None, true),    // `Digit8`? no: see below
+            egui::Event::Text("8".into()),
+            egui::Event::PointerGone,
+            key(egui::Key::Num2, None, false), // a release is left alone
+        ];
+        let taken = keys.take(&mut events);
+        // `egui::Key::Num2` is `Digit2` on winit, not `Numpad2`, so nothing is
+        // bound: the *text* event is the only thing consumed.
+        assert!(taken.is_empty());
+        assert_eq!(
+            events,
+            vec![
+                key(egui::Key::ArrowUp, None, true),
+                key(egui::Key::Num8, None, true),
+                egui::Event::PointerGone,
+                key(egui::Key::Num2, None, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn take_matches_the_recovered_numpad_chords() {
+        // `names::winit_name` turns `Del`/`Insert`/… into winit names; the
+        // recovered default map is keyed by the *numpad* names, so a binding on
+        // `Numpad5` is found through the alias spelling `num_5`.
+        let mut keys = Keys::default();
+        keys.every
+            .insert(Chord::new("Digit5", Mods::NONE), Macro::new("out"));
+        let mut events = vec![key(egui::Key::Num5, None, true)];
+        let taken = keys.take(&mut events);
+        assert_eq!(taken, vec![Macro::new("out")]);
+        assert!(events.is_empty(), "the bound press is consumed");
+    }
+
+    #[test]
+    fn take_prefers_the_physical_key_and_reads_the_modifiers() {
+        let mut keys = Keys::default();
+        keys.every
+            .insert(Chord::new("Digit8", Mods::CTRL), Macro::new("north"));
+        // The logical key is something else; the physical key is what wins
+        // (`cmp w8, #0x75; csel` @0x100398dec).
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::Num8),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..egui::Modifiers::NONE
+            },
+        }];
+        let taken = keys.take(&mut events);
+        assert_eq!(taken, vec![Macro::new("north")]);
+        assert!(events.is_empty());
+        // Without the modifier the same key does not match.
+        let mut events = vec![key(egui::Key::Num8, None, true)];
+        assert!(keys.take(&mut events).is_empty());
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn take_can_run_in_a_layer() {
+        let mut keys = Keys::default();
+        keys.every
+            .insert(Chord::new("Digit4", Mods::NONE), Macro::new("west"));
+        keys.bind(
+            Some(2),
+            Chord::new("Digit4", Mods::NONE),
+            Some(Macro::new("look")),
+        );
+        let mut events = vec![key(egui::Key::Num4, None, true)];
+        assert_eq!(
+            keys.take_on(Some(2), &mut events),
+            vec![Macro::new("look")]
+        );
+        // An explicit `None` action on the layer shadows the shared binding and
+        // the event is left in the queue.
+        keys.bind(Some(2), Chord::new("Digit4", Mods::NONE), None);
+        let mut events = vec![key(egui::Key::Num4, None, true)];
+        assert!(keys.take_on(Some(2), &mut events).is_empty());
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn take_drops_every_text_event() {
+        // `Event::Text` is variant 12 (`cmp w8, #0xc` @0x1003d80d4).
         let keys = Keys::default();
         let mut events = vec![
-            KeyEvent::Other,
-            KeyEvent::Text("a".into()),
-            KeyEvent::Other,
+            egui::Event::Text("a".into()),
+            egui::Event::Copy,
+            egui::Event::Text("bc".into()),
         ];
-        let taken: Vec<String> = keys.take(&mut events);
-        assert_eq!(taken, vec!["a".to_string()]);
-        assert_eq!(events.len(), 2);
+        assert!(keys.take(&mut events).is_empty());
+        assert_eq!(events, vec![egui::Event::Copy]);
+    }
+
+    #[test]
+    fn modifier_bits_come_from_the_egui_modifiers() {
+        assert_eq!(Mods::of_egui(egui::Modifiers::NONE), Mods::NONE);
+        assert_eq!(
+            Mods::of_egui(egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                mac_cmd: true,
+                command: true,
+            }),
+            Mods::CTRL | Mods::SHIFT | Mods::ALT | Mods::CMD
+        );
+        // `command` alone is the Cmd bit on every platform egui runs on.
+        assert_eq!(
+            Mods::of_egui(egui::Modifiers {
+                command: true,
+                ..egui::Modifiers::NONE
+            }),
+            Mods::CMD
+        );
     }
 
     #[test]

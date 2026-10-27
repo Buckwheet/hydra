@@ -1048,7 +1048,18 @@ mod tests {
         fs::write(&lich, "# fake\n").unwrap();
 
         let mut relay = show(&Launch::new(&ruby, &lich), 4000).unwrap();
-        relay.send("north").unwrap();
+        // A typed line waits for the hand-held release; the first one emits
+        // the recovered login notice.
+        let typed = relay.type_line("north".into()).unwrap();
+        match typed {
+            Typed::Queued(Some(notice)) => assert_eq!(
+                notice.text(),
+                "Lich is still logging in; what you typed follows once it knows the character."
+            ),
+            other => panic!("unexpected typed result: {other:?}"),
+        }
+        assert!(relay.output.is_empty(), "line must not be written yet");
+        assert_eq!(relay.release_hold().unwrap(), ["north".to_string()]);
         let status = relay.run_to_end().unwrap();
         assert_eq!(status.code(), Some(3));
         assert_eq!(
@@ -1065,6 +1076,39 @@ mod tests {
             errors = relay.errors();
         }
         assert_eq!(errors, ["stderr line"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_maps_child_exit_status_to_ended() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "hydra-lich-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let ruby = root.join("ruby");
+        fs::write(&ruby, "#!/bin/sh\necho started\nexit 5\n").unwrap();
+        let mut perms = fs::metadata(&ruby).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ruby, perms).unwrap();
+        let lich = root.join("lich.rbw");
+        fs::write(&lich, "# fake\n").unwrap();
+
+        let ended = run(Launch::new(&ruby, &lich), 4001).unwrap();
+        assert_eq!(ended, Ended::Exited(Some(5)));
+        assert_eq!(
+            ended.notice().unwrap().text(),
+            "Lich exited (5)."
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }

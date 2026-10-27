@@ -6,9 +6,8 @@
 //!   * unknown or malformed references are copied through verbatim
 //!   * numeric values above `U+10FFFF` and surrogates are rejected (copied
 //!     through verbatim)
-//!   * `strip_control_chars` keeps tab/newline and drops other C0 controls
-//!     (the exact set of dropped characters is partially inferred; see the
-//!     `UNKNOWN` notes below)
+//!   * `strip_control_chars` keeps tab and everything at or above `U+00A0`;
+//!     it drops the other C0 controls and the `0x7f..=0x9f` C1 range
 
 /// Decode the five XML entities plus `&nbsp;` and numeric character
 /// references.
@@ -121,19 +120,16 @@ pub fn decode_attribute_value(input: &str) -> String {
 
 /// Remove C0 control characters from `input`.
 ///
-/// The binary's loop explicitly preserves `\t` and keeps ordinary text; the
-/// remaining control characters are dropped.  `\n`/`\r` do not normally occur
-/// inside an attribute value.  `// UNKNOWN:` the exact handling of `0x7f` and
-/// the `0x80..=0x9f` range was not fully resolved from the disassembly; this
-/// implementation keeps `0x7f..=0x9f` and drops the rest of C0.
+/// Recovered from `0x101c27cc8`: printable ASCII (`0x20..=0x7e`) and every
+/// character at or above `U+00A0` are kept.  Among C0 only TAB is preserved;
+/// `0x7f..=0x9f` (DEL and C1) is dropped.  Consequently `\n` and `\r` are
+/// removed too.
 pub fn strip_control_chars(input: &str) -> String {
     input
         .chars()
         .filter(|&c| {
-            if c == '\t' || c == '\n' || c == '\r' {
-                return true;
-            }
-            !((c as u32) < 0x20)
+            let n = c as u32;
+            c == '\t' || (0x20..=0x7e).contains(&n) || n >= 0xa0
         })
         .collect()
 }
@@ -179,13 +175,19 @@ mod tests {
             decode_attribute_value("a &quot;blue&quot; gem"),
             "a \"blue\" gem"
         );
-        assert_eq!(decode_attribute_value("line&#10;two"), "line\ntwo");
+        // Newlines are stripped by the binary's control-character pass.
+        assert_eq!(decode_attribute_value("line&#10;two"), "linetwo");
     }
 
     #[test]
     fn strips_control_chars_but_keeps_tabs() {
         assert_eq!(strip_control_chars("a\u{0}b\u{1}c"), "abc");
         assert_eq!(strip_control_chars("a\tb"), "a\tb");
-        assert_eq!(strip_control_chars("a\u{7f}b"), "a\u{7f}b");
+        assert_eq!(strip_control_chars("a\nb\rc"), "abc");
+        // DEL and the C1 range are dropped.
+        assert_eq!(strip_control_chars("a\u{7f}b\u{9f}c"), "abc");
+        // U+00A0 and above are preserved.
+        assert_eq!(strip_control_chars("a\u{a0}b"), "a\u{a0}b");
+        assert_eq!(strip_control_chars("caf\u{e9}"), "caf\u{e9}");
     }
 }

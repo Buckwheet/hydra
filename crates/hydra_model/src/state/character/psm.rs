@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 
 use super::vocabulary::PsmCategory;
+use serde::Deserialize;
 
 /// A learned PSM with its ranks.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct PsmRanks {
     /// `name -> ranks`
     pub ranks: BTreeMap<String, u32>,
@@ -25,7 +26,7 @@ impl PsmRanks {
 }
 
 /// The per-category PSM tables.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct PsmSet {
     pub categories: BTreeMap<PsmCategory, PsmRanks>,
 }

@@ -28,6 +28,7 @@
 //! `struct SkillSet` survives).
 
 use std::collections::BTreeMap;
+use serde::Deserialize;
 
 macro_rules! skill_kinds {
     ($($variant:ident => $name:literal),* $(,)?) => {
@@ -35,7 +36,7 @@ macro_rules! skill_kinds {
         ///
         /// `// UNKNOWN:` the variant identifiers; the display names, their
         /// order and the `key()` mapping are recovered.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
         pub enum SkillKind {
             $($variant),*
         }
@@ -119,14 +120,14 @@ impl SkillKind {
 }
 
 /// One skill's rank/bonus row.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Skill {
     pub rank: u32,
     pub bonus: i32,
 }
 
 /// The skill table, keyed by [`SkillKind`].
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct SkillSet {
     pub skills: BTreeMap<SkillKind, Skill>,
     /// The training circle printed in the header (`" (at level N)"`).

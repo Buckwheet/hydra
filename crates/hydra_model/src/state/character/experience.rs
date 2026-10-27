@@ -5,8 +5,10 @@
 //! `// UNKNOWN:` the exact bar field set; the recovered body copies a numeric
 //! triple.
 
+use serde::Deserialize;
+
 /// Experience state.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct Experience {
     /// Total absorbed experience.
     pub total: u64,

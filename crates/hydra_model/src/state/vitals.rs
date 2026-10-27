@@ -18,9 +18,10 @@
 //! a percentage computed as `round(100 * (max - cur) / max)` clamped to 100.
 
 use std::collections::BTreeMap;
+use serde::Deserialize;
 
 /// A 20-byte vitals/progress-bar record.
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Deserialize)]
 pub struct Vital {
     /// Kind/discriminant word. `0x11_0000` marks "no reading" in
     /// `targetid::of`.

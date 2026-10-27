@@ -6,3 +6,9 @@ edition = "2021"
 [dependencies]
 hydra_protocol = { path = "../hydra_protocol" }
 gs_base = { path = "../gs_base" }
+regex = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+toml = { workspace = true }

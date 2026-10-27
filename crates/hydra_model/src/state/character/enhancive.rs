@@ -6,13 +6,16 @@
 //! `EnhanciveTotals::apply` (976 B).
 //!
 //! `// UNKNOWN:` the section titles; only the recovered ones are listed.
+//! `Bonus` is one of the recovered serde types (`expecting` text at
+//! `0x101b67ed4`); its field set is `// UNKNOWN:`.
 
 use std::collections::BTreeMap;
 
 use super::stats::StatKind;
+use serde::Deserialize;
 
 /// Which part of the report a line belongs to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Section {
     #[default]
     Unknown,
@@ -34,7 +37,7 @@ impl Section {
 }
 
 /// What an enhancive line grants.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Resource {
     #[default]
     Unknown,
@@ -94,8 +97,20 @@ impl EnhanciveLine {
     }
 }
 
+/// One ` Bonus: ` / ` Ranks: ` reading of an enhancive line.
+///
+/// Only the serde `expecting` text
+/// `<impl Deserialize for enhancive::Bonus>::__Visitor` at `0x101b67ed4`
+/// survives. `// UNKNOWN:` the field set — modelled as the `Bonus: ` amount and
+/// the ` Ranks: ` count [`EnhanciveLine::classify`] reads.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub struct Bonus {
+    pub amount: i32,
+    pub ranks: i32,
+}
+
 /// The running enhancive totals.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct EnhanciveTotals {
     pub bonuses: BTreeMap<Resource, i32>,
     pub ranks: BTreeMap<Resource, i32>,
@@ -152,6 +167,17 @@ mod tests {
         let line = EnhanciveLine::classify("Strength: +3").unwrap();
         assert_eq!(line.resource, Resource::Stat(StatKind::Strength));
         assert_eq!(line.amount, 3);
+    }
+
+    #[test]
+    fn bonus_records_the_two_numbers() {
+        let bonus = Bonus {
+            amount: 3,
+            ranks: 1,
+        };
+        assert_eq!(bonus.amount, 3);
+        assert_eq!(bonus.ranks, 1);
+        assert_eq!(Bonus::default(), Bonus { amount: 0, ranks: 0 });
     }
 
     #[test]

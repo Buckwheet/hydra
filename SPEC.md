@@ -57,9 +57,9 @@ Configuration:
   Secrets come from the environment via api_key_env (e.g. DEEPSEEK_API_KEY).
   Run 'reasonix setup' to scaffold a config; see docs/SPEC.md. tool to run TWO subagents in parallel, one per crate, each in its own
 git worktree so their workspaces never collide:
-  git -C ~/Code/hydra-recon worktree add ../hydra-recon-protocol -b recon/protocol
-  git -C ~/Code/hydra-recon worktree add ../hydra-recon-lich -b recon/lich
-Subagent A works in ../hydra-recon-protocol on crate hydra_protocol. Subagent B works in ../hydra-recon-lich on crate hydra_lich.
+  git worktree add .work/protocol -b recon/protocol
+  git worktree add .work/lich -b recon/lich
+Subagent A works in .work/protocol on crate hydra_protocol. Subagent B works in .work/lich on crate hydra_lich.
 Wait for both, then merge both branches into the main branch of ~/Code/hydra-recon, resolve conflicts, run
 cargo check --workspace and cargo test -p hydra_protocol -p hydra_lich, and report.
 

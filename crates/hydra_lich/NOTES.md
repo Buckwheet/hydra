@@ -9,11 +9,21 @@ Source: arm64 Mach-O `/Users/cpmbpro/Code/hydra-inspect/hydra`, symbols at
 (0.7.19) are reconnected for real; see §0.  Still stand-ins: `getrandom` and
 `hydra_session::lich::LichDoor` (§4).
 
+**Phase 3 status:** the Lich handshake is no longer guessed.  `docs/LICH_WIRE.md`
+is the ground truth (one live capture of Hydra v0.1.0-beta.7 driving Lich
+5.22.0), and §2/§3.2/§3.3 here record what it resolved and what it left open.
+The wire constants, the two-line stdin handshake, the **server-side** keyed
+accept, the `<c>`/bare command framing and the 0x1F stdout chunk prefix live in
+`crate::wire`; `relay::start_keyed` runs the whole sequence.
+
 Legend:
 * **ESTABLISHED** — directly visible in the disassembly/strings.
+* **OBSERVED** — captured from a live Hydra + Lich session
+  (`docs/LICH_WIRE.md`); overrides an earlier guess.
 * **INFERRED** — follows from the code shape or from the surrounding
   `hydra_session` API, but the original type/name is not in our crate.
-* **UNKNOWN** — not recoverable from this binary; safest behaviour chosen.
+* **UNKNOWN** — not recoverable from this binary (and not in the capture);
+  safest behaviour chosen.
 
 ## 0. Phase 1 reconnection
 
@@ -275,10 +285,45 @@ parent (Hydra session)                         child (ruby lich.rbw)
 * **stderr** is never shown directly; it is kept so a failed Lich can be
   diagnosed (`Errors::tail` in the original).  Only the last 20 lines are
   retained.
-* Lich also speaks a local TCP protocol: the command line tells it to
-  `--pipe` on `127.0.0.1:<port>`, and the relay connects back and performs
-  the keyed accept (`relay::accept_keyed` closure).  The 64-char
-  `new_token` value is the key for that local handshake (see §3.2).
+* Lich also speaks a local TCP protocol.  **Observed**
+  (`docs/LICH_WIRE.md` §1-2): Hydra **listens** on `127.0.0.1:<ephemeral>`
+  and `-g 127.0.0.1:<port>` tells Lich to connect back; Hydra plays the game
+  server for Lich.  The 64-char `new_token` value is the key for that
+  handshake.  The old note here had the direction backwards (Hydra
+  connecting to a Lich listener) — that was a guess from the `--pipe`
+  spelling and is wrong.
+
+  Handshake, two redundant channels carrying the same two lines
+  (`crate::wire`):
+
+  ```text
+  Hydra -> Lich stdin, once, right after the spawn:
+      <token>\n
+      /FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n
+  Lich -> Hydra, first two lines of the accepted socket:
+      <token>\n                                      (the key)
+      /FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML\n  (client identification)
+  ```
+
+  [`crate::wire::accept_keyed`] is the server side: first line must equal the
+  token, second line must be the client-identification line, anything else is
+  an error and the stream is dropped.  [`crate::relay::start_keyed`] runs the
+  whole sequence (bind, spawn, stdin handshake, accept with the recovered
+  60-second deadline) and returns the relay plus the accepted socket.
+
+* Streaming after the handshake (`docs/LICH_WIRE.md` §3-4):
+  * Lich -> Hydra: newline-delimited commands.  Lich-originated commands carry
+    the Stormfront `<c>` prefix (`<c>exp`, `<c>locker info`, `<c>open #123456`);
+    text the player typed and Lich forwarded is the bare line (`look`); some
+    bare protocol lines exist (`_injury 2`).  [`crate::wire::LichFrame`] is
+    the typed parser and [`crate::wire::command_frame`] builds `<c>` frames.
+  * Hydra -> Lich: the game stream on the socket; typed input on stdin as a
+    bare line (the existing `Relay::send` path).
+  * Lich stdout: game XML it forwards is prefixed **per chunk** with the byte
+    0x1F; Lich's own lines (banner, `<output class="mono"/>…`) are not.
+    [`read_lines`]/[`read_lines_async`] strip that byte so it never reaches a
+    protocol parser, [`read_lich_out`]/[`read_lich_out_async`] yield
+    [`crate::wire::LichOut`] when the game/Lich distinction matters.
 
 ### 2.2 Lifecycle — ESTABLISHED events, INFERRED orchestration
 
@@ -323,10 +368,13 @@ until exit → map to `Ended`).  Phase 1 gave that shape two forms:
   of checks and consults its `CancellationToken` first.
 
 The other recovered arms (door commands, the hand-held `watch`, the `Waits`
-deadline, `fell_behind`, the keyed-accept race) still live outside this crate:
-they need `hydra_session::lich::LichDoor`'s command stream, which is not a
-dependency here (see §4.2).  **UNKNOWN:** exact cancellation ordering and the
-Lich TCP wire framing of the token.
+deadline, `fell_behind`) still live outside this crate: they need
+`hydra_session::lich::LichDoor`'s command stream, which is not a dependency
+here (see §4.2).  The keyed-accept race is now implemented directly in
+[`crate::wire::accept_keyed_listener`] / [`crate::relay::start_keyed`] with the
+recovered 60-second deadline (see §3.2); it no longer needs the door.
+**UNKNOWN:** exact cancellation ordering between the token and the child kill
+(the capture shows the child killed on teardown, not the arm order).
 
 
 ### 2.3 Password / environment flow
@@ -354,22 +402,68 @@ Our crate exposes the stdin writer (`Relay::send`) and leaves prompt
 recognition to the caller; it does document that the password channel is
 the removed `HYDRA_PASSWORD_*` environment, not the command line.
 
-### 3.2 Token flow
+### 3.2 Token flow — OBSERVED (`docs/LICH_WIRE.md` §2)
 
-**ESTABLISHED:** `new_token` is called exactly twice in the binary:
+**ESTABLISHED (binary):** `new_token` is called exactly twice:
 
 * `hydra::instance::claim` (`0x1001145ec`) — a 64-char token for the local
   Hydra instance/claim protocol;
 * the Lich relay loop (`0x10112ee04`) — the token is stored as a `String`
   at `+0x2f8` in the relay state, then handed to the `accept_keyed` future
-  together with the TCP connect to `127.0.0.1:<port>` and a 60-second
-  timeout.
+  together with a 60-second deadline.
 
-**INFERRED:** Lich (started with `--pipe --stormfront --sentinel -g`) listens
-on the given port; Hydra connects and proves it is the parent by sending the
-token as the keyed first line.  **UNKNOWN:** the exact wire encoding
-(newline/JSON/length prefix) of that keyed accept, because `accept_keyed`'s
-body is inlined into the relay closure.
+**OBSERVED (capture), which replaces the earlier guess:** Hydra listens;
+Lich connects.  The token is a key *Lich* presents, on two channels:
+
+1. Hydra writes `<token>\n<client line>\n` to Lich's **stdin** once, right
+   after the spawn.
+2. Lich connects to `127.0.0.1:<port>` and sends the same two lines as the
+   first bytes of the socket stream.
+
+The earlier note in this file claimed Lich "listens on `--pipe` and Hydra
+connects and sends the token" with an unknown encoding (newline/JSON/length
+prefix).  Both halves of that were wrong: the capture shows no Lich listener at
+all, `-g <host:port>` is Lich's *game-server* address (Hydra is the server), and
+the encoding is plain `\n`-terminated ASCII.  `--pipe` is what makes Lich speak
+a socket rather than a terminal.
+
+Code: `crate::wire::{handshake_bytes, write_lich_handshake, accept_keyed,
+accept_keyed_listener, keyed_listener, listen_loopback}` and
+`crate::relay::{start_keyed, start_keyed_minted, KeyedRelay}`.  The old
+sending helper survives as `hydra_session::lich::client_handshake` (Lich's
+half, for fake Lich/tests) — Hydra itself accepts.
+
+### 3.3 Resolved by the capture, and what is still unknown
+
+Resolved (guesses removed from this file and from the source):
+
+* the direction of the local TCP channel: Hydra listens, Lich connects;
+* the handshake encoding: two `\n`-terminated lines, no CR, on *both* the
+  stdin channel and the socket;
+* the client-identification literal `/FE:WRAYTH /VERSION:1.0.1.28
+  /P:WIN_UNKNOWN /XML` (the same on both channels);
+* the `<c>` prefix on Lich-originated commands versus bare forwarded lines
+  and bare protocol lines;
+* the 0x1F per-chunk prefix on game XML in Lich's stdout, and that Lich's
+  own wrapped lines (`<output class="mono"/>…`, `\r\r\n`) are unprefixed;
+* the recovered 60-second accept deadline is the keyed-accept race.
+
+Still **UNKNOWN** (the single live capture cannot answer these):
+
+* whether Hydra re-sends the two stdin lines when Lich restarts;
+* what Hydra says to the player on a token mismatch (the message is not in
+  the capture; `accept_keyed` returns `PermissionDenied` and the relay kills
+  the child, and no notice text is invented here);
+* non-Windows builds (the captured Hydra was the Windows build; Ruby
+  discovery, the `C:\Ruby4Lich5` scan and path separators differ);
+* other game instances (DragonRealms, Platinum) — only one GemStone IV Prime
+  session was captured;
+* what Hydra does when Lich is disabled mid-session;
+* whether scripts' own commands are also `<c>`-prefixed (the capture shows
+  both `<c>` commands and bare typed lines, but does not identify which of
+  the `<c>` ones came from a script);
+* the exact `Ended` branch Hydra uses for a mismatch, and the cancellation
+  ordering on teardown.
 
 ---
 
@@ -473,4 +567,20 @@ Checked against the current snapshot (`crates/hydra_session/src/lich.rs`,
   `Ended::Stopped` ("Lich stopped.", level 2) with the child killed; a
   pre-cancelled token; the synchronous `Relay`'s `CancellationToken`
   cancelling `run_to_end` from another thread; `BlockingReader`.
+* **Phase 3 wire protocol** (`crate::wire`): the exact handshake bytes and the
+  captured client-identification literal; `accept_keyed` accepting a good
+  token + client line (CRLF tolerated, the following game bytes left in the
+  stream), and refusing a wrong token (`PermissionDenied`, no token in the
+  message), a wrong second line, a truncated handshake and an over-long line;
+  the loopback listener helper and `accept_keyed_listener` accepting a good
+  handshake and closing a wrong-token socket (a real client observes EOF/RST,
+  not an open connection); `<c>`/bare framing and `command_frame`; the 0x1F
+  prefix recognition/stripping.  The stdout readers strip 0x1F
+  (`read_lines`/`read_lines_async`) and classify
+  (`read_lich_out`/`read_lich_out_async`).  `start_keyed` is exercised
+  end-to-end against a fake Lich written as a **bash** script that reads the
+  two stdin lines and speaks the handshake over `/dev/tcp` (no Ruby, no game
+  text): good handshake streams both ways, and a wrong token or a wrong
+  client line is refused with the child killed and reaped (checked with
+  `kill -0`).
 

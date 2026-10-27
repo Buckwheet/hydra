@@ -3,21 +3,21 @@
 //!
 //! Reconstructed from the arm64 binary `/Users/cpmbpro/Code/hydra-inspect/hydra`
 //! (no DWARF). See `NOTES.md` for the legend, the per-function table and every
-//! `std`-only departure. The two that shape the whole crate:
+//! departure that remains. The two that shape the whole crate:
 //!
-//! * the original used `serde`/`serde_json` for `scene` and `overrides` — this
-//!   build carries a small JSON reader/writer in [`json`] and hand-written
-//!   `to_json`/`from_json` pairs with the *recovered* field names and types;
+//! * `serde`/`serde_json` are real again (Phase 1): [`scene`] and
+//!   [`overrides`] are derives over the *recovered* field names, order and types,
+//!   and the hand-written JSON reader/writer that stood in for them is gone;
 //! * the original talked to the external `cena_map` crate (the room model and the
-//!   binary map format) — this build carries the slice of it `hydra_map` uses in
-//!   [`cena`], with the map-file decoder documented as a seam.
+//!   binary map format) — that crate is not in this workspace's pins, so this
+//!   build carries the slice of it `hydra_map` uses in [`cena`], with the
+//!   map-file decoder documented as a seam.
 #![allow(dead_code)]
 
 pub mod atlas;
 pub mod cena;
 pub mod course;
 pub mod follow;
-pub mod json;
 pub mod next_door;
 pub mod ocean;
 pub mod overrides;
@@ -122,6 +122,47 @@ pub fn share(loaded: Result<Loaded, String>) -> Result<(), &'static Result<Loade
     SHARED.set(loaded).map_err(|_| shared())
 }
 
+/// The message a load that never finishes reports. Phase 1 addition: the
+/// original let the panic out of the blocking task, which is not reproducible
+/// from here.
+pub const CANNOT_FINISH: &str = "[map] the map loader did not finish: {}";
+
+/// [`decode`] on a `tokio` blocking task (**Phase 1**, the real `tokio`).
+///
+/// The original's whole loading path ran inside `tokio`'s blocking pool —
+/// `tokio::runtime::task::core::Core<T,S>::poll` is the frame that calls
+/// `hydra_map::load` and `hydra_map::shared`. [`load`], [`decode`] and
+/// [`shared`] stay synchronous (they are the sibling-facing API and do not need
+/// a runtime); this is the same work dispatched to the pool, so a caller that
+/// already has a runtime can keep the UI thread free.
+///
+/// Needs a live runtime (any flavour): without one `spawn_blocking` panics,
+/// exactly as any other `tokio` call would.
+pub async fn decode_task(bytes: Vec<u8>) -> Result<Loaded, String> {
+    match tokio::task::spawn_blocking(move || decode(&bytes)).await {
+        Ok(answer) => answer,
+        Err(e) => Err(CANNOT_FINISH.replacen("{}", &e.to_string(), 1)),
+    }
+}
+
+/// [`load`] on a `tokio` blocking task. See [`decode_task`].
+pub async fn load_task() -> Result<Loaded, String> {
+    match tokio::task::spawn_blocking(load).await {
+        Ok(answer) => answer,
+        Err(e) => Err(CANNOT_FINISH.replacen("{}", &e.to_string(), 1)),
+    }
+}
+
+/// [`shared`], initialised on a `tokio` blocking task, then handed back.
+///
+/// The `OnceLock::get_or_init(load)` stays the same cell [`shared`] answers
+/// from, so the two entry points can never disagree; the difference is that the
+/// first call's `load` runs on the blocking pool instead of the calling task.
+pub async fn shared_task() -> &'static Result<Loaded, String> {
+    let _ = tokio::task::spawn_blocking(shared).await;
+    shared()
+}
+
 /// FNV-1a 64, as `decode` computes it (`0xcbf29ce484222325`, `× 0x100000001b3`).
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -161,6 +202,14 @@ pub fn fnv1a64_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::cena::Room;
+    use std::sync::Mutex;
+
+    /// `HYDRA_MAP` is process-wide and the test harness runs tests on several
+    /// threads, so every test that touches it holds this.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: Mutex<()> = Mutex::new(());
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn fnv1a64_matches_the_reference_vectors() {
@@ -213,7 +262,8 @@ mod tests {
             }])),
         )
         .unwrap();
-        // `HYDRA_MAP` is process-wide; this is the only test that sets it.
+        // `HYDRA_MAP` is process-wide; every test that sets it holds the lock.
+        let _env = env_lock();
         std::env::set_var(MAP_ENV, &path);
         let loaded = load().unwrap();
         std::env::remove_var(MAP_ENV);
@@ -234,5 +284,64 @@ mod tests {
         assert_eq!(first, *shared());
         // It is already initialised, so a later `share` is refused.
         assert!(share(Err("other".into())).is_err());
+    }
+
+    // ---- Phase 1: the real `tokio` behind the loading path ----------------
+
+    #[tokio::test]
+    async fn the_blocking_pool_runs_the_recovered_loader() {
+        let bytes = cena::encode(&Map::from_rooms(vec![Room {
+            id: 9,
+            title: "Nine".into(),
+            ..Default::default()
+        }]));
+        let loaded = decode_task(bytes.clone()).await.unwrap();
+        assert_eq!(loaded.map.room(9).unwrap().title, "Nine");
+        assert_eq!(loaded.fingerprint, fnv1a64_hex(&bytes));
+        // The task answers exactly what the synchronous path answers.
+        assert_eq!(decode_task(bytes.clone()).await.unwrap(), decode(&bytes).unwrap());
+        // A blob that is not a map keeps the recovered refusal wording.
+        assert_eq!(decode_task(b"nope".to_vec()).await, decode(b"nope"));
+    }
+
+    #[tokio::test]
+    async fn load_task_reads_the_file_the_env_var_names() {
+        let dir = std::env::temp_dir().join(format!("hydra-map-load-task-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("map.bin");
+        std::fs::write(
+            &path,
+            cena::encode(&Map::from_rooms(vec![Room {
+                id: 11,
+                title: "Eleven".into(),
+                ..Default::default()
+            }])),
+        )
+        .unwrap();
+        let _env = env_lock();
+        std::env::set_var(MAP_ENV, &path);
+        let loaded = load_task().await.unwrap();
+        std::env::remove_var(MAP_ENV);
+        assert_eq!(loaded.map.room(11).unwrap().title, "Eleven");
+
+        std::env::set_var(MAP_ENV, dir.join("missing.bin"));
+        let err = load_task().await.unwrap_err();
+        std::env::remove_var(MAP_ENV);
+        assert!(err.contains(" cannot be read: "), "{err}");
+        assert!(err.contains("missing.bin"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_shared_cell_is_initialised_on_the_blocking_pool() {
+        let answer = shared_task().await;
+        // Same cell, same answer: `shared_task` cannot disagree with `shared`.
+        assert!(std::ptr::eq(answer, shared()));
+        assert_eq!(*answer, *shared());
+        assert!(share(Ok(Loaded {
+            fingerprint: "x".into(),
+            map: std::sync::Arc::new(Map::default()),
+        }))
+        .is_err());
     }
 }

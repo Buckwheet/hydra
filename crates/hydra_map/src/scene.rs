@@ -29,14 +29,24 @@
 //! The `MapScene::room` index is a `OnceLock<ById>` (offset `+0xa0`, state word
 //! `+0xd0`) whose `ById` is a `HashMap<u32, usize>`; it is `#[serde(skip)]`ed,
 //! which is why `MapScene`'s field visitor knows exactly eight names.
+//!
+//! **Phase 1.** These are now real `serde` derives (`serde` 1.0.229 with
+//! `derive`, `serde_json` 1.0.151), both `x = { workspace = true }`. Deriving
+//! keeps the recovered order for free: a derived `Serialize` writes its fields
+//! in declaration order, which is exactly the order the five recovered
+//! `serialize_entry` chains use, so the files come out byte for byte as before.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::json::{self, Value, Writer};
+use serde::{Deserialize, Serialize};
 
 /// What kind of line an edge is drawn as.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Externally tagged unit variants — `"Directional"`, `"Connector"`, `"Stub"` —
+/// which is what `EdgeKind::deserialize` (`0x1015ae814`) reads back from the
+/// three name literals (`0x102422e63`, `0x102422e6e`, `0x102422e77`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EdgeKind {
     #[default]
     Directional,
@@ -66,7 +76,8 @@ impl EdgeKind {
 }
 
 /// A door on the scene: an opening between `street` and `inside`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SceneDoor {
     pub street: u32,
     pub inside: u32,
@@ -78,7 +89,8 @@ pub struct SceneDoor {
 }
 
 /// One drawn line between room `a` and room `b`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SceneEdge {
     pub a: u32,
     pub b: u32,
@@ -90,7 +102,8 @@ pub struct SceneEdge {
 }
 
 /// One room on the sheet.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SceneRoom {
     pub id: u32,
     /// Column and row on the sheet's grid.
@@ -104,7 +117,8 @@ pub struct SceneRoom {
 }
 
 /// A free-standing label on the sheet.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SceneLabel {
     pub text: String,
     pub at: (f32, f32),
@@ -112,6 +126,9 @@ pub struct SceneLabel {
 }
 
 /// The index `MapScene::room` builds lazily (`hydra_map::scene::ById`).
+///
+/// Derived, never written: `MapScene`'s field visitor knows only the eight
+/// document names.
 #[derive(Clone, Debug, Default)]
 pub struct ById(pub HashMap<u32, usize>);
 
@@ -126,7 +143,12 @@ impl ById {
 }
 
 /// A laid-out place.
-#[derive(Clone, Debug, Default)]
+///
+/// **`#[serde(default)]`** (Phase 1, INFERRED): the recovered field visitor has
+/// eight tags plus an `ignore` arm and says nothing about absent keys; the
+/// previous hand-written reader defaulted them, and so does this.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MapScene {
     pub area: String,
     pub rooms: Vec<SceneRoom>,
@@ -137,6 +159,7 @@ pub struct MapScene {
     pub min: (i32, i32),
     pub max: (i32, i32),
     /// `#[serde(skip)]`: the id → room index, built on first use.
+    #[serde(skip)]
     pub(crate) by_id: OnceLock<ById>,
 }
 
@@ -164,359 +187,22 @@ impl MapScene {
         self.rooms.get(ix)
     }
 
-    /// The `Serialize` impl, entry for entry, in the recovered order.
+    /// The `Serialize` impl, entry for entry, in the recovered order —
+    /// `serde_json::to_string` of the derived impl (no spaces, no trailing
+    /// newline, which is what the original's writer produced too).
     pub fn to_json(&self) -> String {
-        let mut w = Writer::new();
-        w.begin_object();
-        w.key("area");
-        w.str(&self.area);
-        w.key("rooms");
-        w.begin_array();
-        for r in &self.rooms {
-            r.write(&mut w);
-        }
-        w.end_array();
-        w.key("edges");
-        w.begin_array();
-        for e in &self.edges {
-            e.write(&mut w);
-        }
-        w.end_array();
-        w.key("doors");
-        w.begin_array();
-        for d in &self.doors {
-            d.write(&mut w);
-        }
-        w.end_array();
-        w.key("buildings");
-        w.begin_array();
-        for b in &self.buildings {
-            w.str(b);
-        }
-        w.end_array();
-        w.key("labels");
-        w.begin_array();
-        for l in &self.labels {
-            l.write(&mut w);
-        }
-        w.end_array();
-        w.key("min");
-        pair_i32(&mut w, self.min);
-        w.key("max");
-        pair_i32(&mut w, self.max);
-        w.end_object();
-        w.into_string()
+        serde_json::to_string(self).expect("a scene always serialises")
     }
 
-    /// The `Deserialize` side.
-    pub fn from_json(text: &str) -> Result<MapScene, json::Error> {
-        let v = json::parse(text)?;
-        MapScene::from_value(&v)
+    /// The `Deserialize` side, from the document text.
+    pub fn from_json(text: &str) -> serde_json::Result<MapScene> {
+        serde_json::from_str(text)
     }
 
-    pub fn from_value(v: &Value) -> Result<MapScene, json::Error> {
-        let obj = want_object(v)?;
-        let mut scene = MapScene::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                // The field visitor's tag numbers, in order: area=0 (len 4),
-                // rooms=1 (5), edges=2 (5), doors=3 (5), buildings=4 (9),
-                // labels=5 (6), min=6 (3), max=7 (3); anything else is the
-                // `ignore` arm (tag 8) and is skipped.
-                "area" => scene.area = want_string(value)?.to_string(),
-                "rooms" => {
-                    scene.rooms = want_array(value)?
-                        .iter()
-                        .map(SceneRoom::from_value)
-                        .collect::<Result<_, _>>()?
-                }
-                "edges" => {
-                    scene.edges = want_array(value)?
-                        .iter()
-                        .map(SceneEdge::from_value)
-                        .collect::<Result<_, _>>()?
-                }
-                "doors" => {
-                    scene.doors = want_array(value)?
-                        .iter()
-                        .map(SceneDoor::from_value)
-                        .collect::<Result<_, _>>()?
-                }
-                "buildings" => {
-                    scene.buildings = want_array(value)?
-                        .iter()
-                        .map(|b| Ok(want_string(b)?.to_string()))
-                        .collect::<Result<_, json::Error>>()?
-                }
-                "labels" => {
-                    scene.labels = want_array(value)?
-                        .iter()
-                        .map(SceneLabel::from_value)
-                        .collect::<Result<_, _>>()?
-                }
-                "min" => scene.min = pair_i32_from(value)?,
-                "max" => scene.max = pair_i32_from(value)?,
-                _ => {}
-            }
-        }
-        Ok(scene)
+    /// The `Deserialize` side, from an already-parsed document.
+    pub fn from_value(v: &serde_json::Value) -> serde_json::Result<MapScene> {
+        serde_json::from_value(v.clone())
     }
-}
-
-impl SceneDoor {
-    fn write(&self, w: &mut Writer) {
-        w.begin_object();
-        w.key("street");
-        w.u32(self.street);
-        w.key("inside");
-        w.u32(self.inside);
-        w.key("at");
-        pair_f32(w, self.at);
-        w.key("place");
-        w.str(&self.place);
-        w.key("named");
-        w.bool(self.named);
-        w.key("marks");
-        w.begin_array();
-        for m in &self.marks {
-            w.str(m);
-        }
-        w.end_array();
-        w.end_object();
-    }
-
-    fn from_value(v: &Value) -> Result<SceneDoor, json::Error> {
-        let obj = want_object(v)?;
-        let mut d = SceneDoor::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "street" => d.street = want_u32(value)?,
-                "inside" => d.inside = want_u32(value)?,
-                "at" => d.at = pair_f32_from(value)?,
-                "place" => d.place = want_string(value)?.to_string(),
-                "named" => d.named = want_bool(value)?,
-                "marks" => {
-                    d.marks = want_array(value)?
-                        .iter()
-                        .map(|m| Ok(want_string(m)?.to_string()))
-                        .collect::<Result<_, json::Error>>()?
-                }
-                _ => {}
-            }
-        }
-        Ok(d)
-    }
-}
-
-impl SceneEdge {
-    fn write(&self, w: &mut Writer) {
-        w.begin_object();
-        w.key("a");
-        w.u32(self.a);
-        w.key("b");
-        w.u32(self.b);
-        w.key("kind");
-        w.str(self.kind.name());
-        w.key("path");
-        w.begin_array();
-        for p in &self.path {
-            pair_f32(w, *p);
-        }
-        w.end_array();
-        w.key("label");
-        match &self.label {
-            Some(l) => w.str(l),
-            None => w.null(),
-        }
-        w.key("building");
-        match self.building {
-            Some(b) => w.u64(b),
-            None => w.null(),
-        }
-        w.end_object();
-    }
-
-    fn from_value(v: &Value) -> Result<SceneEdge, json::Error> {
-        let obj = want_object(v)?;
-        let mut e = SceneEdge::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "a" => e.a = want_u32(value)?,
-                "b" => e.b = want_u32(value)?,
-                "kind" => {
-                    let name = want_string(value)?;
-                    e.kind = EdgeKind::named(name).ok_or_else(|| {
-                        json::Error(format!(
-                            "unknown variant `{name}`, expected one of \
-                             `Directional`, `Connector`, `Stub`"
-                        ))
-                    })?;
-                }
-                "path" => {
-                    e.path = want_array(value)?
-                        .iter()
-                        .map(pair_f32_from)
-                        .collect::<Result<_, _>>()?
-                }
-                "label" => {
-                    e.label = match value {
-                        Value::Null => None,
-                        other => Some(want_string(other)?.to_string()),
-                    }
-                }
-                "building" => e.building = want_opt_u64(value)?,
-                _ => {}
-            }
-        }
-        Ok(e)
-    }
-}
-
-impl SceneRoom {
-    fn write(&self, w: &mut Writer) {
-        w.begin_object();
-        w.key("id");
-        w.u32(self.id);
-        w.key("cell");
-        pair_i32(w, self.cell);
-        w.key("title");
-        w.str(&self.title);
-        w.key("building");
-        match self.building {
-            Some(b) => w.u64(b),
-            None => w.null(),
-        }
-        w.key("paths");
-        w.str(&self.paths);
-        w.end_object();
-    }
-
-    fn from_value(v: &Value) -> Result<SceneRoom, json::Error> {
-        let obj = want_object(v)?;
-        let mut r = SceneRoom::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "id" => r.id = want_u32(value)?,
-                "cell" => r.cell = pair_i32_from(value)?,
-                "title" => r.title = want_string(value)?.to_string(),
-                "building" => r.building = want_opt_u64(value)?,
-                "paths" => r.paths = want_string(value)?.to_string(),
-                _ => {}
-            }
-        }
-        Ok(r)
-    }
-}
-
-impl SceneLabel {
-    fn write(&self, w: &mut Writer) {
-        w.begin_object();
-        w.key("text");
-        w.str(&self.text);
-        w.key("at");
-        pair_f32(w, self.at);
-        w.key("building");
-        match self.building {
-            Some(b) => w.u64(b),
-            None => w.null(),
-        }
-        w.end_object();
-    }
-
-    fn from_value(v: &Value) -> Result<SceneLabel, json::Error> {
-        let obj = want_object(v)?;
-        let mut l = SceneLabel::default();
-        for (key, value) in obj {
-            match key.as_str() {
-                "text" => l.text = want_string(value)?.to_string(),
-                "at" => l.at = pair_f32_from(value)?,
-                "building" => l.building = want_opt_u64(value)?,
-                _ => {}
-            }
-        }
-        Ok(l)
-    }
-}
-
-fn pair_f32(w: &mut Writer, p: (f32, f32)) {
-    w.begin_array();
-    w.f32(p.0);
-    w.f32(p.1);
-    w.end_array();
-}
-
-fn pair_i32(w: &mut Writer, p: (i32, i32)) {
-    w.begin_array();
-    w.i32(p.0);
-    w.i32(p.1);
-    w.end_array();
-}
-
-fn want_object(v: &Value) -> Result<&std::collections::BTreeMap<String, Value>, json::Error> {
-    v.as_object()
-        .ok_or_else(|| json::Error("invalid type: expected a map".into()))
-}
-
-fn want_array(v: &Value) -> Result<&[Value], json::Error> {
-    v.as_array()
-        .ok_or_else(|| json::Error("invalid type: expected a sequence".into()))
-}
-
-fn want_string(v: &Value) -> Result<&str, json::Error> {
-    v.as_str()
-        .ok_or_else(|| json::Error("invalid type: expected a string".into()))
-}
-
-fn want_bool(v: &Value) -> Result<bool, json::Error> {
-    v.as_bool()
-        .ok_or_else(|| json::Error("invalid type: expected a boolean".into()))
-}
-
-fn want_u32(v: &Value) -> Result<u32, json::Error> {
-    let n = v
-        .as_i64()
-        .ok_or_else(|| json::Error("invalid type: expected u32".into()))?;
-    u32::try_from(n).map_err(|_| json::Error("invalid value: u32 out of range".into()))
-}
-
-fn want_opt_u64(v: &Value) -> Result<Option<u64>, json::Error> {
-    match v {
-        Value::Null => Ok(None),
-        other => {
-            let n = other
-                .as_i64()
-                .ok_or_else(|| json::Error("invalid type: expected u64".into()))?;
-            u64::try_from(n)
-                .map(Some)
-                .map_err(|_| json::Error("invalid value: u64 out of range".into()))
-        }
-    }
-}
-
-fn pair_f32_from(v: &Value) -> Result<(f32, f32), json::Error> {
-    let a = want_array(v)?;
-    if a.len() != 2 {
-        return Err(json::Error("invalid length 2, expected a pair".into()));
-    }
-    let f = |x: &Value| {
-        x.as_f64()
-            .map(|f| f as f32)
-            .ok_or_else(|| json::Error("invalid type: expected f32".into()))
-    };
-    Ok((f(&a[0])?, f(&a[1])?))
-}
-
-fn pair_i32_from(v: &Value) -> Result<(i32, i32), json::Error> {
-    let a = want_array(v)?;
-    if a.len() != 2 {
-        return Err(json::Error("invalid length 2, expected a pair".into()));
-    }
-    let f = |x: &Value| {
-        x.as_i64()
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(|| json::Error("invalid type: expected i32".into()))
-    };
-    Ok((f(&a[0])?, f(&a[1])?))
 }
 
 #[cfg(test)]
@@ -610,5 +296,173 @@ mod tests {
         assert_eq!(EdgeKind::Stub.name(), "Stub");
         assert_eq!(EdgeKind::named("Stub"), Some(EdgeKind::Stub));
         assert_eq!(EdgeKind::named("stub"), None);
+    }
+
+    // ---- Phase 1: what the real `serde` derive now provides ----------------
+
+    #[test]
+    fn serde_derive_round_trips_through_values_and_text() {
+        let scene = MapScene::from_json(SAMPLE).unwrap();
+        // Text → value → struct, the path `serde_json` itself takes.
+        let value = serde_json::to_value(&scene).unwrap();
+        assert_eq!(MapScene::from_value(&value).unwrap(), scene);
+        // Struct → text → struct.
+        let text = serde_json::to_string(&scene).unwrap();
+        assert_eq!(text, scene.to_json());
+        assert_eq!(serde_json::from_str::<MapScene>(&text).unwrap(), scene);
+        // An empty scene is still the eight recovered keys.
+        assert_eq!(
+            MapScene::default().to_json(),
+            r#"{"area":"","rooms":[],"edges":[],"doors":[],"buildings":[],"labels":[],"min":[0,0],"max":[0,0]}"#
+        );
+    }
+
+    #[test]
+    fn every_child_document_round_trips_on_its_own() {
+        let door = SceneDoor {
+            street: 1,
+            inside: 2,
+            at: (1.5, -2.25),
+            place: "a\tb".into(),
+            named: false,
+            marks: vec!["m".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(&door).unwrap(),
+            r#"{"street":1,"inside":2,"at":[1.5,-2.25],"place":"a\tb","named":false,"marks":["m"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SceneDoor>(&serde_json::to_string(&door).unwrap()).unwrap(),
+            door
+        );
+
+        let edge = SceneEdge {
+            a: 3,
+            b: 4,
+            kind: EdgeKind::Connector,
+            path: vec![(0.0, 0.0), (1.25, 2.0)],
+            label: Some("gate".into()),
+            building: Some(u64::MAX),
+        };
+        assert_eq!(
+            serde_json::to_string(&edge).unwrap(),
+            r#"{"a":3,"b":4,"kind":"Connector","path":[[0.0,0.0],[1.25,2.0]],"label":"gate","building":18446744073709551615}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SceneEdge>(&serde_json::to_string(&edge).unwrap()).unwrap(),
+            edge
+        );
+
+        let room = SceneRoom {
+            id: 5,
+            cell: (-3, 4),
+            title: "T".into(),
+            building: None,
+            paths: "n=6".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&room).unwrap(),
+            r#"{"id":5,"cell":[-3,4],"title":"T","building":null,"paths":"n=6"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SceneRoom>(&serde_json::to_string(&room).unwrap()).unwrap(),
+            room
+        );
+
+        let label = SceneLabel {
+            text: "Seaway".into(),
+            at: (0.5, 0.5),
+            building: Some(9),
+        };
+        assert_eq!(
+            serde_json::to_string(&label).unwrap(),
+            r#"{"text":"Seaway","at":[0.5,0.5],"building":9}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SceneLabel>(&serde_json::to_string(&label).unwrap()).unwrap(),
+            label
+        );
+    }
+
+    #[test]
+    fn string_escapes_are_serde_jsons() {
+        // The six mandatory escapes, a control character as `\u00XX`, a `/`
+        // left alone, and non-ASCII passed through as UTF-8 — the same set the
+        // hand-written writer had (it was modelled on
+        // `serde_json::ser::format_escaped_str`).
+        let scene = MapScene {
+            area: "a/b\"c\\d\n\r\t\u{8}\u{c}\u{1}é😀".into(),
+            ..Default::default()
+        };
+        let text = scene.to_json();
+        assert_eq!(
+            text,
+            "{\"area\":\"a/b\\\"c\\\\d\\n\\r\\t\\b\\f\\u0001é😀\",\"rooms\":[],\"edges\":[],\
+             \"doors\":[],\"buildings\":[],\"labels\":[],\"min\":[0,0],\"max\":[0,0]}"
+        );
+        assert_eq!(MapScene::from_json(&text).unwrap().area, scene.area);
+
+        // `\uXXXX` escapes — including a surrogate pair — read back.
+        let scene =
+            MapScene::from_json(r#"{"area":"\u00e9\ud83d\ude00\u001f"}"#).unwrap();
+        assert_eq!(scene.area, "é😀\u{1f}");
+    }
+
+    #[test]
+    fn numbers_take_serde_jsons_forms() {
+        // An `f32` pair may be spelled in any JSON number form, so a sheet
+        // written with `1e3` still reads; the integer pairs stay integers.
+        let scene =
+            MapScene::from_json(r#"{"min":[1000,0],"max":[1,2],"doors":[{"at":[1e3,1.0]}]}"#)
+                .unwrap();
+        assert_eq!(scene.min, (1000, 0));
+        assert_eq!(scene.max, (1, 2));
+        assert_eq!(scene.doors[0].at, (1000.0, 1.0));
+        // And the writer emits the shortest round-trip form, `.0` included.
+        let scene = MapScene {
+            min: (1, -2),
+            max: (3, 4),
+            ..Default::default()
+        };
+        assert!(scene.to_json().ends_with(r#""min":[1,-2],"max":[3,4]}"#));
+    }
+
+    #[test]
+    fn a_wrong_type_names_the_field_and_the_line() {
+        let err = MapScene::from_json(r#"{"area":7}"#).unwrap_err();
+        assert!(err.to_string().contains("invalid type: integer"), "{err}");
+        assert!(err.to_string().contains("line 1 column"), "{err}");
+
+        // An unknown `EdgeKind` variant is serde's own wording now.
+        let err = MapScene::from_json(
+            r#"{"edges":[{"kind":"stub"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant `stub`"), "{err}");
+        assert!(err.to_string().contains("`Directional`"), "{err}");
+    }
+
+    #[test]
+    fn the_derived_index_is_not_part_of_the_document() {
+        let mut scene = MapScene::from_json(SAMPLE).unwrap();
+        // Touch the `OnceLock` so it is populated...
+        assert!(scene.room(7116001).is_some());
+        // ...and the document is still the eight recovered keys.
+        let value: serde_json::Value = serde_json::to_value(&scene).unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "area", "buildings", "doors", "edges", "labels", "max", "min", "rooms"
+            ]
+        );
+        // A round trip through the text drops the index, as `skip` implies.
+        let again = MapScene::from_json(&scene.to_json()).unwrap();
+        assert!(again.by_id.get().is_none());
+        assert_eq!(again.room(7116002).unwrap().id, 7116002);
+        // `MapScene` equality ignores it either way.
+        scene.by_id = OnceLock::new();
+        assert_eq!(scene, again);
     }
 }

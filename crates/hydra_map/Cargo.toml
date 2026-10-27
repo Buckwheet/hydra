@@ -2,3 +2,22 @@
 name = "hydra_map"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Phase 1 reconnection: the crates the original linked, all pinned in the
+# workspace root and used through `cargo --offline` (see NOTES.md, "Phase 1
+# reconnection").  Every one is the version recorded in
+# `~/Code/hydra-inspect/crate_versions.txt`.
+#
+# * `serde` is the `Serialize`/`Deserialize` the binary still carries for
+#   `scene::{MapScene, SceneDoor, SceneEdge, SceneRoom, SceneLabel, EdgeKind}`
+#   and `overrides::{Overrides, Area, Exported}`: the five
+#   `SerializeMap::serialize_entry` monomorphizations and the five
+#   `__FieldVisitor::expecting` visitors are theirs.
+# * `serde_json` is the reader/writer of `map-overrides.json`,
+#   `map-overrides-export.json` and the scene files.
+# * `tokio` is the blocking pool `shared` was awaited on
+#   (`tokio::runtime::task::core::Core<T,S>::poll` calls `hydra_map::load`).
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

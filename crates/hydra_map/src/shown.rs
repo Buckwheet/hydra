@@ -125,7 +125,9 @@ mod tests {
         assert_eq!(route.last(2), Some(3));
         assert_eq!(route.from(4), &[4][..]);
         assert_eq!(route.from(9), &[1, 2, 3, 2, 4][..], "unknown id: whole route");
-        assert_eq!(ShownRoute::default().from(1), &[][..]);
+        // `&[][..]` needs the element type spelled out now that `serde_json`
+        // brings its own `impl PartialEq<Value> for u32` into the crate.
+        assert_eq!(ShownRoute::default().from(1), &[0u32; 0][..]);
     }
 
     #[test]

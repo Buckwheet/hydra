@@ -5,9 +5,13 @@ Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hy
 `todo!()` stubs over 12 files; this build has none —
 `grep -Rn 'todo!\|unimplemented!' crates/hydra_map/src` is empty — and
 
-* `cargo check -p hydra_map` — clean, no warnings
-* `cargo test -p hydra_map` — **58 tests pass**
-* `cargo check --workspace` — clean (no other crate was touched)
+* `cargo check -p hydra_map --offline` — clean, no warnings
+* `cargo test -p hydra_map --offline` — **65 tests pass**
+* `cargo check --workspace --offline` — clean (no other crate was touched)
+
+Phase 1 reconnected `serde`, `serde_json` and `tokio` (see *Phase 1
+reconnection*). `cena_map`/`cena_map_layout` are not in the workspace pins and
+stay as seams.
 
 ---
 
@@ -266,18 +270,63 @@ read entry by entry. Field *names* are the literals passed to
 
 ---
 
-## `std`-only departures
+## Departures that remain
+
+Phase 1 struck the three that could be reconnected (`serde`, `serde_json`,
+`tokio` — see the next section). What is left:
 
 | original dependency | recovered use | what this build does |
 |---|---|---|
-| `serde` + `serde_core::de::Visitor` | `scene::{MapScene, SceneDoor, SceneEdge, SceneRoom, SceneLabel, EdgeKind}`, `overrides::Overrides` (their `expecting` symbols are in the crate's unresolved list) | plain structs with hand-written `from_json`/`to_json`; the *field names, order and types* are the recovered ones, the derive machinery is not. |
-| `serde_json` | `map-overrides.json`, the scene files | [`json`]: a small `Value` with a parser and a writer (objects, arrays, strings with the six escapes and surrogate pairs, numbers kept as source text). |
-| `cena_map` (external crate) | `Map::room`, `Map::from_rooms`, `Map::locate`, `locate::title_from_subtitle`, `Room` (384 B), `Exit` (184 B), `exit::Cost::price`, `cond::Cond` | [`cena`]: the same accessors over a room model with the recovered field *shapes* (`id`, `title`, `paths`, `areas`, `specs`, `note`, `exits`) and the recovered `Vec<String>`/`Option<String>` kinds. |
-| `cena_map::binary::decode` | `decode`'s first call | [`cena::decode`] accepts the recovered `HYDRAMAP` magic and then a record layout of its own ([`cena::encode`] writes it for the tests). **This is the largest seam in the crate**: the real image is a 22 MB blob whose record layout lives outside `hydra_map`. |
-| `cena_map_layout` | `atlas::work`'s per-name resolution, `next_door`, `lay::{open_place, marks, places, convert, lay_out}` | the queue/worker plumbing is reproduced; the *layout* is supplied by the caller as a closure ([`atlas::Atlas::start`]/[`Atlas::work`]). The `lay` helpers are not reproduced at all — they belong to that crate. |
-| `tokio` | `shared` is awaited inside a tokio blocking task (`tokio::runtime::task::core::Core<T,S>::poll` calls it) | the synchronous equivalent: `OnceLock::get_or_init` + `std::fs`. |
-| `anyhow`-style errors | `String` errors from `decode`/`load` | `Result<_, String>` with the recovered `Display` wording preserved byte for word. |
-| `egui`/`wgpu` drawing | `scene::MinimapView`, `Follower::view`'s `View` | the model/state is kept, the draw calls are not: `View` carries the placement, the ways out and the area. |
+| `cena_map` (external crate, **not in the workspace pins**) | `Map::room`, `Map::from_rooms`, `Map::locate`, `locate::title_from_subtitle`, `Room` (384 B), `Exit` (184 B), `exit::Cost::price`, `cond::Cond` | [`cena`]: the same accessors over a room model with the recovered field *shapes* (`id`, `title`, `paths`, `areas`, `specs`, `note`, `exits`) and the recovered `Vec<String>`/`Option<String>` kinds. |
+| `cena_map::binary::decode` (**not in the pins**) | `decode`'s first call | [`cena::decode`] accepts the recovered `HYDRAMAP` magic and then a record layout of its own ([`cena::encode`] writes it for the tests). **This is the largest remaining departure in the crate**: the real image is a 22 MB blob whose record layout lives outside `hydra_map`. |
+| `cena_map_layout` (**not in the pins**) | `atlas::work`'s per-name resolution, `next_door`, `lay::{open_place, marks, places, convert, lay_out}` | the queue/worker plumbing is reproduced; the *layout* is supplied by the caller as a closure ([`atlas::Atlas::start`]/[`Atlas::work`]). The `lay` helpers are not reproduced at all — they belong to that crate. |
+| `anyhow`-style errors | `String` errors from `decode`/`load` | `Result<_, String>` with the recovered `Display` wording preserved byte for word. `anyhow` **is** pinned (`1.0.104`), but the recovered signatures are `Result<_, String>` (`decode`'s sret is one `Vec`-shaped 24-byte `String`), so switching would break the sibling-visible API for no gain. |
+| `egui`/`wgpu` drawing | `scene::MinimapView`, `Follower::view`'s `View` | the model/state is kept, the draw calls are not: `View` carries the placement, the ways out and the area. Not this crate's dependencies here and not in the pins (Phase 4 in `PLAN.md`). |
+
+---
+
+## Phase 1 reconnection — what is real again
+
+Three crates, each the workspace pin declared as `x = { workspace = true }` in
+this crate's `Cargo.toml` and built with `cargo --offline`:
+
+| real crate (pin) | replaced | where | notes |
+|---|---|---|---|
+| `serde` 1.0.229, feature `derive` | the hand-written `to_json`/`from_json` pairs on the five scene structs and `Overrides` | `scene::{MapScene, SceneDoor, SceneEdge, SceneRoom, SceneLabel, EdgeKind}`, `overrides::{Overrides, Area, Exported}` | the derives *are* the crate's five `SerializeMap::serialize_entry` chains and five `__FieldVisitor::expecting` symbols. A derived `Serialize` writes its fields in declaration order, which is the recovered order, so the documents keep their byte-for-byte shape — the exact-text assertions did not change. |
+| `serde_json` 1.0.151 | `src/json.rs` (a `Value`, a parser and a `Writer`) | `scene::{to_json, from_json, from_value}`, `overrides::{load, save, export, from_json, to_json}` | `src/json.rs` is **deleted** and `pub mod json` with it: the two documents above were its only users, and no sibling crate names `hydra_map::json`. `to_json`/`from_json` keep their names and meaning; their error type is `serde_json::Error` instead of the local `json::Error`. |
+| `tokio` 1.53.1, feature `full` | "nothing is spawned; `shared` is a plain `OnceLock`" | `lib::{decode_task, load_task, shared_task}` | the recovered shape — `hydra_map::load`/`hydra_map::shared` running on tokio's blocking pool — is now reachable, while `load`, `decode` and `shared` stay synchronous for the sibling-facing API. |
+
+Path dependencies: **none**. `cena_map`/`cena_map_layout` are not in the
+workspace, so the crate still carries [`cena`] and the two seams above.
+
+### Behaviour that changed as a direct result of the real crates
+
+1. **Error text.** A broken scene or overrides file reports `serde_json`'s
+   wording (`invalid type: integer `7`, expected a string at line 1 column 9`,
+   `unknown variant `stub`, expected one of `Directional`, `Connector`, `Stub``)
+   instead of the hand-written sentences. Nothing on disk changed, and
+   `Overrides::load` still swallows every error into the empty document before
+   the text can reach a caller (`0x1015beb24`).
+2. **A struct may be spelled as a sequence.** serde's derive accepts the tuple
+   form of a struct, so `Overrides::from_json("[]")` is now
+   `Overrides { areas: [] }` where the hand-written reader refused it. The
+   object form is untouched, and `{"areas": …}` with a non-sequence under it is
+   still a type error.
+3. **Absent keys default.** `#[serde(default)]` on each document (INFERRED:
+   the recovered visitor has eight tags plus an `ignore` arm and says nothing
+   about missing keys; the previous reader defaulted them). Unknown keys are
+   ignored, as before — that part is recovered (`ignore`, tag 8).
+4. **Duplicate keys.** `src/json.rs` kept the last one; `serde_json` keeps the
+   last one too, so this did not change — but it is now the real crate's
+   documented behaviour rather than a coincidence.
+5. **`serde_json` brings `impl PartialEq<Value> for u32` into the crate**, which
+   made one existing inference in `shown`'s test ambiguous
+   (`&[][..]` → `&[0u32; 0][..]`). Library code is unaffected; it is a compile
+   nit, not a behaviour change.
+6. **A loader that panics on the blocking pool.** `decode_task`/`load_task`
+   turn a `JoinError` into `[map] the map loader did not finish: {}`
+   ([`CANNOT_FINISH`]) — a Phase 1 addition, not recovered; the original let the
+   panic escape.
 
 ---
 
@@ -336,24 +385,28 @@ read entry by entry. Field *names* are the literals passed to
 
 ## Tests
 
-`cargo test -p hydra_map` — **58 tests**, all passing, all asserting recovered
-values:
+`cargo test -p hydra_map --offline` — **65 tests**, all passing, all asserting
+recovered values:
 
-* `scene` (4) — the full eight-key document round-tripped byte for byte, the four
+* `scene` (10) — the full eight-key document round-tripped byte for byte, the four
   child structs' key order/types, an unknown key ignored exactly like serde's
   `ignore` arm, the `OnceLock` room index (including a miss), and the three
-  `EdgeKind` names.
-* `json` (5) — objects/arrays/escapes/surrogates, the three error wordings serde
-  uses, numbers keeping their source text, the writer's exact output, the
-  mandatory-escape set.
+  `EdgeKind` names; then the derive itself: text→value→struct and
+  struct→text→struct, each child struct on its own, the string escape set
+  (`"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\u00XX`, `/` and non-ASCII passed
+  through), `\uXXXX` including a surrogate pair, every JSON number form in an
+  `f32` slot, serde's own type/variant error wording, and the proof that the
+  skipped `OnceLock` index never enters the document.
 * `cena` (4) — `title_from_subtitle` on both shapes, `locate`'s
   number-then-name precedence (including a stale number falling through), the
   `HYDRAMAP` round trip plus its two refusal wordings, and
   first-title-wins indexing.
-* `overrides` (5) — the exact `{"areas":[{"area":…,"rooms":[…]}]}` document and
+* `overrides` (8) — the exact `{"areas":[{"area":…,"rooms":[…]}]}` document and
   the `[{"id","uid","title","area"}]` export, save→load→export against a real
   directory, `applied` rewriting a title and an area, `pocket`'s grouping,
-  `written`'s atomic replace (no `*.tmp` left behind).
+  `written`'s atomic replace (no `*.tmp` left behind); then the derive:
+  value round trip, absent/unknown keys, a lone `Exported`, a broken file
+  loading as the empty document (`{"areas":{}}` included), and the escape set.
 * `ocean` (7) — all eight heading names and abbreviations plus the negatives, the
   two delta tables and the four opposites, the thirteen-column parse (cells,
   eight neighbours, ports, piers), `runs_true`'s three conditions including the
@@ -379,16 +432,21 @@ values:
   `area@room` while queueing an unknown place.
 * `shown` (3) — `from` returning the tail at the *last* passage for both route
   and course, and the two caches staying separate.
-* `lib` (5) — three FNV-1a 64 vectors, `decode`'s fingerprint stability, refusal
+* `lib` (8) — three FNV-1a 64 vectors, `decode`'s fingerprint stability, refusal
   of a non-map blob with the recovered wording, `load` through `HYDRA_MAP`
-  (success and the `cannot be read` wording), and `shared` answering the same way
-  twice.
+  (success and the `cannot be read` wording), `shared` answering the same way
+  twice; then the real `tokio`: `decode_task` answering exactly what `decode`
+  answers (fingerprint, room, and the refusal path), `load_task` reading the
+  `HYDRA_MAP` file and its `cannot be read` wording on the blocking pool, and
+  `shared_task` initialising the same `OnceLock` `shared` reads. The two
+  `HYDRA_MAP` tests (sync and async) take a mutex, because the variable is
+  process-wide.
 
 Verification:
 
 ```
-cargo check -p hydra_map     # clean
-cargo test  -p hydra_map     # 58 passed
-cargo check --workspace      # clean
+cargo check -p hydra_map --offline   # clean, no warnings
+cargo test  -p hydra_map --offline   # 65 passed
+cargo check --workspace --offline    # clean
 grep -Rn 'todo!\|unimplemented!' crates/hydra_map/src   # empty
 ```

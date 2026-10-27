@@ -95,7 +95,7 @@ pub type Reply = Sender<Outcome>;
 /// **ESTABLISHED**: the binary's `Envelope` drops a
 /// `Option<oneshot::Sender<Outcome>>` at `+0x18`.  The sender is shared (and
 /// taken when it fires) so that [`Envelope`] and [`Owed`] keep their `Clone`
-/// and `Debug` derives; a `oneshot::Sender` is neither.
+/// derive, which a bare `oneshot::Sender` does not have.
 #[derive(Debug, Clone, Default)]
 pub struct Oneshot(Arc<Mutex<Option<oneshot::Sender<Outcome>>>>);
 

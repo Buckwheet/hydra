@@ -34,7 +34,16 @@ pub struct Parser {
     /// Dropping the remainder of an over-long line until the next newline.
     skip_until_newline: bool,
     /// Inside a multi-line `<settings>...</settings>` block.
+    ///
+    /// While set, [`Parser::push_bytes`] diverts bytes into
+    /// [`Parser::settings_window`] instead of the line buffer.
     in_settings: bool,
+    /// Rolling window of the last 11 bytes seen inside a settings block, used
+    /// to spot `</settings>` (`Parser + 0x60` in the binary).
+    settings_window: Vec<u8>,
+    /// `</settings>` was seen but the current line has not ended yet
+    /// (state `2` at `Parser + 0x169`).
+    settings_closed: bool,
     /// Bold state carried across lines.
     bold: bool,
     /// Current `<preset>` style id.
@@ -394,6 +403,60 @@ mod tests {
         assert!(parser.push_bytes(b"tail").is_empty());
         let frames = parser.finish();
         assert_eq!(first_text(&frames).plain(), "tail");
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn settings_block_bytes_never_reach_the_line_buffer() {
+        let mut parser = Parser::new();
+        // The opening line is parsed (and suppressed) normally; from then on
+        // bytes are diverted to the rolling `</settings>` window.
+        assert!(parser.push_bytes(b"<settings>\n").is_empty());
+        // The body may contain markup and newlines: none of it is parsed.
+        assert!(parser.push_bytes(b"{\"a\":<pushBold/>1}\n").is_empty());
+        assert!(parser.push_bytes(b"{\"b\":").is_empty());
+        // `</settings>` is detected at byte level; the rest of the line is
+        // still parsed, but leading CRs are dropped.
+        let frames = parser.push_bytes(b"</settings>\r<prompt>ok</prompt>\n");
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(&frames[0], Frame::Prompt(text) if text == "ok"));
+
+        // Back to normal line splitting.
+        let frames = parser.push_bytes(b"visible\n");
+        assert_eq!(first_text(&frames).plain(), "visible");
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_aborts_an_unterminated_settings_block() {
+        let mut parser = Parser::new();
+        assert!(parser.push_bytes(b"<settings>\n").is_empty());
+        assert!(parser.push_bytes(b"{\"truncated\": ").is_empty());
+        // `<prompt` inside the block ends it and is seeded into the line
+        // buffer, so the prompt itself survives.
+        let frames = parser.push_bytes(b"<prompt>hp: 100</prompt>\n");
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(&frames[0], Frame::Prompt(text) if text == "hp: 100"));
+
+        let frames = parser.push_bytes(b"visible\n");
+        assert_eq!(first_text(&frames).plain(), "visible");
+    }
+
+    #[test]
+    fn an_over_long_line_becomes_a_raw_frame_and_the_tail_is_dropped() {
+        let mut parser = Parser::new();
+        let long = vec![b'x'; MAX_LINE_BYTES + 1];
+        let frames = parser.push_bytes(&long);
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            Frame::Raw(text) => assert_eq!(text.len(), MAX_LINE_BYTES + 1),
+            other => panic!("expected a raw frame, got {other:?}"),
+        }
+
+        // Everything up to the next newline belongs to the discarded line.
+        let frames = parser.push_bytes(b"tail\nafter\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(first_text(&frames).plain(), "after");
         assert!(parser.finish().is_empty());
     }
 }

@@ -2,3 +2,15 @@
 name = "hydra_session"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# The crates the original linked (see NOTES.md, "Phase 1 reconnection"): all
+# pinned in the workspace root and used offline.
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+regex = { workspace = true }
+flate2 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

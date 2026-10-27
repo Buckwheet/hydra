@@ -1,22 +1,33 @@
-//! A very small JSON / TOML reader and writer.
+//! The JSON / TOML document type the file stores share.
 //!
 //! The original crate used `serde_json` (its `__Visitor` impls are still in
 //! the symbol table, e.g.
 //! `<hydra_session::notes::_::<impl Deserialize for notes::File>::deserialize::__Visitor
 //! as Visitor>::expecting @0x101a54fb4`) and `toml` / `toml_edit` for the
-//! settings and stream rules.  This crate is std-only, so this module
-//! implements the small subset of both formats the recovered files actually
-//! use:
+//! settings and stream rules.  **Phase 1** reconnected both:
 //!
-//! * JSON: objects, arrays, strings (with `\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
-//!   `\r`, `\t`, `\uXXXX`), integers, floats, `true`, `false`, `null`.
-//! * TOML: `key = value` lines, `[table]` headers, `[[array-of-tables]]`
-//!   headers, basic strings, booleans, integers and single-line arrays of
-//!   scalars, plus `#` comments.
+//! * [`parse_json`] / [`to_json`] are `serde_json::from_str` /
+//!   `serde_json::to_string_pretty` over [`Value`], which implements
+//!   [`serde::Serialize`] and [`serde::Deserialize`] itself so that the key
+//!   *order* of a document survives a round trip (`serde_json::Value`'s map is
+//!   a `BTreeMap` unless `preserve_order` is on, and turning that feature on
+//!   would reorder every other crate's output);
+//! * [`parse_toml`] is `toml::from_str` over `toml::Value`, converted into
+//!   [`Value`]; [`to_toml`] renders a flat table (the shape the settings use)
+//!   and `stream_rules` writes its `[[rules]]` documents with `toml_edit`.
 //!
-//! Nothing here is a general-purpose implementation; unknown keys are kept but
-//! never interpreted, which mirrors how the original ignored fields it did not
-//! know about.  Departures from `serde` are recorded in `NOTES.md`.
+//! [`Value`] is the crate's own document type, not `serde_json::Value`: every
+//! file store in this crate (`notes`, `alias`, `character_store`,
+//! `settings_store`, `player_log::links`, `actor`) reads and writes it, and
+//! several of them expose it in their public API (`SettingsFile::sections`).
+//! Unknown keys are kept but never interpreted, which mirrors how the original
+//! ignored fields it did not know about.  Departures are recorded in
+//! `NOTES.md` §"Phase 1 reconnection".
+
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 /// A parsed JSON or TOML value.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,215 +110,134 @@ impl Value {
     }
 }
 
+
 // ---------------------------------------------------------------------------
-// JSON
+// JSON — `serde_json`, over this crate's own document type
 // ---------------------------------------------------------------------------
 
-/// Parse a JSON document.  The error is a short human-readable message with
-/// the byte offset, which is what the `Refused` error type carries.
+/// Parse a JSON document with `serde_json`.
+///
+/// The error is serde's own message, which carries the line and column
+/// (`expected `,` or `}` at line 3 column 7`) instead of the byte offset the
+/// hand-written parser used to report.  Callers wrap it in their own
+/// `"{} cannot be read: {}"` shape, as before.
 pub fn parse_json(text: &str) -> Result<Value, String> {
-    let mut p = Parser {
-        b: text.as_bytes(),
-        i: 0,
-    };
-    p.ws();
-    let v = p.value()?;
-    p.ws();
-    if p.i != p.b.len() {
-        return Err(format!("trailing text at byte {}", p.i));
-    }
-    Ok(v)
+    serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
+/// Render a value as JSON with `serde_json`, pretty-printed with two spaces.
+pub fn to_json(v: &Value) -> String {
+    // `Value`'s `Serialize` impl cannot fail for a finite document, and a
+    // non-finite float is written as `null`; an empty string keeps `to_json`
+    // total, which is what every caller assumes.
+    serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-impl<'a> Parser<'a> {
-    fn ws(&mut self) {
-        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
-            self.i += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn eat(&mut self, c: u8) -> Result<(), String> {
-        if self.peek() == Some(c) {
-            self.i += 1;
-            Ok(())
-        } else {
-            Err(format!("expected `{}` at byte {}", c as char, self.i))
-        }
-    }
-
-    fn value(&mut self) -> Result<Value, String> {
-        match self.peek() {
-            None => Err("unexpected end of input".to_string()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Value::Str(self.string()?)),
-            Some(b't') => self.word("true", Value::Bool(true)),
-            Some(b'f') => self.word("false", Value::Bool(false)),
-            Some(b'n') => self.word("null", Value::Null),
-            Some(_) => self.number(),
-        }
-    }
-
-    fn word(&mut self, w: &str, v: Value) -> Result<Value, String> {
-        if self.b[self.i..].starts_with(w.as_bytes()) {
-            self.i += w.len();
-            Ok(v)
-        } else {
-            Err(format!("expected `{w}` at byte {}", self.i))
-        }
-    }
-
-    fn number(&mut self) -> Result<Value, String> {
-        let start = self.i;
-        while self.i < self.b.len()
-            && matches!(self.b[self.i],
-                b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-        {
-            self.i += 1;
-        }
-        let s = std::str::from_utf8(&self.b[start..self.i]).map_err(|e| e.to_string())?;
-        s.parse::<f64>()
-            .map(Value::Num)
-            .map_err(|e| format!("bad number `{s}`: {e}"))
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.eat(b'"')?;
-        let mut out = String::new();
-        loop {
-            match self.peek() {
-                None => return Err("unterminated string".to_string()),
-                Some(b'"') => {
-                    self.i += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.i += 1;
-                    let c = self.peek().ok_or("dangling escape")?;
-                    self.i += 1;
-                    match c {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let ch = if (0xd800..0xdc00).contains(&hi) {
-                                // surrogate pair
-                                self.eat(b'\\')?;
-                                self.eat(b'u')?;
-                                let lo = self.hex4()?;
-                                let cp =
-                                    0x1_0000 + ((hi - 0xd800) << 10) + (lo.wrapping_sub(0xdc00));
-                                char::from_u32(cp).unwrap_or('\u{fffd}')
-                            } else {
-                                char::from_u32(hi).unwrap_or('\u{fffd}')
-                            };
-                            out.push(ch);
-                        }
-                        other => return Err(format!("bad escape \\{}", other as char)),
-                    }
-                }
-                Some(_) => {
-                    // Copy one UTF-8 scalar.
-                    let start = self.i;
-                    let len = utf8_len(self.b[self.i]);
-                    self.i = (self.i + len).min(self.b.len());
-                    let chunk = std::str::from_utf8(&self.b[start..self.i])
-                        .map_err(|e| e.to_string())?;
-                    out.push_str(chunk);
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::Null => s.serialize_unit(),
+            Value::Bool(b) => s.serialize_bool(*b),
+            Value::Num(n) => {
+                // JSON has one number type; the original wrote whole numbers
+                // without a fractional part (`"schema_version": 2`), which is
+                // also what `serde_json` does for integers, so an integral
+                // `f64` is emitted through the integer path.
+                if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.0e15 {
+                    s.serialize_i64(*n as i64)
+                } else {
+                    s.serialize_f64(*n)
                 }
             }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        if self.i + 4 > self.b.len() {
-            return Err("short \\u escape".to_string());
-        }
-        let s = std::str::from_utf8(&self.b[self.i..self.i + 4]).map_err(|e| e.to_string())?;
-        self.i += 4;
-        u32::from_str_radix(s, 16).map_err(|e| format!("bad \\u escape: {e}"))
-    }
-
-    fn array(&mut self) -> Result<Value, String> {
-        self.eat(b'[')?;
-        let mut items = Vec::new();
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.i += 1;
-            return Ok(Value::Arr(items));
-        }
-        loop {
-            self.ws();
-            items.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.i += 1;
+            Value::Str(text) => s.serialize_str(text),
+            Value::Arr(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
                 }
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(Value::Arr(items));
-                }
-                _ => return Err(format!("expected `,` or `]` at byte {}", self.i)),
+                seq.end()
             }
-        }
-    }
-
-    fn object(&mut self) -> Result<Value, String> {
-        self.eat(b'{')?;
-        let mut pairs = Vec::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.i += 1;
-            return Ok(Value::Obj(pairs));
-        }
-        loop {
-            self.ws();
-            let k = self.string()?;
-            self.ws();
-            self.eat(b':')?;
-            self.ws();
-            let v = self.value()?;
-            pairs.push((k, v));
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.i += 1;
+            Value::Obj(pairs) => {
+                let mut map = s.serialize_map(Some(pairs.len()))?;
+                for (key, item) in pairs {
+                    map.serialize_entry(key, item)?;
                 }
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(Value::Obj(pairs));
-                }
-                _ => return Err(format!("expected `,` or `}}` at byte {}", self.i)),
+                map.end()
             }
         }
     }
 }
 
-fn utf8_len(b: u8) -> usize {
-    match b {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        _ => 4,
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(Document)
     }
 }
 
+/// The visitor behind `Value::deserialize`: it keeps object members in the
+/// order the document lists them, which `serde_json::Value` does not (its map
+/// is a `BTreeMap` unless the `preserve_order` feature is on).
+struct Document;
+
+impl<'de> Visitor<'de> for Document {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+        Ok(Value::Bool(b))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+        Ok(Value::Num(n as f64))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+        Ok(Value::Num(n as f64))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+        Ok(Value::Num(n))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+        Ok(Value::Str(s.to_string()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Value, E> {
+        Ok(Value::Str(s))
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        Value::deserialize(d)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(item) = seq.next_element::<Value>()? {
+            items.push(item);
+        }
+        Ok(Value::Arr(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some((key, item)) = map.next_entry::<String, Value>()? {
+            pairs.push((key, item));
+        }
+        Ok(Value::Obj(pairs))
+    }
+}
 /// Escape a string for JSON output.
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -325,73 +255,6 @@ pub fn json_escape(s: &str) -> String {
         }
     }
     out
-}
-
-/// Render a value as JSON, pretty-printed with two spaces.
-pub fn to_json(v: &Value) -> String {
-    let mut out = String::new();
-    write_json(&mut out, v, 0);
-    out
-}
-
-fn write_json(out: &mut String, v: &Value, depth: usize) {
-    let pad = |out: &mut String, d: usize| {
-        out.push('\n');
-        for _ in 0..d {
-            out.push_str("  ");
-        }
-    };
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(n) => {
-            if n.fract() == 0.0 && n.abs() < 9.0e15 {
-                out.push_str(&format!("{}", *n as i64));
-            } else {
-                out.push_str(&format!("{n}"));
-            }
-        }
-        Value::Str(s) => {
-            out.push('"');
-            out.push_str(&json_escape(s));
-            out.push('"');
-        }
-        Value::Arr(items) => {
-            if items.is_empty() {
-                out.push_str("[]");
-                return;
-            }
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                pad(out, depth + 1);
-                write_json(out, item, depth + 1);
-            }
-            pad(out, depth);
-            out.push(']');
-        }
-        Value::Obj(pairs) => {
-            if pairs.is_empty() {
-                out.push_str("{}");
-                return;
-            }
-            out.push('{');
-            for (i, (k, item)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                pad(out, depth + 1);
-                out.push('"');
-                out.push_str(&json_escape(k));
-                out.push_str("\": ");
-                write_json(out, item, depth + 1);
-            }
-            pad(out, depth);
-            out.push('}');
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,9 +558,51 @@ mod tests {
     }
 
     #[test]
-    fn json_reports_the_byte_offset_of_a_bad_escape() {
+    fn json_reports_a_bad_escape_with_serde_s_position() {
+        // The hand-written parser reported a byte offset; `serde_json` reports
+        // a line and column.  The stored message shape is unchanged.
         let e = parse_json(r#"{"a": "\q"}"#).unwrap_err();
-        assert!(e.contains("bad escape"), "{e}");
+        assert!(e.contains("invalid escape"), "{e}");
+        assert!(e.contains("line 1 column 9"), "{e}");
+        // A truncated document is refused with a position too, not a panic.
+        let e = parse_json(r#"{"a": "b"#).unwrap_err();
+        assert!(e.contains("line 1"), "{e}");
+    }
+
+    #[test]
+    fn serde_keeps_member_order_through_a_round_trip() {
+        // This is the property `serde_json::Value` does not have without the
+        // `preserve_order` feature, and the settings file depends on it.
+        let v = parse_json(r#"{"zeta": 1, "alpha": 2, "mu": 3}"#).unwrap();
+        let keys: Vec<&str> = match &v {
+            Value::Obj(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(keys, ["zeta", "alpha", "mu"]);
+        assert_eq!(parse_json(&to_json(&v)).unwrap(), v);
+    }
+
+    #[test]
+    fn serde_json_parses_real_documents_the_store_writes() {
+        // A whole settings-shaped document, through `serde_json` directly: the
+        // wrapper is a paper-thin delegation now.
+        let text = r#"{
+          "schema_version": 1,
+          "instance": "gemstone",
+          "character": "Aelith",
+          "sections": {"lich": {"path": "/usr/bin/ruby"}, "symbol": "."}
+        }"#;
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v.u64_of("schema_version"), Some(1));
+        let sections = v.get("sections").unwrap();
+        assert_eq!(sections.str_of("symbol"), ".");
+        assert_eq!(sections.get("lich").unwrap().str_of("path"), "/usr/bin/ruby");
+        // Whole numbers stay integral on the way out, as the original wrote
+        // them, and nested tables are indented two spaces.
+        let written = to_json(&v);
+        assert!(written.contains("\"schema_version\": 1"), "{written}");
+        assert!(written.contains("\n  \"sections\": {"), "{written}");
+        assert_eq!(parse_json(&written).unwrap(), v);
     }
 
     #[test]

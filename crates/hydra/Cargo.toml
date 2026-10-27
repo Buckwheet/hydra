@@ -34,6 +34,10 @@ hydra_lich = { path = "../hydra_lich" }
 # (`0x10021b8d`) called.
 hydra_net = { path = "../hydra_net" }
 hydra_table = { path = "../hydra_table" }
+# Phase 7: `hydra import` groups the recordings with `hydra_import::sessions`
+# and records each one through `hydra_ledger::Ledger::note_import`.
+hydra_import = { path = "../hydra_import" }
+hydra_ledger = { path = "../hydra_ledger" }
 tokio = { workspace = true }
 # `hydra::gui::run` (`0x1001103f4`, 9716 bytes) is the eframe boundary: the
 # recovered `hydra_gui::app::run` builds the "Hydra" window (660 × 520, "hub",

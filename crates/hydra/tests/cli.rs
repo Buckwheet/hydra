@@ -238,13 +238,13 @@ fn the_unwired_subcommands_say_what_they_still_need() {
     // `serve` are wired since Phase 3 (the Lich side); they are covered by
     // `play_and_serve_say_that_lich_is_off` and `tests/lich_relay.rs`.  `login`
     // is wired since Phase 6 (the real game login) and is covered end to end by
-    // `tests/login.rs`, so it is no longer in this list.
-    for args in [&[][..], &["import", "x.bytes"][..], &["lookout", "seed"][..]] {
-        let output = run(args);
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        let err = stderr(&output);
-        assert!(err.contains("not wired up in this headless phase"), "{args:?}: {err}");
-    }
+    // `tests/login.rs`, so it is no longer in this list.  `import` and
+    // `lookout seed` are wired since Phase 7 and are covered end to end by
+    // `tests/import_lookout.rs`; the bare hub is the only report left.
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("not wired up in this headless phase"), "{err}");
 }
 
 #[test]

@@ -60,7 +60,9 @@
 #![allow(dead_code)]
 
 mod cli;
+mod import;
 mod lich;
+mod lookout;
 mod login;
 mod render;
 mod replay;
@@ -163,10 +165,17 @@ fn run(command: &Command) -> Option<String> {
                 Err(err) => Some(format!("{label}: {err}")),
             }
         }
+        // The ledger: `hydra_import::sessions` groups the recordings and every
+        // file's metadata goes through `hydra_ledger::Ledger::note_import`; the
+        // original's summary line is printed (§8).
+        Command::Import { paths } => import::import(paths).err(),
+        // `hydra lookout seed`: the player logs taught to the lookout, with the
+        // data folder locked so a running Hydra is detected (§8).
+        Command::LookoutSeed => lookout::seed().err(),
         // The bare hub reaches the same `gui::run` in the recovered dispatch
         // (`0x10021dd40`), but this headless phase keeps it reporting rather
         // than opening a window; only the explicit `gui` word launches.
-        Command::Hub | Command::Import { .. } | Command::LookoutSeed => Some(not_wired(command)),
+        Command::Hub => Some(not_wired(command)),
     }
 }
 
@@ -298,12 +307,14 @@ mod tests {
         // `login` and `play` are wired since Phase 6 (they log in for real):
         // `tests/login.rs` covers them, and `crate::login`'s own tests cover the
         // argument and roster half without a socket.
-        for command in [Command::Hub, Command::Import { paths: vec![] }, Command::LookoutSeed] {
-            let message = run(&command).expect("a message");
-            assert!(message.contains("not wired up in this headless phase"), "{message}");
-            assert!(message.contains("NOTES.md"), "{message}");
-        }
+        // `import` and `lookout seed` are wired since Phase 7; their own
+        // integration tests cover them, and the hub is the only report left.
+        let command = Command::Hub;
+        let message = run(&command).expect("a message");
+        assert!(message.contains("not wired up in this headless phase"), "{message}");
+        assert!(message.contains("NOTES.md"), "{message}");
         assert!(not_wired(&Command::Hub).contains("eframe"));
+        assert!(not_wired(&Command::Import { paths: vec![] }).contains("hydra_import"));
         assert!(not_wired(&Command::LookoutSeed).contains("hydra_table"));
         assert!(not_wired(&Command::Serve { args: vec![] }).contains("hydra_web"));
     }

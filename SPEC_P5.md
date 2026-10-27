@@ -3,7 +3,7 @@
 Ground truth: the ORIGINAL binary ~/Code/hydra-inspect/hydra runs locally. `hydra replay FILE --summary` prints a frame-kind
 histogram and `--text` prints readable text. Ours: `cargo build --offline --release -p hydra` gives target/release/hydra (same CLI).
 Fixtures: `find ~/evidence161 -type f` (real GemStone IV session recordings, about 2.3 MB each). On
-~/evidence161/xml/Mejora/2026-09-25_12-58-56.xml the original reports 49670 frames in about 35 kinds (CastTime, ClearContainer,
+one recording under ~/evidence161/xml/<character>/ the original reports 49670 frames in about 35 kinds (CastTime, ClearContainer,
 ClearDialogData, ClearStream, Compass, Component, Container, ContainerItem, ...) and ours reports only 7248 (text and prompt only).
 
 PRIVACY: these recordings are private character data and the repo is PUBLIC. Never copy fixture bytes or real names or text into the

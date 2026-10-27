@@ -51,7 +51,7 @@ use crate::runs::{Run, Runs};
 use crate::text::{self, entities};
 
 /// Maximum number of bytes buffered for a single line before it is emitted
-/// as a [`Frame::Raw`].  The binary used `0x40000`.
+/// as one `MalformedTag` frame.  The binary used `0x40000`.
 pub const MAX_LINE_BYTES: usize = 0x40000;
 
 /// The 15-byte prefix of a Lich client region; `wire::client_region` slices
@@ -1108,5 +1108,20 @@ mod tests {
         b.extend(grouped.push_bytes_lines(&wire[7..]).into_iter().flatten());
         b.extend(grouped.finish());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_over_long_line_is_one_malformed_tag_and_the_rest_is_dropped() {
+        let mut parser = Parser::new();
+        let mut data = vec![b'x'; MAX_LINE_BYTES + 1];
+        data.extend_from_slice(b"tail\nnext\n");
+        let lines = parser.push_bytes_lines(&data);
+        assert_eq!(lines.len(), 2, "the malformed line and the next line");
+        assert_eq!(
+            lines[0].iter().map(Frame::kind).collect::<Vec<_>>(),
+            vec!["MalformedTag"]
+        );
+        assert_eq!(plain(&lines[1]), vec!["next"]);
+        assert!(parser.finish().is_empty());
     }
 }

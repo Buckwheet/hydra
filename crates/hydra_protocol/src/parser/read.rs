@@ -4,10 +4,10 @@
 //!   * `push_bytes` at `0x101c1a288` (1028 bytes), `finish` at `0x101c1a68c`.
 //!   * Bytes are split on `\n`; every completed line is decoded (valid UTF-8,
 //!     or byte-to-`char` fallback) and handed to [`Parser::parse_line`].
-//!   * A line longer than `0x40000` bytes is emitted as a [`Frame::Raw`] and
+//!   * A line longer than `0x40000` bytes is emitted as one `MalformedTag`
+//!     frame (the reference build's frame tag `0x8000_0000_0000_0039`) and
 //!     the rest of that line is discarded (the skip flag at `Parser + 0x168`;
-//!     the check is `len >= 0x40000` *before* appending, so the emitted line
-//!     is `0x40001` bytes long).
+//!     the check triggers once the buffered line exceeds `0x40000` bytes).
 //!   * Inside a `<settings ...>` block the bytes never reach the line buffer.
 //!     `push_bytes` keeps a rolling window of the last 11 bytes (the
 //!     `Vec<u8>` at `Parser + 0x60`) and waits for `</settings>`; seeing it
@@ -99,12 +99,11 @@ impl Parser {
 
             self.buffer.push(byte);
             if self.buffer.len() > MAX_LINE_BYTES {
-                let data = std::mem::take(&mut self.buffer);
-                let line = decode_wire_line(&data);
-                // `// UNKNOWN:` the binary emitted a frame here whose tag word
-                // is `0x8000_0000_0000_0039`, i.e. a raw frame; whether a
-                // settings block was active at this point is not visible.
-                frames.push(Frame::Raw(line.trim_end_matches('\r').to_string()));
+                // The reference build's frame tag `0x8000_0000_0000_0039`
+                // is `MalformedTag` (the over-long line itself is not kept).
+                self.buffer.clear();
+                frames.push(Frame::event("MalformedTag"));
+                lines.push(std::mem::take(&mut frames));
                 self.skip_until_newline = true;
             }
         }

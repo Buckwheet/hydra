@@ -204,7 +204,7 @@ read entry by entry. Field *names* are the literals passed to
 
 | symbol | addr | status | notes |
 |---|---|---|---|
-| `ways_out_of` | `0x1015b28cc` | **partly** | `fn ways_out_of(&Map, RoomId) -> Vec<WayOut>`: `Map::room` then the exit vector at `+0xc8`/`+0xd0` (stride 0xb8); each exit's word is trimmed and folded into a `BTreeMap` (so `Vec` order = word order, duplicates collapse); an unknown room returns the empty `Vec` niche. The `"east"`/`"west"` comparisons (`0x7473_6165` / `| 0x412`) are recovered literals but their role is not. |
+| `ways_out_of` | `0x1015b28cc` | **partly** | `fn ways_out_of(&Map, RoomId) -> Vec<WayOut>`: `Map::room` then the exit vector at `+0xc8`/`+0xd0` (stride 0xb8). Each exit's word is lower-cased (the vectorised `to_ascii_lowercase` at `0x1015b29e8`) and compared against the compass words (`"east"`/`"west"` folded into one immediate by the `| 0x412` trick at `0x1015b2940`; `"north"`/`"south"`/`"northwest"`/`"up"` at `0x1015b2ca4`..`0x1015b2cd4`), but the entry is *named after the place it leads to*: `Map::room(exit.to)` (`0x1015b2d60`), the first area-path element trimmed of `[`/`]` (`0x1015b2d80`), or `format!("room {}", to)` when the map cannot name it (`0x103e23ae3`). A `BTreeMap` de-duplicates by that name and orders by it; an unknown room returns the empty `Vec` niche. UNKNOWN: what the compass-word comparisons select. |
 | `room_of` | `0x1015b3304` | **partly** | four arguments `(map, state, hint, generation)`; builds a 0x60-byte record from the room number (parsed with the shared decimal reader), `title_from_subtitle`, the `"room exits"` component (a 10-byte name at `0x10245becc`) and two styled strings, then calls `cena_map::Map::locate`. The hint/`generation` interplay is recovered from `Follower::view`'s `csinc` chain. |
 | `Follower::view` | `0x1015b3690` | **partly** | `Follower`'s cache is `{discriminant @0x78, generation @0x7c, room @0x80}`; the body re-places the walker when the counter (`state + 0x1340`) moved, then calls `scene_of`, `progress`, `Navigator::fix`, `Heading::named` and `next_door` and packages a `MinimapView`. The drawing half is a UI seam; this build returns the placement, the ways out and the area. |
 | `Follower::ways_out` | `0x1015b3fb4` | **full** | `cmp w9, #1` on the discriminant; a placed walker gives `ways_out_of(map, room)`, an unplaced one the empty `Vec` niche. |
@@ -311,9 +311,11 @@ read entry by entry. Field *names* are the literals passed to
    `next_door`; the fields carried here are the ones the plumbing demonstrably
    has (the `'@'`-split place name, the room and cell, the heading).
 8. **`room::found`'s predicate and third argument.** See the table.
-9. **`ways_out_of`'s `"east"`/`"west"` special case.** Two literals are compared
-   (`0x7473_6165` and that value with `0x412` or-ed in) but the branch they feed
-   was not reconstructed.
+9. **`ways_out_of`'s compass-word comparisons.** The exit word is lower-cased
+   and compared against `"east"`/`"west"`/`"north"`/`"south"`/`"northwest"`/`"up"`
+   but what the result selects (probably "a plain exit is named after the
+   neighbouring area") was not reconstructed; the place naming itself is
+   recovered and used.
 10. **`Navigator::fix`'s state byte.** `1`, `2`, `3` and `4` all appear as writes;
     which case means what is not recoverable, so only `4` (= unfixed) is named.
 11. **`Atlas::work`'s name table.** The worker binary-searches a sorted table of
@@ -322,6 +324,13 @@ read entry by entry. Field *names* are the literals passed to
     reach.
 12. **`atlas::LIVE`'s exact type.** `held` is a bare 8-byte load, so `AtomicUsize`
     with a relaxed load is a rendering choice, not an observation.
+13. **`hydra_travel` duplicates a slice of this crate.** That crate's
+    `route::here` is a four-byte tail call to `hydra_map::follow::room_of`
+    (`0x1015b3304`), but it was recovered while `hydra_map` was still a stub and
+    therefore carries its own `map` module and a `room_of(map, state)` with two
+    arguments. This crate's `room_of` takes the four the binary takes (plus a
+    [`follow::Standing`] instead of a `GameState`). Nothing in `hydra_travel` was
+    changed — unifying the two is a follow-up, not part of this recovery.
 
 ---
 
@@ -353,9 +362,11 @@ values:
 * `course` (5) — `runs_true` across a 3×3 block, a straight run, a diagonal run, a
   held heading forcing the first move and then coming about, and the
   unreachable-destination cases.
-* `follow` (3) — ways out trimmed/deduped/ordered with the price and condition
-  kept, `room_of`'s hint-versus-generation rule, and a `Follower` placing the
-  walker, listing the ways out and clearing the placement when the room is lost.
+* `follow` (3) — ways out named after the target's area (brackets trimmed) or
+  `room <id>`, de-duplicated by that name and ordered by it, with the word
+  trimmed/lower-cased and the price and condition kept; `room_of`'s
+  hint-versus-generation rule; and a `Follower` placing the walker, listing the
+  ways out and clearing the placement when the room is lost.
 * `room` (4) — search by number (`u`-prefixed) and by word, the bracket-trimmed
   path, both `described` shapes line for line, and the shared decimal reader.
 * `sailing` (3) — the fix by pier title, the failure path resetting the state

@@ -9,13 +9,25 @@ use crate::cena::{title_from_subtitle, Located, Map, RoomId};
 /// One way out of a room.
 ///
 /// `ways_out_of` walks the room's exits (`+0xc8`/`+0xd0`, element size `0xb8`),
-/// folds each exit's condition text with `trim_matches`, compares the resulting
-/// word against `"east"`/`"west"` (`0x7473_6165` and that value with `0x412`
-/// or-ed in, at `0x1015b2930`) and inserts what survives into a `BTreeMap` — so
-/// the answer is de-duplicated by word and ordered by it.
+/// lower-cases each exit's word (the vectorised `to_ascii_lowercase` at
+/// `0x1015b29e8`..`0x1015b2a08`) and compares it against the compass words —
+/// `"east"`/`"west"` are folded into one immediate with the `| 0x412` trick at
+/// `0x1015b2930`..`0x1015b2940`, and `"north"`/`"south"`/`"northwest"`/`"up"`
+/// follow at `0x1015b2ca4`..`0x1015b2cd4`.
+///
+/// What the entry is *named* after is the place it leads to, not the word: the
+/// body calls `Map::room(exit.to)` (`0x1015b2d60`), takes the first element of
+/// that room's area-path vector and trims `[`/`]` off it
+/// (`0x1015b2d80`, the same `['[', ']']` pattern `room::found` uses), and when
+/// the room or its path is missing it formats `"room {}"` instead
+/// (`0x103e23ae3`: `05 "room " c0`). The results go into a `BTreeMap`, so the
+/// answer is de-duplicated by name and ordered by it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WayOut {
-    /// The word or command the game accepts.
+    /// The place the exit leads to: the target room's outermost area path with
+    /// its brackets trimmed, or `room <id>` when the map cannot name it.
+    pub place: String,
+    /// The word or command the game accepts, trimmed and lower-cased.
     pub word: String,
     /// Where it leads, as a map room id.
     pub to: RoomId,
@@ -35,11 +47,17 @@ pub fn ways_out_of(map: &Map, id: RoomId) -> Vec<WayOut> {
     };
     let mut out = std::collections::BTreeMap::new();
     for exit in &room.exits {
-        let word = exit.word.trim().to_string();
-        if word.is_empty() {
-            continue;
-        }
-        out.entry(word.clone()).or_insert_with(|| WayOut {
+        let word = exit.word.trim().to_lowercase();
+        let place = match map
+            .room(exit.to)
+            .and_then(|r| r.areas.first())
+            .map(|a| a.trim_matches(['[', ']']).to_string())
+        {
+            Some(area) if !area.is_empty() => area,
+            _ => format!("room {}", exit.to),
+        };
+        out.entry(place.clone()).or_insert_with(|| WayOut {
+            place,
             word,
             to: exit.to,
             price: exit.price,
@@ -203,7 +221,7 @@ mod tests {
                 id: 7116001,
                 title: "Sleeping Drake Harbor".into(),
                 note: Some("Pier One".into()),
-                areas: vec!["North Blue".into()],
+                areas: vec!["[North Blue]".into()],
                 exits: vec![
                     Exit {
                         word: "north".into(),
@@ -229,19 +247,30 @@ mod tests {
             Room {
                 id: 7116224,
                 title: "The Tenebrous Cauldron".into(),
+                areas: vec!["[North Blue]".into()],
                 ..Default::default()
             },
         ])
     }
 
     #[test]
-    fn ways_out_are_trimmed_deduped_and_ordered() {
+    fn ways_out_are_named_after_the_place_and_deduped() {
         let w = ways_out_of(&map(), 7116001);
-        let words: Vec<&str> = w.iter().map(|x| x.word.as_str()).collect();
-        assert_eq!(words, vec!["go gate", "north"]);
-        assert_eq!(w[0].price, Some(10));
-        assert_eq!(w[0].when.as_deref(), Some("daytime"));
-        assert_eq!(w[1].to, 7116224, "the first exit with that word wins");
+        let places: Vec<&str> = w.iter().map(|x| x.place.as_str()).collect();
+        // The two exits that both lead to 7116224 collapse into one entry, named
+        // after that room's area; 7116226 is not in the map, so its exit is
+        // named after the room instead.
+        assert_eq!(
+            places,
+            vec!["North Blue", "room 7116225", "room 7116226"]
+        );
+        let gate = w.iter().find(|x| x.word == "go gate").unwrap();
+        assert_eq!(gate.place, "room 7116226");
+        assert_eq!(gate.price, Some(10));
+        assert_eq!(gate.when.as_deref(), Some("daytime"));
+        // The word is trimmed and lower-cased, so both northern exits carry the
+        // same word but stay separate entries because they lead elsewhere.
+        assert_eq!(w.iter().filter(|x| x.word == "north").count(), 2);
         assert!(ways_out_of(&map(), 1).is_empty());
     }
 
@@ -269,9 +298,11 @@ mod tests {
             &Standing::new("Sleeping Drake Harbor, Pier One", None, None, 1),
         );
         assert_eq!(view.at, Where::In(7116001));
-        assert_eq!(view.area.as_deref(), Some("North Blue"));
-        assert_eq!(view.ways_out.len(), 2);
-        assert_eq!(f.ways_out(&m).len(), 2);
+        // `View::area` is the raw innermost area name; only `ways_out_of` trims
+        // the brackets off, the way the binary does.
+        assert_eq!(view.area.as_deref(), Some("[North Blue]"));
+        assert_eq!(view.ways_out.len(), 3);
+        assert_eq!(f.ways_out(&m).len(), 3);
         // Losing the room clears the placement.
         let lost = f.view(&m, &Standing::new("Somewhere Else", None, None, 2));
         assert_eq!(lost.at, Where::Unknown);

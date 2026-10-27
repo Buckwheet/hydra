@@ -16,8 +16,15 @@
 //! and 0x18, `Vec<ListedFile>` at 0x30 with a 0x38-byte stride, the `bool` last
 //! at 0x48) and `drop_in_place<ListedFile>` @0x1010b0660 (Strings at 0x00 and
 //! 0x18, `size` at 0x30).
+//!
+//! **Phase 1 reconnection.**  The two structs are again `serde` derives — which
+//! is where the string table above comes from — `listed` is
+//! `serde_json::from_str::<Vec<Listed>>` (the recovered `from_trait` @0x1010a0f70)
+//! and [`Version`] is a newtype over `semver::Version` 1.0.28, so the recovered
+//! comparison chain (`major`, `minor`, `patch`, `Prerelease`, then
+//! `BuildMetadata`) is the crate's own `Ord` again instead of a reproduction.
 
-use crate::json::{self, Json};
+use serde::{Deserialize, Serialize};
 
 /// The checksum list the release publishes beside the archive (14 bytes,
 /// compared word-for-word in `newest::{{closure}}` at 0x1010aead0).
@@ -29,7 +36,12 @@ pub const SUMS_SIG: &str = "SHA256SUMS.txt.minisig";
 
 /// One entry of `GET /releases` — only the four fields Hydra reads; every other
 /// key GitHub sends is ignored, as `serde`'s derive does by default.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Fields are declared in the derive's order (the order the binary's
+/// `expecting`/string table lists them), which is also the order they are
+/// serialized in.  Nothing carries `#[serde(default)]`, so each one is
+/// **required** — a release without `draft` is an error, not a `false`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listed {
     pub tag_name: String,
     pub draft: bool,
@@ -38,7 +50,7 @@ pub struct Listed {
 }
 
 /// One downloadable asset of a release.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ListedFile {
     pub name: String,
     pub browser_download_url: String,
@@ -71,80 +83,36 @@ pub struct Offer {
     pub version: Version,
 }
 
-/// The subset of `semver::Version` this crate needs.
+/// `semver::Version` (1.0.28), which is what the binary parsed release tags
+/// with.
 ///
-/// `newest` parses the release tag and compares it with the running version
-/// through `semver::Version`'s `PartialOrd` (the four inlined comparisons at
-/// 0x1010ae16c–0x1010ae1cc: major, minor, patch, then
-/// `Prerelease::partial_cmp`, then `BuildMetadata::partial_cmp`), so the
-/// ordering here follows semver 1.x: `pre` empty sorts *above* any pre-release,
-/// and `build` is compared last as text.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Version {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
-    /// The `-alpha.1` part, without the dash.
-    pub pre: String,
-    /// The `+sha.abc` part, without the plus.
-    pub build: String,
-}
+/// `newest` compares the release tag with the running version through
+/// `semver::Version`'s ordering (the four inlined comparisons at
+/// 0x1010ae16c–0x1010ae1cc: major, minor, patch, then `Prerelease`, then
+/// `BuildMetadata`), which is exactly what `semver::Version`'s derived `Ord`
+/// does — the fields are compared in declaration order with the two
+/// `Identifier`s' own comparisons.  The newtype keeps the recovered path
+/// (`release::Version`) and the recovered `as_str` while leaving the parsing
+/// and the ordering to the real crate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version(semver::Version);
 
 impl Version {
     /// `semver::Version::parse`.  The binary's call site
     /// (`hydra::update::keep` @0x10009e744) parses `"0.1.0-beta.7"`.
+    ///
+    /// The error text is `semver`'s own (`"unexpected character 'v' while
+    /// parsing major version number"`); the hand-rolled parser had its own
+    /// wording, which said the same thing less precisely.
     pub fn parse(text: &str) -> Result<Version, String> {
-        if text.contains(char::is_whitespace) {
-            return Err(bad(text, "whitespace"));
-        }
-        let (rest, build) = match text.split_once('+') {
-            Some((head, build)) => (head, Some(build)),
-            None => (text, None),
-        };
-        let (rest, pre) = match rest.split_once('-') {
-            Some((head, pre)) => (head, Some(pre)),
-            None => (rest, None),
-        };
-        let mut numbers = rest.split('.');
-        let major = numbers.next().ok_or_else(|| bad(text, "empty version"))?;
-        let minor = numbers
-            .next()
-            .ok_or_else(|| bad(text, "missing minor version"))?;
-        let patch = numbers
-            .next()
-            .ok_or_else(|| bad(text, "missing patch version"))?;
-        if numbers.next().is_some() {
-            return Err(bad(text, "unexpected fourth number"));
-        }
-        let numeric = |part: &str| -> Result<u64, String> {
-            if part.is_empty() {
-                return Err(bad(text, "empty number"));
-            }
-            if part.len() > 1 && part.starts_with('0') {
-                return Err(bad(text, "leading zero in a number"));
-            }
-            part.parse::<u64>().map_err(|_| bad(text, "invalid number"))
-        };
-        let major = numeric(major)?;
-        let minor = numeric(minor)?;
-        let patch = numeric(patch)?;
-        if let Some(pre) = pre {
-            for identifier in pre.split('.') {
-                check_identifier(text, identifier, false)?;
-            }
-        }
-        if let Some(build) = build {
-            for identifier in build.split('.') {
-                check_identifier(text, identifier, true)?;
-            }
-        }
-        Ok(Version {
-            major,
-            minor,
-            patch,
-            pre: pre.unwrap_or_default().to_string(),
-            build: build.unwrap_or_default().to_string(),
-        })
+        semver::Version::parse(text)
+            .map(Version)
+            .map_err(|e| e.to_string())
+    }
+
+    /// A version with no pre-release and no build metadata.
+    pub fn new(major: u64, minor: u64, patch: u64) -> Version {
+        Version(semver::Version::new(major, minor, patch))
     }
 
     /// The text minisign's trusted comment is compared with: `newest`'s caller
@@ -152,175 +120,56 @@ impl Version {
     pub fn as_str(&self) -> String {
         self.to_string()
     }
+
+    /// The `semver` value underneath.
+    pub fn semver(&self) -> &semver::Version {
+        &self.0
+    }
 }
 
-fn bad(text: &str, why: &str) -> String {
-    format!("unexpected character in version {text:?}: {why}")
-}
-
-fn check_identifier(text: &str, identifier: &str, build: bool) -> Result<(), String> {
-    if identifier.is_empty() {
-        return Err(bad(text, "empty identifier"));
+impl Default for Version {
+    fn default() -> Self {
+        Version::new(0, 0, 0)
     }
-    if !identifier
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(bad(text, "invalid character in an identifier"));
-    }
-    let numeric = identifier.bytes().all(|b| b.is_ascii_digit());
-    if numeric && !build && identifier.len() > 1 && identifier.starts_with('0') {
-        return Err(bad(text, "leading zero in a numeric identifier"));
-    }
-    Ok(())
 }
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if !self.pre.is_empty() {
-            write!(f, "-{}", self.pre)?;
-        }
-        if !self.build.is_empty() {
-            write!(f, "+{}", self.build)?;
-        }
-        Ok(())
+        std::fmt::Display::fmt(&self.0, f)
     }
 }
 
-impl PartialOrd for Version {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+/// Field access onto `semver::Version` (`version.major`, `version.pre`,
+/// `version.build`), which is what the hand-written struct's public fields gave
+/// the rest of the crate.
+impl std::ops::Deref for Version {
+    type Target = semver::Version;
+
+    fn deref(&self) -> &semver::Version {
+        &self.0
     }
 }
 
-impl Ord for Version {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.major
-            .cmp(&other.major)
-            .then_with(|| self.minor.cmp(&other.minor))
-            .then_with(|| self.patch.cmp(&other.patch))
-            .then_with(|| compare_prerelease(&self.pre, &other.pre))
-            // semver 1.x compares the build metadata last, as text.
-            .then_with(|| self.build.cmp(&other.build))
+impl From<semver::Version> for Version {
+    fn from(version: semver::Version) -> Version {
+        Version(version)
     }
 }
 
-/// `Prerelease`'s ordering: no pre-release is greater than any pre-release,
-/// dot-separated identifiers compare numeric-to-numeric numerically and
-/// otherwise as text, a numeric identifier sorts below an alphanumeric one, and
-/// a shorter run that is a prefix of another sorts first.
-fn compare_prerelease(left: &str, right: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (left.is_empty(), right.is_empty()) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Greater,
-        (false, true) => return Ordering::Less,
-        (false, false) => {}
-    }
-    let mut left = left.split('.');
-    let mut right = right.split('.');
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(a), Some(b)) => {
-                let a_numeric = a.bytes().all(|c| c.is_ascii_digit());
-                let b_numeric = b.bytes().all(|c| c.is_ascii_digit());
-                let ordering = match (a_numeric, b_numeric) {
-                    (true, true) => match (a.parse::<u64>(), b.parse::<u64>()) {
-                        (Ok(a), Ok(b)) => a.cmp(&b),
-                        _ => a.cmp(b),
-                    },
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    (false, false) => a.cmp(b),
-                };
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-        }
+impl From<Version> for semver::Version {
+    fn from(version: Version) -> semver::Version {
+        version.0
     }
 }
 
 /// Read `Vec<Listed>` out of the releases document.
 ///
-/// `serde`'s derive requires every field of `Listed`/`ListedFile` to be
-/// present (neither carries `#[serde(default)]`), so a missing key is an error
-/// here too; the message mimics `serde`'s.
+/// `serde_json::from_str::<Vec<Listed>>` — the recovered
+/// `serde_json::de::from_trait` — so every field of `Listed`/`ListedFile` is
+/// required and a missing or mistyped one is `serde`'s own error
+/// (`"missing field `draft` at line 1 column 20"`).
 pub fn listed(text: &str) -> Result<Vec<Listed>, String> {
-    let root = json::parse(text)?;
-    let items = root
-        .as_array()
-        .ok_or_else(|| format!("invalid type: {}, expected a sequence", root.kind()))?;
-    items.iter().map(listed_one).collect()
-}
-
-fn listed_one(value: &Json) -> Result<Listed, String> {
-    let object = match value {
-        Json::Object(_) => value,
-        other => {
-            return Err(format!(
-                "invalid type: {}, expected struct Listed",
-                other.kind()
-            ))
-        }
-    };
-    // Fields are taken in declaration order, as the derive's `visit_map` does,
-    // so the first problem reported is the one `serde` would report.
-    let tag_name = string_field(object, "tag_name")?;
-    let draft = object
-        .get("draft")
-        .ok_or_else(|| "missing field `draft`".to_string())?
-        .as_bool()
-        .ok_or_else(|| "invalid type: expected a boolean for `draft`".to_string())?;
-    let html_url = string_field(object, "html_url")?;
-    let assets = object
-        .get("assets")
-        .ok_or_else(|| "missing field `assets`".to_string())?;
-    let assets = assets
-        .as_array()
-        .ok_or_else(|| format!("invalid type: {}, expected a sequence", assets.kind()))?;
-    Ok(Listed {
-        tag_name,
-        draft,
-        html_url,
-        assets: assets.iter().map(listed_file).collect::<Result<_, _>>()?,
-    })
-}
-
-fn listed_file(value: &Json) -> Result<ListedFile, String> {
-    let object = match value {
-        Json::Object(_) => value,
-        other => {
-            return Err(format!(
-                "invalid type: {}, expected struct ListedFile",
-                other.kind()
-            ))
-        }
-    };
-    let size = object
-        .get("size")
-        .ok_or_else(|| "missing field `size`".to_string())?;
-    Ok(ListedFile {
-        name: string_field(object, "name")?,
-        browser_download_url: string_field(object, "browser_download_url")?,
-        size: size
-            .as_u64()
-            .ok_or_else(|| format!("invalid type: {}, expected u64", size.kind()))?,
-    })
-}
-
-fn string_field(object: &Json, key: &str) -> Result<String, String> {
-    let value = object
-        .get(key)
-        .ok_or_else(|| format!("missing field `{key}`"))?;
-    value
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("invalid type: {}, expected a string for `{key}`", value.kind()))
+    serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
 /// Pick the newest release to install, or `None` when every release is older
@@ -533,6 +382,69 @@ mod tests {
         );
         let error = newest(r#"[{"tag_name": "v1.0.0"}]"#, &running(), "x").unwrap_err();
         assert!(error.contains("missing field `draft`"), "{error}");
+        // `serde` says where, which the hand-written reader also tried to.
+        assert!(error.contains("line 1 column"), "{error}");
+    }
+
+    /// The two documents `serde` reads are the recovered schema: the four (and
+    /// three) field names, in the recovered order, and all of them required.
+    #[test]
+    fn the_schema_is_the_recovered_one() {
+        let one = Listed {
+            tag_name: "v0.1.0-beta.8".to_string(),
+            draft: false,
+            html_url: "https://example.invalid/r".to_string(),
+            assets: vec![ListedFile {
+                name: "hydra-arm64".to_string(),
+                browser_download_url: "https://example.invalid/dl/hydra-arm64".to_string(),
+                size: 42,
+            }],
+        };
+        let text = serde_json::to_string(&one).expect("writes");
+        assert_eq!(
+            text,
+            "{\"tag_name\":\"v0.1.0-beta.8\",\"draft\":false,\
+             \"html_url\":\"https://example.invalid/r\",\"assets\":[{\"name\":\"hydra-arm64\",\
+             \"browser_download_url\":\"https://example.invalid/dl/hydra-arm64\",\"size\":42}]}"
+        );
+        // Round trip: what is written is what is read.
+        let back: Vec<Listed> = serde_json::from_str(&format!("[{text}]")).expect("reads");
+        assert_eq!(back, vec![one]);
+
+        // Every field is required — no `#[serde(default)]` anywhere.
+        for missing in ["tag_name", "draft", "html_url", "assets"] {
+            let document = match missing {
+                "tag_name" => r#"[{"draft":false,"html_url":"u","assets":[]}]"#,
+                "draft" => r#"[{"tag_name":"v1.0.0","html_url":"u","assets":[]}]"#,
+                "html_url" => r#"[{"tag_name":"v1.0.0","draft":false,"assets":[]}]"#,
+                _ => r#"[{"tag_name":"v1.0.0","draft":false,"html_url":"u"}]"#,
+            };
+            let error = listed(document).unwrap_err();
+            assert_eq!(
+                error.split(" at line").next().unwrap(),
+                format!("missing field `{missing}`"),
+                "{document}"
+            );
+        }
+        for missing in ["name", "browser_download_url", "size"] {
+            let document = match missing {
+                "name" => r#"[{"tag_name":"v1.0.0","draft":false,"html_url":"u",
+                    "assets":[{"browser_download_url":"u","size":1}]}]"#,
+                "browser_download_url" => r#"[{"tag_name":"v1.0.0","draft":false,"html_url":"u",
+                    "assets":[{"name":"n","size":1}]}]"#,
+                _ => r#"[{"tag_name":"v1.0.0","draft":false,"html_url":"u",
+                    "assets":[{"name":"n","browser_download_url":"u"}]}]"#,
+            };
+            let error = listed(document).unwrap_err();
+            assert!(
+                error.contains(&format!("missing field `{missing}`")),
+                "{document}: {error}"
+            );
+        }
+        // A mistyped field is refused too, rather than coerced.
+        let error = listed(r#"[{"tag_name":"v1.0.0","draft":"no","html_url":"u","assets":[]}]"#)
+            .unwrap_err();
+        assert!(error.contains("invalid type"), "{error}");
     }
 
     #[test]
@@ -549,19 +461,67 @@ mod tests {
         // A shorter run that is a prefix sorts first.
         assert!(parse("1.0.0-alpha") < parse("1.0.0-alpha.1"));
         assert_eq!(parse("1.0.0+build.2"), parse("1.0.0+build.2"));
-        // Build metadata is compared last, as text (semver 1.x).
-        assert!(parse("1.0.0+build.10") < parse("1.0.0+build.9"));
+        // Build metadata is compared last, by `semver`'s `BuildMetadata`
+        // ordering: dot-separated identifiers, numeric ones numerically.
+        // (The hand-written stand-in compared the whole string as text, which
+        // is why this line used to assert the opposite.)
+        assert!(parse("1.0.0+build.9") < parse("1.0.0+build.10"));
+        assert!(parse("1.0.0+build") < parse("1.0.0+build.1"));
+    }
+
+    /// The recovered chain — major, minor, patch, pre-release, build — is
+    /// `semver::Version`'s own, so the newtype must agree with it on every
+    /// pair.
+    #[test]
+    fn version_ordering_agrees_with_semver() {
+        let order = [
+            "0.1.0-beta.6",
+            "0.1.0-beta.7",
+            "0.1.0-beta.10",
+            "0.1.0-beta.10+build.1",
+            "0.1.0",
+            "0.1.0+build.1",
+            "0.1.1",
+            "0.2.0-alpha",
+            "0.2.0",
+            "1.0.0",
+        ];
+        let ours: Vec<Version> = order.iter().map(|s| Version::parse(s).unwrap()).collect();
+        for (i, left) in ours.iter().enumerate() {
+            for (j, right) in ours.iter().enumerate() {
+                let expected = order[i]
+                    .parse::<semver::Version>()
+                    .unwrap()
+                    .cmp(&order[j].parse::<semver::Version>().unwrap());
+                assert_eq!(left.cmp(right), expected, "{} vs {}", order[i], order[j]);
+                assert_eq!(left.partial_cmp(right), Some(expected));
+            }
+        }
+        // And the running version comes out where `newest` expects it.
+        let running = Version::parse(RUNNING).unwrap();
+        assert!(Version::parse("0.1.0-beta.6").unwrap() < running);
+        assert!(Version::parse("0.1.0-beta.8").unwrap() > running);
     }
 
     #[test]
     fn parses_the_running_version() {
         let version = Version::parse("0.1.0-beta.7").unwrap();
         assert_eq!((version.major, version.minor, version.patch), (0, 1, 0));
-        assert_eq!(version.pre, "beta.7");
-        assert_eq!(version.build, "");
+        assert_eq!(version.pre.as_str(), "beta.7");
+        assert_eq!(version.build.as_str(), "");
         assert_eq!(version.to_string(), "0.1.0-beta.7");
-        assert_eq!(Version::parse("2.10.3+sha.abc").unwrap().build, "sha.abc");
-        assert_eq!(Version::parse("1.0.0").unwrap().pre, "");
+        assert_eq!(version.as_str(), "0.1.0-beta.7");
+        assert_eq!(Version::parse("2.10.3+sha.abc").unwrap().build.as_str(), "sha.abc");
+        assert_eq!(Version::parse("1.0.0").unwrap().pre.as_str(), "");
+        // The newtype and the crate agree, in both directions.
+        assert_eq!(version.semver(), &semver::Version::parse("0.1.0-beta.7").unwrap());
+        assert_eq!(
+            semver::Version::from(version.clone()),
+            semver::Version::parse("0.1.0-beta.7").unwrap()
+        );
+        assert_eq!(Version::from(semver::Version::new(1, 2, 3)).to_string(), "1.2.3");
+        assert_eq!(Version::default().to_string(), "0.0.0");
+        assert_eq!(Version::new(1, 2, 3).to_string(), "1.2.3");
     }
 
     #[test]
@@ -580,5 +540,8 @@ mod tests {
         ] {
             assert!(Version::parse(bad).is_err(), "{bad:?} should not parse");
         }
+        // The error is `semver`'s, not a stand-in's: it names the position.
+        let error = Version::parse("1.0").unwrap_err();
+        assert!(error.contains("unexpected end of input"), "{error}");
     }
 }

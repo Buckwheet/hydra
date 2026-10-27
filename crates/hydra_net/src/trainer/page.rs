@@ -5,6 +5,9 @@
 //! answers a goal submission with a fresh copy of itself.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use crate::trainer::goals::SkillGoals;
 
@@ -16,17 +19,25 @@ pub fn page_url(character: &str) -> String {
     format!("https://www.play.net/gs4/play/cm/{}", character)
 }
 
+/// One of the page's three recovered `var` patterns, built for `name`.
+///
+/// The original built the pattern from the skill name it was looking for
+/// (`regex::Regex::new(&format!(...))`), which is why `var skill` cannot match
+/// `var skills`: the literal name is followed by `\s*=`, and the `s` of
+/// `skills` is neither whitespace nor `=`.  The name is escaped so a caller
+/// cannot smuggle regex syntax into it.
+fn var_pattern(name: &str, tail: &str) -> Option<Regex> {
+    Regex::new(&format!(r"var\s+{}\s*=\s*{}", regex::escape(name), tail)).ok()
+}
+
 /// The value of a quoted `var NAME = "..."` declaration.
 ///
 /// Recovered from `0x101c3c7c8`: the page is searched with
 /// `var\s+NAME\s*=\s*"([^"]*)"\s*;` (0x103e7f26a).
 pub fn quoted_var<'a>(page: &'a str, name: &str) -> Option<&'a str> {
-    let at = find_var(page, name)?;
-    let rest = page[at..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+    let pattern = var_pattern(name, r#""([^"]*)"\s*;"#)?;
+    let captures = pattern.captures(page)?;
+    captures.get(1).map(|value| value.as_str())
 }
 
 /// The value of a `var NAME = -?123` declaration.
@@ -34,56 +45,31 @@ pub fn quoted_var<'a>(page: &'a str, name: &str) -> Option<&'a str> {
 /// Recovered from the same function: the page is searched with
 /// `var\s+NAME\s*=\s*(-?\d+)\s*;` (0x103e7f2ad).
 pub fn number_var(page: &str, name: &str) -> Option<i64> {
-    let at = find_var(page, name)?;
-    let rest = page[at..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    let pattern = var_pattern(name, r"(-?\d+)\s*;")?;
+    let captures = pattern.captures(page)?;
+    captures.get(1)?.as_str().parse().ok()
 }
 
 /// The numbers in a `var NAME = new Array(1, 2, 3)` declaration.
 ///
 /// Recovered from the same function: the page is searched with
-/// `var\s+NAME\s*=\s*new\s+Array\(([^)]*)\)` (0x103e7f2c9).
+/// `var\s+NAME\s*=\s*new\s+Array\(([^)]*)\)` (0x103e7f2c9).  The list is the
+/// pattern's own capture, split on `,`; an item that is not a number is
+/// dropped, as the original's `filter_map` did.
 pub fn array_var(page: &str, name: &str) -> Vec<i64> {
-    let at = match find_var(page, name) {
-        Some(at) => at,
-        None => return Vec::new(),
+    let Some(pattern) = var_pattern(name, r"new\s+Array\(([^)]*)\)") else {
+        return Vec::new();
     };
-    let rest = &page[at..];
-    let open = match rest.find('(') {
-        Some(open) => open + 1,
-        None => return Vec::new(),
+    let Some(captures) = pattern.captures(page) else {
+        return Vec::new();
     };
-    let close = match rest[open..].find(')') {
-        Some(close) => open + close,
-        None => return Vec::new(),
+    let Some(list) = captures.get(1) else {
+        return Vec::new();
     };
-    rest[open..close]
+    list.as_str()
         .split(',')
         .filter_map(|item| item.trim().parse().ok())
         .collect()
-}
-
-/// Where `var NAME` starts, past the whitespace the pattern allows.
-fn find_var(page: &str, name: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(at) = page[from..].find("var") {
-        let start = from + at;
-        let raw = &page[start + 3..];
-        let lead = raw.len() - raw.trim_start().len();
-        let after = raw.trim_start();
-        if let Some(rest) = after.strip_prefix(name) {
-            // `var skill` must not match `var skills`.
-            if !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                return Some(start + 3 + lead + name.len());
-            }
-        }
-        from = start + 3;
-    }
-    None
 }
 
 /// The form to submit for a set of skill goals.
@@ -147,30 +133,36 @@ pub fn read_page(page: &str) -> Result<SkillGoals, String> {
 ///
 /// Recovered from the literal `(?is)<b class="normS2">{}</b></td>\s*<td[^>]*><b
 /// class="normS1">([^<]+)</b>` (0x103e7f35e): the skill name sits in a `normS2`
-/// cell and its rank in the `normS1` cell that follows.
+/// cell and its rank in the `normS1` cell that follows.  The original filled
+/// the `{}` with the skill name it was asking about; this scan keeps the same
+/// pattern with a capture in place of the name so a page can be read whole.
+/// The `</td> … <td>` bridge is part of the recovered pattern, so a table that
+/// does not have it yields no rows (and so is refused by [`read_page`]).
 fn skill_rows(page: &str) -> Vec<(String, i64)> {
-    let mut rows = Vec::new();
-    let mut from = 0;
-    while let Some(at) = page[from..].find("class=\"normS2\">") {
-        let start = from + at + "class=\"normS2\">".len();
-        let name_end = match page[start..].find('<') {
-            Some(end) => start + end,
-            None => break,
-        };
-        let name = page[start..name_end].trim().to_string();
-        from = name_end;
-        if let Some(at) = page[from..].find("class=\"normS1\">") {
-            let rank_start = from + at + "class=\"normS1\">".len();
-            let rank_end = match page[rank_start..].find('<') {
-                Some(end) => rank_start + end,
-                None => break,
-            };
-            let rank = page[rank_start..rank_end].trim().parse().unwrap_or(0);
-            from = rank_end;
-            rows.push((name, rank));
-        }
-    }
-    rows
+    let Some(pattern) = skill_row_pattern() else {
+        return Vec::new();
+    };
+    pattern
+        .captures_iter(page)
+        .filter_map(|captures| {
+            let name = captures.get(1)?.as_str().trim();
+            let rank: i64 = captures.get(2)?.as_str().trim().parse().unwrap_or(0);
+            Some((name.to_string(), rank))
+        })
+        .collect()
+}
+
+/// The compiled skill-table pattern (0x103e7f35e), built once.
+fn skill_row_pattern() -> Option<&'static Regex> {
+    static PATTERN: OnceLock<Option<Regex>> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| {
+            Regex::new(
+                r#"(?is)<b class="normS2">([^<]+)</b></td>\s*<td[^>]*><b class="normS1">([^<]+)</b>"#,
+            )
+            .ok()
+        })
+        .as_ref()
 }
 
 /// True when submitting the form landed on a real page rather than an error.
@@ -209,6 +201,56 @@ mod tests {
         let page = "var skills = 5;\nvar skill = 3;";
         assert_eq!(number_var(page, "skill"), Some(3));
         assert_eq!(number_var(page, "skills"), Some(5));
+    }
+
+    #[test]
+    fn the_var_patterns_are_the_recovered_ones() {
+        // The trailing `;` is part of all three recovered patterns.
+        assert_eq!(quoted_var("var a = \"x\"", "a"), None);
+        assert_eq!(number_var("var a = 3", "a"), None);
+        assert_eq!(quoted_var("var a = \"x\";", "a"), Some("x"));
+
+        // `var\s+NAME\s*=\s*…`: any whitespace will do, and none will not.
+        assert_eq!(number_var("var\ta = 3;", "a"), Some(3));
+        assert_eq!(number_var("var\n  a   =   3 ;", "a"), Some(3));
+        assert_eq!(number_var("vara = 3;", "a"), None);
+        assert_eq!(array_var("var a=new Array(7);", "a"), vec![7]);
+
+        // A name with pattern syntax in it is escaped, not compiled.
+        assert_eq!(number_var("var a.b = 3;", "a.b"), Some(3));
+        assert_eq!(number_var("var axb = 3;", "a.b"), None);
+
+        // Signs, and an array whose items are not all numbers.
+        assert_eq!(number_var("var a = -12;", "a"), Some(-12));
+        assert!(array_var("var a = new Array();", "a").is_empty());
+        assert_eq!(array_var("var a = new Array( 4 ,x, 5 );", "a"), vec![4, 5]);
+
+        // The quoted value stops at the first closing quote, and the `;` must
+        // follow it at once: an escaped quote inside the value therefore ends
+        // the match without a `;`, so there is no match at all.
+        assert_eq!(quoted_var("var a = \"x \\\" y\";", "a"), None);
+        assert_eq!(quoted_var("var a = \"x y\";", "a"), Some("x y"));
+    }
+
+    #[test]
+    fn the_skill_table_needs_the_recovered_cell_bridge() {
+        // Name and rank in adjacent cells, as the recovered pattern reads them.
+        let page = "<b class=\"normS2\">Climbing</b></td>\n<td class=\"x\"><b class=\"normS1\">2</b>";
+        assert_eq!(read_page(page).unwrap().goal("Climbing"), Some(2));
+
+        // The same two cells without the `</td> … <td>` bridge are not a row.
+        let page = "<b class=\"normS2\">Climbing</b><b class=\"normS1\">2</b>";
+        assert_eq!(read_page(page).unwrap_err(), "the page has no skills");
+
+        // `(?is)`: the tags are matched case insensitively, and `.`-less classes
+        // still span the newline between the cells.
+        let page = "<B CLASS=\"NORMS2\">Climbing</B></td><td><B class=\"normS1\">3</B>";
+        assert_eq!(read_page(page).unwrap().goal("Climbing"), Some(3));
+
+        // A rank cell that is not a number is read as zero, as the recovered
+        // `unwrap_or` did.
+        let page = "<b class=\"normS2\">Climbing</b></td><td><b class=\"normS1\">n/a</b>";
+        assert_eq!(read_page(page).unwrap().goal("Climbing"), Some(0));
     }
 
     #[test]

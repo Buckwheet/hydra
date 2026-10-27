@@ -2,3 +2,13 @@
 name = "hydra_net"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+base64 = { workspace = true }
+jiff = { workspace = true }
+regex = { workspace = true }
+# No extra features: reqwest's `blocking` client needs `futures-io`, which is
+# not in this offline registry (see NOTES.md), so the HTTP helpers are async.
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }

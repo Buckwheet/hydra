@@ -3,6 +3,7 @@ pub mod behind;
 pub mod eaccess;
 pub mod eastern;
 pub mod gemstone;
+pub mod http;
 pub mod live;
 pub mod record;
 pub mod sink;

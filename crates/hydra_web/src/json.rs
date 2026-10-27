@@ -1,15 +1,24 @@
-//! A very small `std`-only JSON value, writer and parser.
+//! JSON documents: the recovered field order plus a `serde_json`-backed
+//! writer and parser.
 //!
-//! The original crate used `serde` + `serde_json`.  This module is the
-//! replacement: [`Value`] plus a deterministic writer (object keys are emitted
-//! in insertion order, exactly like `serde_json`'s `Map` does for the small
-//! structs this crate emits) and a strict-enough RFC 8259 parser.
+//! The original crate used `serde` + `serde_json`; that is what the wire types
+//! (`wire::Out`, `wire::In`, every leaf payload) now derive against.  This
+//! module keeps the small ordering-preserving [`Value`] the crate's `fields()`
+//! helpers build, so the *recovered serialization order* can be spelled out and
+//! asserted next to the serde derives.  Nothing here parses or escapes JSON by
+//! hand any more: [`parse`] is `serde_json::from_str`, [`write_str`] and
+//! [`Value::to_json`]/[`Value::write`] go through `serde_json`'s writer (which
+//! is why the escaping is exactly the escaping the original emitted).
 //!
-//! Everything the web page exchanges is built through this module so the wire
-//! contract recovered from the binary (`{"t":"...", ...}`) can be asserted in
-//! tests without pulling in a dependency.
+//! `Value` keeps object keys **in document/insertion order** — `serde_json`'s
+//! own `Map` is a `BTreeMap` without the `preserve_order` feature, which would
+//! sort the recovered field order away.
 
-/// A JSON value.
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+use std::fmt;
+
+/// A JSON value, with object keys in insertion order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
@@ -98,276 +107,128 @@ impl Value {
         }
     }
 
-    /// Render to JSON text.
+    /// Render to JSON text (`serde_json`'s writer).
     pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out);
-        out
+        serde_json::to_string(self).expect("a json::Value always serializes")
     }
 
     /// Append the JSON text to `out`.
     pub fn write(&self, out: &mut String) {
-        match self {
-            Value::Null => out.push_str("null"),
-            Value::Bool(true) => out.push_str("true"),
-            Value::Bool(false) => out.push_str("false"),
-            Value::Num(t) => out.push_str(t),
-            Value::Str(s) => write_str(s, out),
-            Value::Arr(xs) => {
-                out.push('[');
-                for (i, x) in xs.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    x.write(out);
-                }
-                out.push(']');
-            }
-            Value::Obj(pairs) => {
-                out.push('{');
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write_str(k, out);
-                    out.push(':');
-                    v.write(out);
-                }
-                out.push('}');
-            }
-        }
+        out.push_str(&self.to_json());
     }
 }
 
 /// Write a JSON string literal (`serde_json`'s escape set: `"` `\` and the
 /// control characters, `\uXXXX` for the rest below `0x20`).
 pub fn write_str(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    out.push_str(&serde_json::to_string(s).expect("a string always serializes"));
 }
 
-/// Parse JSON text.
+/// Parse JSON text (order preserving, via `serde_json`).
 pub fn parse(text: &str) -> Result<Value, String> {
-    let mut p = Parser {
-        bytes: text.as_bytes(),
-        text,
-        at: 0,
-    };
-    p.ws();
-    let v = p.value()?;
-    p.ws();
-    if p.at != p.bytes.len() {
-        return Err(format!("trailing characters at byte {}", p.at));
-    }
-    Ok(v)
+    serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
-struct Parser<'a> {
-    bytes: &'a [u8],
-    text: &'a str,
-    at: usize,
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::Null => s.serialize_unit(),
+            Value::Bool(b) => s.serialize_bool(*b),
+            // The text is re-read as a number so `serde_json` formats it; a
+            // whole number stays an integer, anything else becomes a float.
+            Value::Num(text) => {
+                if let Ok(n) = text.parse::<i64>() {
+                    s.serialize_i64(n)
+                } else if let Ok(n) = text.parse::<u64>() {
+                    s.serialize_u64(n)
+                } else if let Ok(n) = text.parse::<f64>() {
+                    s.serialize_f64(n)
+                } else {
+                    s.serialize_unit()
+                }
+            }
+            Value::Str(text) => s.serialize_str(text),
+            Value::Arr(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Value::Obj(pairs) => {
+                let mut map = s.serialize_map(Some(pairs.len()))?;
+                for (key, value) in pairs {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
-impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
     }
 
-    fn ws(&mut self) {
-        while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                self.at += 1;
-            } else {
-                break;
-            }
-        }
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
     }
 
-    fn expect(&mut self, b: u8) -> Result<(), String> {
-        if self.peek() == Some(b) {
-            self.at += 1;
-            Ok(())
-        } else {
-            Err(format!("expected `{}` at byte {}", b as char, self.at))
-        }
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
     }
 
-    fn value(&mut self) -> Result<Value, String> {
-        match self.peek() {
-            None => Err("unexpected end of input".to_string()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Value::Str(self.string()?)),
-            Some(b't') => self.literal("true", Value::Bool(true)),
-            Some(b'f') => self.literal("false", Value::Bool(false)),
-            Some(b'n') => self.literal("null", Value::Null),
-            Some(_) => self.number(),
-        }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
     }
 
-    fn literal(&mut self, word: &str, v: Value) -> Result<Value, String> {
-        if self.text[self.at..].starts_with(word) {
-            self.at += word.len();
-            Ok(v)
-        } else {
-            Err(format!("bad literal at byte {}", self.at))
-        }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::Num(v.to_string()))
     }
 
-    fn number(&mut self) -> Result<Value, String> {
-        let start = self.at;
-        if self.peek() == Some(b'-') {
-            self.at += 1;
-        }
-        while let Some(b) = self.peek() {
-            if b.is_ascii_digit() || b == b'.' || b == b'e' || b == b'E' || b == b'+' || b == b'-' {
-                self.at += 1;
-            } else {
-                break;
-            }
-        }
-        let text = &self.text[start..self.at];
-        if text.is_empty() || text == "-" {
-            return Err(format!("bad number at byte {start}"));
-        }
-        Ok(Value::Num(text.to_string()))
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::Num(v.to_string()))
     }
 
-    fn string(&mut self) -> Result<String, String> {
-        self.expect(b'"')?;
-        let mut out = String::new();
-        loop {
-            let b = self.peek().ok_or("unterminated string")?;
-            self.at += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let e = self.peek().ok_or("unterminated escape")?;
-                    self.at += 1;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let cp = self.hex4()?;
-                            // Surrogate pairs.
-                            if (0xd800..0xdc00).contains(&cp) {
-                                if self.text[self.at..].starts_with("\\u") {
-                                    self.at += 2;
-                                    let lo = self.hex4()?;
-                                    let c = 0x10000
-                                        + (((cp - 0xd800) as u32) << 10)
-                                        + (lo - 0xdc00) as u32;
-                                    out.push(char::from_u32(c).unwrap_or('\u{fffd}'));
-                                } else {
-                                    out.push('\u{fffd}');
-                                }
-                            } else {
-                                out.push(char::from_u32(cp.into()).unwrap_or('\u{fffd}'));
-                            }
-                        }
-                        other => return Err(format!("bad escape `\\{}`", other as char)),
-                    }
-                }
-                // Multi-byte UTF-8: copy the whole scalar.
-                b if b < 0x80 => out.push(b as char),
-                _ => {
-                    let start = self.at - 1;
-                    let len = match b {
-                        0xc0..=0xdf => 2,
-                        0xe0..=0xef => 3,
-                        _ => 4,
-                    };
-                    if start + len > self.bytes.len() {
-                        return Err("truncated utf-8".to_string());
-                    }
-                    out.push_str(&self.text[start..start + len]);
-                    self.at = start + len;
-                }
-            }
-        }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+        Ok(Value::float(v))
     }
 
-    fn hex4(&mut self) -> Result<u16, String> {
-        if self.at + 4 > self.bytes.len() {
-            return Err("truncated \\u escape".to_string());
-        }
-        let s = &self.text[self.at..self.at + 4];
-        self.at += 4;
-        u16::from_str_radix(s, 16).map_err(|_| format!("bad \\u escape `{s}`"))
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::Str(v.to_string()))
     }
 
-    fn array(&mut self) -> Result<Value, String> {
-        self.expect(b'[')?;
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Value, E> {
+        Ok(Value::Str(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
         let mut out = Vec::new();
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.at += 1;
-            return Ok(Value::Arr(out));
+        while let Some(item) = seq.next_element()? {
+            out.push(item);
         }
-        loop {
-            self.ws();
-            out.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.at += 1;
-                }
-                Some(b']') => {
-                    self.at += 1;
-                    return Ok(Value::Arr(out));
-                }
-                _ => return Err(format!("expected `,` or `]` at byte {}", self.at)),
-            }
-        }
+        Ok(Value::Arr(out))
     }
 
-    fn object(&mut self) -> Result<Value, String> {
-        self.expect(b'{')?;
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        // `MapAccess` yields the keys in document order, so the recovered
+        // field order survives the round trip.
         let mut out = Vec::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.at += 1;
-            return Ok(Value::Obj(out));
+        while let Some((key, value)) = map.next_entry::<String, Value>()? {
+            out.push((key, value));
         }
-        loop {
-            self.ws();
-            let key = self.string()?;
-            self.ws();
-            self.expect(b':')?;
-            self.ws();
-            let v = self.value()?;
-            out.push((key, v));
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.at += 1;
-                }
-                Some(b'}') => {
-                    self.at += 1;
-                    return Ok(Value::Obj(out));
-                }
-                _ => return Err(format!("expected `,` or `}}` at byte {}", self.at)),
-            }
-        }
+        Ok(Value::Obj(out))
     }
 }
 
@@ -415,5 +276,18 @@ mod tests {
         assert_eq!(Value::float(0.75).to_json(), "0.75");
         assert_eq!(Value::float(2.0).to_json(), "2");
         assert_eq!(Value::float(f64::NAN).to_json(), "null");
+    }
+
+    #[test]
+    fn object_order_survives_the_round_trip() {
+        // `serde_json`'s own `Map` would sort these three keys.
+        let text = r#"{"zebra":1,"apple":2,"t":3}"#;
+        let v = parse(text).unwrap();
+        let Value::Obj(pairs) = &v else {
+            panic!("not an object");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["zebra", "apple", "t"]);
+        assert_eq!(v.to_json(), text);
     }
 }

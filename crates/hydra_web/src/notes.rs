@@ -9,6 +9,7 @@ use crate::json::Value;
 
 /// One note (`NoteOut`): `who, character, name, changed, text, lines`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NoteOut {
     /// The note key (which room / title it was taken for).
     pub who: String,
@@ -49,6 +50,40 @@ impl NoteOut {
 pub enum NotesOut {
     Notes(Vec<NoteOut>),
     Problem(String),
+}
+
+/// The wire shape of [`NotesOut`]: an untagged enum whose variants are *objects*
+/// — `{"notes":[…]}` or `{"problem":"…"}` — which is exactly what the two
+/// recovered `Serialize for NotesOut` impls write.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum NotesWire {
+    Notes { notes: Vec<NoteOut> },
+    Problem { problem: String },
+}
+
+impl serde::Serialize for NotesOut {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            NotesOut::Notes(notes) => NotesWire::Notes {
+                notes: notes.clone(),
+            }
+            .serialize(s),
+            NotesOut::Problem(problem) => NotesWire::Problem {
+                problem: problem.clone(),
+            }
+            .serialize(s),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NotesOut {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<NotesOut, D::Error> {
+        Ok(match NotesWire::deserialize(d)? {
+            NotesWire::Notes { notes } => NotesOut::Notes(notes),
+            NotesWire::Problem { problem } => NotesOut::Problem(problem),
+        })
+    }
 }
 
 impl NotesOut {

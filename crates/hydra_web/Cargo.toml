@@ -3,9 +3,20 @@ name = "hydra_web"
 version = "0.0.0"
 edition = "2021"
 
-# The original linked tokio, tokio-tungstenite, serde/serde_json, mdns-sd and
-# rustls.  Nothing outside `std` is used here; the two path dependencies are
-# sibling crates that were already recovered from the same binary.
+# The original linked tokio, tokio-tungstenite, tungstenite, serde/serde_json,
+# base64 and mdns-sd; all of those are reconnected here at the workspace pins
+# (see NOTES.md §5).  rustls, getrandom, bytes, futures-util and axum are not
+# workspace pins, so the pieces that needed them stay modelled in `std`/seam
+# form.  The two path dependencies are sibling crates recovered from the same
+# binary.
 [dependencies]
 hydra_model = { path = "../hydra_model" }
 hydra_session = { path = "../hydra_session" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true }
+mdns-sd = { workspace = true }
+base64 = { workspace = true }

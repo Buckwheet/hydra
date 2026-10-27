@@ -27,13 +27,14 @@ pub fn file(root: &Path, kind: &str) -> Option<PathBuf> {
 /// Store one kind of phone state.
 ///
 /// Recovered (`0x10029f94c`): the text is validated as JSON
-/// (`serde_json::from_str::<Value>`), the parent directory is created
+/// (`serde_json::de::from_str::<Value>`), the parent directory is created
 /// (`DirBuilder::create`) and the bytes are written with
 /// `hydra_session::store::save_bytes`.  A malformed document is refused before
 /// anything is written.
 pub fn keep(root: &Path, kind: &str, text: &str) -> Result<(), String> {
     let path = file(root, kind).ok_or_else(|| format!("no phone state called `{kind}`"))?;
-    crate::json::parse(text).map_err(|e| format!("{kind}.json is not JSON: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|e| format!("{kind}.json is not JSON: {e}"))?;
     let dir = path.parent().unwrap_or(root);
     hydra_session::store::save_bytes(dir, &path, text.as_bytes())
         .map_err(|e| format!("{} cannot be written: {e}", path.display()))

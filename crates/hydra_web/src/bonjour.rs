@@ -5,9 +5,11 @@
 //!
 //! The original used the `mdns_sd` crate: `start` built a `ServiceInfo` and
 //! registered it on a `ServiceDaemon`; `Drop` called `unregister` and
-//! `shutdown`.  Nothing here talks to the network: the daemon is a trait so the
-//! caller can supply the real mDNS backend, and the default one only records the
-//! announcement.
+//! `shutdown`.  Both halves are here: [`Mdns`] is that crate behind the
+//! [`Daemon`] trait (and [`service_info`] builds the record it registers), while
+//! the default [`Announced::start`] keeps the recording daemon so nothing in
+//! this crate opens a socket unless it is asked to
+//! ([`Announced::start_mdns`]).
 
 /// The registered service type (`0x1020725fc`, 19 bytes).
 pub const SERVICE: &str = "v1_hydra._tcp.local.";
@@ -55,6 +57,101 @@ impl Daemon for std::cell::RefCell<Recording> {
 
     fn shutdown(&self) {
         self.borrow_mut().shutdowns += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real daemon (mdns-sd)
+// ---------------------------------------------------------------------------
+
+/// The service record an announcement advertises.
+///
+/// Recovered: the instance name, the [`SERVICE`] type and the TXT records
+/// [`TXT_TOKEN`], [`TXT_VERSION`], [`TXT_LAYOUT`].  The host name is the
+/// instance's own (`<instance>.local.`) and the address is the machine's LAN
+/// address ([`crate::lan_address`]).
+///
+/// `// UNKNOWN:` the TXT value encodings.  The token is passed through verbatim,
+/// the storage version is decimal text and the layout is as given.
+pub fn service_info(
+    instance: &str,
+    port: u16,
+    ip: std::net::IpAddr,
+    txt: &[(&str, String)],
+) -> Result<mdns_sd::ServiceInfo, String> {
+    let host = format!("{instance}.local.");
+    mdns_sd::ServiceInfo::new(SERVICE, instance, &host, ip, port, txt)
+        .map_err(|e| format!("{instance} cannot be announced: {e}"))
+}
+
+/// The mDNS responder the original used (`mdns_sd::ServiceDaemon`), behind the
+/// [`Daemon`] seam.
+///
+/// [`Mdns::new`] starts the real responder (it opens the multicast sockets);
+/// `register`, `unregister` and `shutdown` are the three calls the binary makes.
+/// No test constructs one: [`Announced::start`] keeps the recording daemon, and
+/// [`Announced::start_mdns`] is the only way to reach the network.
+pub struct Mdns {
+    daemon: mdns_sd::ServiceDaemon,
+    /// `(instance, fullname)` of every registration, so `unregister` can name
+    /// the record it withdraws.
+    registered: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl std::fmt::Debug for Mdns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let registered = self.registered.lock().map(|known| known.len()).unwrap_or(0);
+        f.debug_struct("Mdns")
+            .field("registered", &registered)
+            .finish()
+    }
+}
+
+impl Mdns {
+    /// Start the daemon (`ServiceDaemon::new`).
+    pub fn new() -> Result<Mdns, String> {
+        Ok(Mdns {
+            daemon: mdns_sd::ServiceDaemon::new().map_err(|e| e.to_string())?,
+            registered: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl Daemon for Mdns {
+    fn register(&self, instance: &str, port: u16, txt: &[(&str, String)]) {
+        let ip = crate::lan_address()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let Ok(info) = service_info(instance, port, ip, txt) else {
+            return;
+        };
+        let fullname = info.get_fullname().to_string();
+        if let Ok(mut known) = self.registered.lock() {
+            // Recorded before the registration so `Drop`'s unconditional
+            // `unregister` is always safe.
+            known.push((instance.to_string(), fullname));
+        }
+        let _ = self.daemon.register(info);
+    }
+
+    fn unregister(&self, instance: &str) {
+        let names: Vec<String> = self
+            .registered
+            .lock()
+            .map(|known| {
+                known
+                    .iter()
+                    .filter(|(who, _)| who == instance)
+                    .map(|(_, fullname)| fullname.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for fullname in names {
+            let _ = self.daemon.unregister(&fullname);
+        }
+    }
+
+    fn shutdown(&self) {
+        let _ = self.daemon.shutdown();
     }
 }
 
@@ -137,6 +234,27 @@ impl Announced {
         }
     }
 
+    /// Announce the web page on the real mDNS responder (`mdns_sd`).
+    ///
+    /// This is the recovered path: `ServiceDaemon::new` (in [`Mdns::new`]) then
+    /// `register` with the [`service_info`] record.  It opens multicast sockets,
+    /// which is why it is not what [`Announced::start`] does by default.
+    pub fn start_mdns(
+        token: &str,
+        port: u16,
+        storage_version: u32,
+        layout: &str,
+    ) -> Result<Announced, String> {
+        let daemon = Mdns::new()?;
+        Ok(Announced::start_on(
+            Box::new(daemon),
+            token,
+            port,
+            storage_version,
+            layout,
+        ))
+    }
+
     /// The full service name, e.g. `hydra v1_hydra._tcp.local.`.
     pub fn service_name(&self) -> String {
         format!("{}.{}", self.instance, SERVICE)
@@ -166,6 +284,30 @@ mod tests {
         assert_eq!(TXT_VERSION, "web.storage_version");
         assert_eq!(TXT_LAYOUT, "layout");
         assert_eq!(HOSTNAME_ENV, "COMPUTERNAME");
+    }
+
+    /// The record `Announced::start_mdns` registers — built without a daemon, so
+    /// no socket is opened.
+    #[test]
+    fn the_service_record_is_the_recovered_announcement() {
+        let txt = [
+            (TXT_TOKEN, "deadbeef".to_string()),
+            (TXT_VERSION, "3".to_string()),
+            (TXT_LAYOUT, "layout.json".to_string()),
+        ];
+        let ip: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+        let info = service_info("hydra", 7788, ip, &txt).unwrap();
+        assert_eq!(info.get_fullname(), "hydra.v1_hydra._tcp.local.");
+        assert_eq!(info.get_type(), SERVICE);
+        assert_eq!(info.get_port(), 7788);
+        assert_eq!(info.get_hostname(), "hydra.local.");
+        assert_eq!(info.get_property_val_str(TXT_TOKEN), Some("deadbeef"));
+        assert_eq!(info.get_property_val_str(TXT_VERSION), Some("3"));
+        assert_eq!(info.get_property_val_str(TXT_LAYOUT), Some("layout.json"));
+        assert!(info
+            .get_addresses_v4()
+            .iter()
+            .any(|a| a.to_string() == "192.168.1.10"));
     }
 
     #[test]

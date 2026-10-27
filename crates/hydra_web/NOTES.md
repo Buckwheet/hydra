@@ -9,8 +9,15 @@ boundaries suggested (e.g. `wire::banners` is 428 B, not 117 KB).
 The original crate lived at `crates/hydra-web/src/...` (five of those paths
 survive in `__cstring`).  It linked `tokio`, `tokio-tungstenite`,
 `tungstenite`, `serde`/`serde_json`, `mdns-sd`, `rustls`, `getrandom`,
-`bytes`, `futures-util`.  This reconstruction is **std only**; the departures are
-listed in §5.
+`bytes`, `futures-util`.
+
+Phase 1 reconnected every crate of that list that is a workspace pin:
+`serde`/`serde_json` (all wire documents), `tokio` (the driver),
+`tungstenite` + `tokio-tungstenite` (handshake and frames), `base64` (the
+accept key) and `mdns-sd` (behind `bonjour::Daemon`).  The four that are **not**
+pinned — `rustls`, `getrandom`, `bytes`, `futures-util` (and `axum`, which the
+original linked but this crate never used) — keep their `std` stand-ins.  §5 is
+the current list, §7 the reconnection itself.
 
 Legend:
 
@@ -349,7 +356,8 @@ and `Arc<Seat>`-ish values at `+0x328`.
 
 ## 4. Tests
 
-74 unit tests (`cargo test -p hydra_web`), all asserting recovered values:
+90 unit tests (`cargo test -p hydra_web --offline`), all asserting recovered
+values:
 the RFC 6455 accept key and the SHA-1/base64 vectors, the exact `101`/`200`
 response templates, the `\r\n`/`:`/`' '` header parsing and the
 `!upgrade && key.is_none() ⇒ None` rule, the `"t"`-tagged `Out`/`In` documents
@@ -361,35 +369,68 @@ pairing token (create → reuse → corrupt → replace), the constant-time comp
 `aspect = 0.75`, the notes round-trip through `hydra_session`, the
 `shape kind`-tagged JSON, the recovered refusal sentences and their lengths.
 
-## 5. std-only departures (and other seams)
+Phase 1 added the assertions that the reconnected crates provide: every wire leaf
+and every payload leaf serializes with `serde_json` to exactly the JSON its
+`fields()` recovered order describes (and round-trips through the derived
+`Deserialize`), all 26 serializable `Out` variants are checked against their tag
+plus field list, all 37 `In` tags parse → serialize → parse, the
+`highlight_save` form is spliced flat next to the tag, the `101` bytes are
+accepted by `tokio-tungstenite`'s client (which verifies the accept key), the
+handshake works over a local TCP pair, the async head reader waits for the blank
+line, the relay pumps `In` → handler → `Out` over tokio channels and over a real
+socket, and the mDNS record is the recovered `ServiceInfo`.
 
-1. **serde/serde_json** → `crate::json` (a `Value` with an ordered writer and an
-   RFC 8259 parser).  Objects keep insertion order, which is how the field order
-   recovered from the binary is preserved and tested.
-2. **tokio/tokio-tungstenite/axum** → synchronous model code plus the documented
-   `Seat`/`Daemon` seams.  `http::request` takes a `&str` head instead of a
-   stream; `read_head` returns the head length from a byte slice.
+## 5. Departures left after Phase 1 (and other seams)
+
+Struck in Phase 1 (now the real crate): ~~serde/serde_json~~, ~~tokio~~,
+~~tungstenite's handshake and message layer~~, ~~base64~~, ~~mdns-sd~~.
+
+1. **rustls** → the original's websocket was plain `ws://` on the LAN; `rustls`
+   is only needed for `wss://` and is not a workspace pin, so no TLS is set up
+   here (the pin list has `native-tls`, not `rustls`).
+2. **getrandom** → `/dev/urandom` with a clock/pid-seeded xorshift fallback in
+   `pairing::random_bytes`.  `getrandom` is not a workspace pin.
 3. **bytes::Bytes** → `Vec<u8>` (`wire::Out::to_frame`, `client::message`).
-4. **mdns-sd** → `bonjour::Daemon` (a trait) plus a `Recording` default.  No
-   socket is opened; `Drop` still unregisters and shuts down.
-5. **getrandom** → `/dev/urandom` with a clock/pid-seeded xorshift fallback.
-6. **base64/sha1 crates** → `http::{base64, sha1}` (standard padded base64;
-   RFC 3174 SHA-1), validated against the published vectors.
-7. **tungstenite's frame layer** → not modelled (only the handshake and the JSON
-   messages are); the original's `Message` becomes the JSON text body.
-8. **hydra_ui / hydra_board** (unrecovered siblings) → `client::Seat` (symbol,
+   `bytes` is not a workspace pin; `tungstenite` re-exports its own `Bytes` but
+   the public functions keep returning `Vec<u8>` so callers are unaffected.
+   `client::frame` is the `tungstenite::Message` the socket actually writes.
+4. **futures-util** → not a workspace pin, so `tokio_tungstenite::
+   WebSocketStream` (whose `Stream`/`Sink` impls come from `futures-util`) cannot
+   be polled here.  `client::serve_socket` therefore drives `tungstenite`'s
+   *blocking* socket on a `tokio::task::spawn_blocking` task (a `SO_RCVTIMEO`
+   tick drains the outgoing channel between reads) and joins the two directions
+   with tokio channels; `client::relay` is transport-agnostic over those channels
+   and `http::accept_websocket` still hands a stream to `tokio-tungstenite` for
+   the handshake.  When `futures-util` is pinned, `serve_socket` becomes a
+   `WebSocketStream` loop with no other change.
+5. **axum** → the original linked it, but nothing in this crate used it (the HTTP
+   side is the hand-rolled head parser plus two format strings); it is not a
+   workspace pin and nothing was re-implemented for it.
+6. **sha1** → `http::sha1` (RFC 3174) stays: no SHA-1/SHA-2 crate is pinned (the
+   original's came from `tungstenite`, which still provides the accept key —
+   `http::accept_key` is `tungstenite::handshake::derive_accept_key`).  A test
+   asserts the hand-rolled digest and `tungstenite`'s agree.
+7. **hydra_ui / hydra_board** (unrecovered siblings) → `client::Seat` (symbol,
    lich_symbol, send, name, game), `highlights::Rule`/`HighlightFile`,
    `inventory::Act`, `follow::Body`, `wire::TextRun`.  Every one is documented at
    its definition.  `hydra_session` and `hydra_model` *are* recovered and are
    used directly (`notes::{load, write, rewrite, remove, stamp}`,
    `store::save_bytes`, `state::inventory_snapshot::InventorySnapshot`).
-9. **`Page`'s async driver** (`client::run`, `client::sent`, `client::closed`,
-   `client::Page::{request, asked, logging_in, highlight}`, `http::{answer,
-   respond, read_head}`, `serve`, `accept`, `serve_to`, `listen`) → not stubs in
-   this skeleton and not modelled as async; the pieces they call are implemented
-   (`http::request`, `client::message`, the `Page` handlers).
+   `client::asked` answers only the messages whose handlers exist here; the ones
+   that need those crates (`login`, `characters`, `launch`, `launch_team`,
+   `choose`, `reconnect`, `attach`, `streams`, `stream`, `theme`, `tasks`,
+   `inventory`, `inventory_act`, `trainer`, `trainer_profile`, `hotbar`,
+   `note_new`, `clip`, `remove`) are accepted and answered with nothing.
+8. **`Page`'s remaining driver pieces** (`client::{sent, closed}`,
+   `Page::{request, logging_in, highlight}`, `serve`, `accept`, `serve_to`,
+   `listen`) are not modelled: `client::relay` + `client::asked` are the loop and
+   the dispatch, and the socket ends are `http::handshake`/
+   `http::accept_websocket` (the two handshakes) and `client::serve_socket`.
+9. **`toml`** is a workspace pin but the highlight document syntax is still
+   `// UNKNOWN:` (§2.8), so `highlights::{parse, render}` keep the documented
+   round-trippable line form rather than guessing a TOML schema.
 10. **Files touched**: only `crates/hydra_web/**` plus the workspace `Cargo.lock`
-    (adding the two path dependencies is unavoidable).
+    (adding the crate dependencies updates it).
 
 ## 6. Conflicts and open questions
 
@@ -409,3 +450,85 @@ pairing token (create → reuse → corrupt → replace), the constant-time comp
 * `wire::Line`, `wire::Card` and `wire::View` mix `String`, `&'static str` and
   enum payloads at offsets that are only partly readable; the recovered *keys*
   are exact, a few field *types* are inferred and marked.
+
+## 7. Phase 1 reconnection
+
+### 7.1 Dependencies actually used
+
+All at the root `[workspace.dependencies]` pins, taken as `{ workspace = true }`
+in `crates/hydra_web/Cargo.toml`; `cargo --offline` only, nothing else was added
+(the two path dependencies `hydra_model`/`hydra_session` predate this phase).
+
+| crate | pin | what it backs now |
+|---|---|---|
+| `serde` | `=1.0.229` (derive) | every wire type derives `Serialize`/`Deserialize` |
+| `serde_json` | `=1.0.151` | `wire::Out::to_json`, `wire::In::from_json`, `json::{parse, to_json, write_str}`, `phone::keep`'s validation, `workspace::revision` |
+| `tokio` | `=1.53.1` (full) | `http::read_head_async`, `client::{frames, relay, serve_socket}` (`mpsc`, `spawn_blocking`); the async tests |
+| `tungstenite` | `=0.29.0` | `http::accept_key` (`handshake::derive_accept_key`), `client::{frame, told}`, the blocking socket in `client::serve_socket`, the TCP-pair tests' client |
+| `tokio-tungstenite` | `=0.29.0` | `http::accept_websocket` (`accept_async`) and the handshake tests (`client_async`) |
+| `base64` | `=0.22.1` | `http::base64` (standard padded alphabet) |
+| `mdns-sd` | `=0.21.5` | `bonjour::{service_info, Mdns}` — the `service_info` record and `Daemon` implementation, reached by `Announced::start_mdns` |
+
+### 7.2 What is now real
+
+* **The JSON.** `wire::Out` is `#[serde(tag = "t", rename_all = "snake_case")]`
+  over struct/newtype variants, `wire::In` is the mirror with `Deserialize`,
+  `injuries::ShapeOut` is `tag = "kind"`, `notes::NotesOut` is the untagged pair
+  of objects, `highlights::Form` is a 33-field struct with `#[serde(default)]`.
+  `crate::json` is no longer a parser or an escaping writer: `parse` is
+  `serde_json::from_str` and `write_str`/`to_json` go through
+  `serde_json`'s writer, so the escaping and the number formatting are the
+  original's.  `json::Value` survives only as the order-preserving shape the
+  recovered `fields()` lists build (its `Serialize`/`Deserialize` impls keep
+  document order, which `serde_json::Map` would sort away without
+  `preserve_order`).
+* **The HTTP/WebSocket handshake.** `http::accept_key` is `tungstenite`'s
+  RFC 6455 derivation; `http::read_head_async` reads the head off a tokio stream;
+  `http::handshake` parses it with the recovered `request` and answers with the
+  recovered `101` bytes; `http::accept_websocket` hands the stream to
+  `tokio-tungstenite`.  Tests run a real `tokio-tungstenite` client against both
+  handshake paths (duplex and a local TCP pair); the client verifies
+  `Sec-WebSocket-Accept`, so a wrong key or header name fails the test.
+* **The relay.** `client::relay` is the recovered loop over tokio channels
+  (text frame → `wire::In` → handler → `wire::Out` → text frame) and
+  `client::asked` is the `Page::asked` dispatch; `client::serve_socket` joins a
+  real `tungstenite` socket to it.  Tested over tokio channels, through the
+  `Page` handlers, and end-to-end over `127.0.0.1` with a `tungstenite` client.
+* **mDNS.** `bonjour::Mdns` is a real `mdns_sd::ServiceDaemon`;
+  `bonjour::service_info` builds the record (`<instance>.v1_hydra._tcp.local.`
+  with the `web.token` / `web.storage_version` / `layout` TXT entries) and is
+  tested without opening a socket.  `Announced::start` still uses the recording
+  daemon, `Drop` still unregisters then shuts down, and only
+  `Announced::start_mdns` touches the network.
+* **base64.** The accept key's encoding is the `base64` crate.
+
+### 7.3 Behaviour the reconnection pinned down (and small API notes)
+
+* `notes::NotesOut` keeps its `Notes(Vec<NoteOut>)` / `Problem(String)` shape but
+  serializes as `{"notes":[…]}` / `{"problem":"…"}`.  A plain `#[serde(untagged)]`
+  over those newtype variants would have produced a bare array, so the impls go
+  through a private mirror enum; `fields()` and the public variants are
+  unchanged.
+* `highlights::Form`'s fields are declared in the **serialization** order now
+  (serde writes declaration order).  The original's memory offsets are kept as
+  comments; construction is by field name, so no caller changes.
+* `wire::Card` holds two `&'static str` state slots, so it — and therefore
+  `Out::Hub` — is serialize-only; `Out` as a whole derives `Serialize` (it is the
+  server→page direction) and `In` derives both.  Round-trip tests cover every
+  leaf except `Card`.
+* `wire::In::from_value` (the `json::Value` entry point) now re-serializes and
+  calls `In::from_json`, so there is one parser; `highlights::Form::from_value`
+  does the same.  `In::HighlightSave` is `#[serde(flatten)]`, because the page
+  splices the 33 form fields next to the `"t"` tag (that is what the recovered
+  handler reads).
+* Every `In` payload field carries `#[serde(default)]`: the page's messages are
+  sparse, and the existing test parses `{"t":tag}` for all 37 tags.
+* `workspace::revision` deserializes a one-field `Revision` document instead of
+  walking a `json::Value`; unknown fields (the page's own layout) are ignored and
+  a negative/non-numeric `revision` is still `None`.
+* `highlights::HighlightFile` gained `remove`/`switch`, the two operations
+  `In::HighlightRemove`/`In::HighlightSwitch` need; `client::asked` uses them.
+* The synchronous functions and types all keep their signatures
+  (`http::{request, read_head, switching, respond, base64, sha1, accept_key}`,
+  `client::{message, Page, Seat}`, every `fields()`): `message` still returns
+  `Vec<u8>`, `client::frame` is the `tungstenite::Message` form alongside it.

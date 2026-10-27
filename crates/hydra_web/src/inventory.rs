@@ -99,6 +99,7 @@ impl Act {
 
 /// A container group (`GroupOut`): `ids, heading, tab`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GroupOut {
     pub ids: Vec<String>,
     pub heading: String,
@@ -125,6 +126,7 @@ impl GroupOut {
 /// (its `name` sits at `+0x60` and `pounds` at `+0x120`), so a few unread fields
 /// live in between; only the serialized keys are modelled.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ItemOut {
     pub within: String,
     pub id: String,
@@ -162,6 +164,7 @@ impl ItemOut {
 
 /// A detail section (`DetailOut`): `id, name, sections`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DetailOut {
     pub id: String,
     pub name: String,
@@ -188,6 +191,7 @@ impl DetailOut {
 
 /// A single offered act (`ActOut`): `act, label`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ActOut {
     pub act: String,
     pub label: String,
@@ -217,6 +221,7 @@ impl ActOut {
 /// The panel payload (`InventoryOut`): `summary, groups, items, item, known,
 /// room_left`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct InventoryOut {
     pub summary: String,
     pub groups: Vec<GroupOut>,

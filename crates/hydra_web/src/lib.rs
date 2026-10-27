@@ -1,12 +1,16 @@
 //! Hydra's local web/phone control surface.
 //!
 //! Recovered from the arm64 `hydra` binary.  The original crate was a
-//! hand-rolled HTTP + websocket server (tokio, tokio-tungstenite, serde_json,
-//! mdns-sd, rustls) that served one page and the game state behind it.  This
-//! reconstruction is `std`-only: the JSON documents, the routing, the pairing
-//! tokens, the file layout and the drawing model are the recovered ones, and
-//! every piece that was I/O or a runtime in the original is a documented seam
-//! (see `NOTES.md`).
+//! hand-rolled HTTP + websocket server (tokio, tokio-tungstenite, tungstenite,
+//! serde/serde_json, base64, mdns-sd, rustls) that served one page and the game
+//! state behind it.  The JSON documents, the routing, the pairing tokens, the
+//! file layout and the drawing model are the recovered ones, and the crates the
+//! original linked are reconnected at the workspace pins: serde/serde_json for
+//! every wire document, tokio for the driver, tungstenite/tokio-tungstenite for
+//! the handshake and the frames, base64 for the accept key and mdns-sd behind
+//! the `bonjour::Daemon` seam.  What is left as a `std` seam — rustls, getrandom,
+//! `bytes`, futures-util, and the unrecovered `hydra_ui`/`hydra_board` types —
+//! is listed in `NOTES.md` §5.
 //!
 //! Sibling crates that *were* recovered are used directly: `hydra_session`
 //! (notes, the atomic save helper) and `hydra_model` (the inventory snapshot).

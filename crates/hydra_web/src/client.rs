@@ -4,10 +4,16 @@
 //! (`client::run`).  Each handler below was read out of the binary; the pieces
 //! that talk to the game live behind the [`Seat`] seam, because the crate that
 //! owns them (`hydra_board`) is not recovered.
+//!
+//! The driver itself is here too, on real `tokio`: [`relay`] is the recovered
+//! read-a-frame → parse-`wire::In` → run-the-handler → write-`wire::Out` loop,
+//! [`asked`] is its message dispatch, and [`serve_socket`] bridges a blocking
+//! `tungstenite` socket onto the same loop.  The synchronous handlers and
+//! builders are unchanged.
 
 use std::path::{Path, PathBuf};
 
-use crate::wire::{self, Out};
+use crate::wire::{self, In, Out};
 use crate::workspace;
 use crate::{
     highlights, injuries, inventory, notes as notes_module, phone, tasks as tasks_module,
@@ -495,11 +501,30 @@ pub fn wheel_command(direction: &str) -> String {
 
 /// The websocket frame body for one message (`client::message`, `0x1002bb490`).
 ///
-/// **ESTABLISHED**: `serde_json::to_string` then
-/// `bytes::Bytes::from(String)`; the crate returns the JSON bytes instead
-/// (std-only departure).
+/// **ESTABLISHED**: `serde_json::to_string` then `bytes::Bytes::from(String)`.
+/// `bytes` is not a workspace pin, so the bytes are a `Vec<u8>` here;
+/// [`frame`] is the same document as the `tungstenite` message the socket
+/// actually sends.
 pub fn message(out: &Out) -> Vec<u8> {
     out.to_frame()
+}
+
+/// One document as the websocket text message the page receives.
+///
+/// The original fed `bytes::Bytes` of the JSON into `tungstenite`; this is that
+/// message, built with the `tungstenite` the original linked.
+pub fn frame(out: &Out) -> tungstenite::Message {
+    tungstenite::Message::text(out.to_json())
+}
+
+/// The page message in a websocket message, when it is a text frame.
+///
+/// `None` for binary/ping/pong/close frames (they carry no `wire::In`).
+pub fn told(msg: &tungstenite::Message) -> Option<Result<In, String>> {
+    match msg {
+        tungstenite::Message::Text(text) => Some(In::from_json(text.as_str())),
+        _ => None,
+    }
 }
 
 /// The trainer panel of one character.
@@ -543,6 +568,209 @@ impl TrainerPanel {
         profiles.sort();
         TrainerPanel { folder, profiles }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The async relay (tokio)
+// ---------------------------------------------------------------------------
+
+/// Apply one page message to `page` — the recovered `Page::asked` dispatch.
+///
+/// The returned messages are the ones this handler queued (the page's outbox is
+/// drained for them).  The messages whose work lives in the unrecovered
+/// `hydra_board`/`hydra_ui` crates — `login`, `characters`, `launch`,
+/// `launch_team`, `choose`, `reconnect`, `attach`, `streams`, `stream`, `theme`,
+/// `tasks`, `inventory`, `inventory_act`, `trainer`, `trainer_profile`,
+/// `hotbar`, `note_new`, `clip`, `remove` — are accepted and leave the outbox
+/// empty: they need a [`Seat`] implementation to do anything.
+pub fn asked(page: &mut Page, seat: &mut dyn Seat, msg: In) -> Vec<Out> {
+    let before = page.outbox.len();
+    match msg {
+        In::Send { text } => {
+            page.press(seat, &text);
+        }
+        In::Wheel { direction } => page.wheel(seat, &direction),
+        // `hotbars::button_lines` belongs to `hydra_board`; the id is the line.
+        In::Button { id } => page.button(seat, std::slice::from_ref(&id)),
+        In::Link { noun } => page.link(seat, &noun),
+        In::Notes => page.panel(),
+        In::NoteWrite { key, text } => {
+            let _ = page.note_write(&key, &text);
+        }
+        In::NoteForget { key } => {
+            let _ = page.note_forget(&key);
+        }
+        In::Highlights => page.highlights_listed(),
+        In::HighlightsMerge { text } => {
+            let _ = page.highlights_merge(&text);
+        }
+        In::HighlightSave { form } => {
+            highlights::save(&mut page.highlights, std::slice::from_ref(&form));
+            page.highlights_text();
+        }
+        In::HighlightRemove { name } => {
+            page.highlights.remove(&name);
+            page.highlights_text();
+        }
+        In::HighlightSwitch { name, on } => {
+            page.highlights.switch(&name, on);
+            page.highlights_text();
+        }
+        // `In::PhoneGet` carries no kind; the page's own state is `ui`.
+        In::PhoneGet => page.phone("ui"),
+        In::PhonePut { kind, text } => {
+            let _ = page.phone_put(&kind, &text);
+        }
+        In::PushPair { .. } => page.push_asked(true, false),
+        In::PushForget => page.push_asked(true, true),
+        In::Workspace => {
+            page.workspace_of(0);
+        }
+        In::TrainerStep { skill, step } => {
+            page.trainer_step(seat, &skill, step);
+        }
+        _ => {}
+    }
+    page.outbox.split_off(before)
+}
+
+/// The relay's end of a page socket: `wire::In` text frames in, `wire::Out`
+/// text frames out.
+#[derive(Debug)]
+pub struct Relay {
+    /// The page's messages, in arrival order (each one is the JSON body of a
+    /// websocket text frame).
+    pub incoming: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// What the page is sent, in order.
+    pub outgoing: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+/// The socket's end of a [`Relay`].
+#[derive(Debug)]
+pub struct Link {
+    /// Feed the page a text frame.
+    pub incoming: tokio::sync::mpsc::UnboundedSender<String>,
+    /// What the relay wrote for the page.
+    pub outgoing: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+/// A connected pair of text-frame channels: the relay on one side, the socket
+/// on the other.
+pub fn frames() -> (Relay, Link) {
+    let (to_page, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (outgoing, to_socket) = tokio::sync::mpsc::unbounded_channel();
+    (
+        Relay { incoming, outgoing },
+        Link {
+            incoming: to_page,
+            outgoing: to_socket,
+        },
+    )
+}
+
+/// What a relayed session did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Relayed {
+    /// Page messages that parsed and reached the handler.
+    pub handled: usize,
+    /// Text frames that were not `wire::In` documents (dropped, as the original's
+    /// parser did).
+    pub rejected: usize,
+}
+
+/// Relay a page (`client::run`'s loop).
+///
+/// Every text frame the page sends is parsed as a [`wire::In`] and handed to
+/// `handle`; every [`Out`] the handler answers with is written back as one text
+/// frame — the JSON body [`message`] produces.  The loop ends when the page's
+/// side of the channel closes, or when the socket side is gone.
+pub async fn relay<H>(relay: &mut Relay, mut handle: H) -> Relayed
+where
+    H: FnMut(In) -> Vec<Out>,
+{
+    let mut done = Relayed::default();
+    while let Some(text) = relay.incoming.recv().await {
+        let Ok(msg) = In::from_json(&text) else {
+            done.rejected += 1;
+            continue;
+        };
+        for out in handle(msg) {
+            // One JSON document per websocket text frame.
+            if relay.outgoing.send(out.to_json()).is_err() {
+                return done;
+            }
+        }
+        done.handled += 1;
+    }
+    done
+}
+
+/// How long [`serve_socket`] waits for a frame before it drains the outbox.
+///
+/// The blocking `tungstenite` socket cannot be interrupted, so it is read with a
+/// short `SO_RCVTIMEO` and the outgoing frames are flushed between reads.
+pub const TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a peer gets to complete its handshake in [`serve_socket`].
+pub const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bridge a blocking `tungstenite` server socket onto a [`Relay`].
+///
+/// The recovered server spoke `tungstenite` text frames over the accepted
+/// socket; `tokio-tungstenite`'s `WebSocketStream` is the async equivalent, but
+/// polling it needs the `futures-util` `Stream`/`Sink` traits, which are **not**
+/// in the workspace pins.  So the socket is driven by `tungstenite`'s blocking
+/// API on a blocking task ([`tokio::task::spawn_blocking`]) and the two
+/// directions are joined with tokio channels.  The handshake is `tungstenite`'s
+/// (`accept`, i.e. its own `101` bytes); [`crate::http::handshake`] is the path
+/// that writes the recovered template bytes instead.
+///
+/// Must be called from inside a tokio runtime; the returned join handle ends
+/// when the socket closes.
+pub fn serve_socket(
+    stream: std::net::TcpStream,
+) -> std::io::Result<(Relay, tokio::task::JoinHandle<()>)> {
+    stream.set_nodelay(true).ok();
+    // The handshake may take as long as the peer needs …
+    stream.set_read_timeout(Some(HANDSHAKE))?;
+    let (relay, link) = frames();
+    let Link {
+        incoming: to_page,
+        mut outgoing,
+    } = link;
+    let handle = tokio::task::spawn_blocking(move || {
+        use std::io::ErrorKind;
+        use tungstenite::Message;
+
+        let Ok(mut socket) = tungstenite::accept(stream) else {
+            return;
+        };
+        // … but a blocking `read` cannot be interrupted, so from here on the
+        // socket is read with a short timeout and the outgoing frames are
+        // written between reads.
+        socket.get_ref().set_read_timeout(Some(TICK)).ok();
+        loop {
+            while let Ok(text) = outgoing.try_recv() {
+                if socket.send(Message::text(text)).is_err() {
+                    return;
+                }
+            }
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    if to_page.send(text.to_string()).is_err() {
+                        return;
+                    }
+                }
+                Ok(Message::Close(_)) => return,
+                // Ping/pong and binary frames carry no page message.
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => return,
+            }
+        }
+    });
+    Ok((relay, handle))
 }
 
 #[cfg(test)]
@@ -774,6 +1002,162 @@ mod tests {
         p.highlights_listed();
         assert!(matches!(p.outbox.last().unwrap(), Out::Highlights { .. }));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frames_are_tungstenite_text_messages() {
+        let out = Out::Said {
+            text: "hi".into(),
+        };
+        let msg = frame(&out);
+        assert!(msg.is_text());
+        assert_eq!(msg.to_text().unwrap(), r#"{"t":"said","text":"hi"}"#);
+        assert_eq!(msg.to_text().unwrap().as_bytes(), message(&out));
+
+        let msg = tungstenite::Message::text(r#"{"t":"send","text":"look"}"#);
+        assert_eq!(
+            told(&msg).unwrap().unwrap(),
+            In::Send {
+                text: "look".into()
+            }
+        );
+        // A frame that is not a page message, and a document that is not JSON.
+        assert!(told(&tungstenite::Message::Ping(tungstenite::Bytes::new())).is_none());
+        assert!(told(&tungstenite::Message::text("<xml/>"))
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_pumps_frames_over_channels() {
+        let (mut relay, mut link) = frames();
+        link.incoming
+            .send(r#"{"t":"send","text":"look"}"#.to_string())
+            .unwrap();
+        link.incoming.send("not a message".to_string()).unwrap();
+        // Closing the page's side ends the loop.
+        drop(link.incoming);
+
+        let done = crate::client::relay(&mut relay, |msg| match msg {
+            In::Send { text } => vec![Out::Said { text }],
+            _ => Vec::new(),
+        })
+        .await;
+        assert_eq!(
+            done,
+            Relayed {
+                handled: 1,
+                rejected: 1
+            }
+        );
+
+        let reply = link.outgoing.try_recv().unwrap();
+        assert_eq!(reply, r#"{"t":"said","text":"look"}"#);
+        assert!(link.outgoing.try_recv().is_err(), "one frame per message");
+    }
+
+    #[tokio::test]
+    async fn relay_runs_the_page_handlers() {
+        let root = std::env::temp_dir().join(format!("hydra-web-relay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut page = Page::new(&root, "ACCT", "Ima", "GS4");
+        let mut seat = FakeSeat::new(Some("Ima"));
+        let (mut relay, mut link) = frames();
+        // A `send` is `Page::press`, a `highlights_merge` goes through the
+        // highlight document, and `workspace` asks for the workspace answer.
+        for msg in [
+            r#"{"t":"send","text":"look"}"#,
+            r#"{"t":"highlights_merge","text":"Combat|kobold|#ff0000||yes\n"}"#,
+            r#"{"t":"workspace"}"#,
+        ] {
+            link.incoming.send(msg.to_string()).unwrap();
+        }
+        drop(link.incoming);
+        let done = crate::client::relay(&mut relay, |msg| asked(&mut page, &mut seat, msg)).await;
+        assert_eq!(
+            done,
+            Relayed {
+                handled: 3,
+                rejected: 0
+            }
+        );
+        assert_eq!(seat.sent, vec!["look"]);
+
+        let frames: Vec<String> = std::iter::from_fn(|| link.outgoing.try_recv().ok()).collect();
+        assert_eq!(frames[0], r#"{"t":"said","text":"look"}"#);
+        assert!(frames[1].starts_with(r#"{"t":"highlights_text","#), "{frames:?}");
+        // `In::Workspace` carries no request id, so the answer's `ask` is 0.
+        assert_eq!(
+            frames[2],
+            r#"{"t":"workspace","ask":0,"status":200}"#,
+            "{frames:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The whole socket path: a blocking `tungstenite` client on a local TCP
+    /// port, [`serve_socket`] bridging it onto the tokio relay.
+    #[tokio::test]
+    async fn relay_over_a_local_tcp_pair() {
+        use tungstenite::client::IntoClientRequest;
+        use tungstenite::Message;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = std::thread::spawn(move || -> Result<String, String> {
+            let stream = std::net::TcpStream::connect(addr).map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|e| e.to_string())?;
+            let request = "ws://localhost/"
+                .into_client_request()
+                .map_err(|e| e.to_string())?;
+            let (mut socket, response) =
+                tungstenite::client(request, stream).map_err(|e| e.to_string())?;
+            assert_eq!(response.status(), 101);
+            socket
+                .send(Message::text(r#"{"t":"send","text":"look"}"#))
+                .map_err(|e| e.to_string())?;
+            match socket.read().map_err(|e| e.to_string())? {
+                Message::Text(text) => Ok(text.to_string()),
+                other => Err(format!("{other:?}")),
+            }
+        });
+
+        let (stream, _) = tokio::task::spawn_blocking(move || listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut relay, bridge) = serve_socket(stream).unwrap();
+        let session = tokio::spawn(async move {
+            crate::client::relay(&mut relay, |msg| match msg {
+                In::Send { text } => vec![Out::Said { text }],
+                _ => Vec::new(),
+            })
+            .await
+        });
+
+        let reply = tokio::task::spawn_blocking(move || peer.join())
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the peer's reply");
+        assert_eq!(reply, r#"{"t":"said","text":"look"}"#);
+        let done = tokio::time::timeout(std::time::Duration::from_secs(10), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            done,
+            Relayed {
+                handled: 1,
+                rejected: 0
+            }
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bridge).await;
     }
 
     #[test]

@@ -1,327 +1,85 @@
-//! The `egui` seam.
+//! The `egui` seam — now the real `egui`.
 //!
-//! The original crate was an `eframe`/`egui` application: the recovered code
-//! paints through `egui::Painter`, lays text out with
-//! `egui::Context::fonts(..).layout_no_wrap(..)` and asks the surrounding `Ui`
-//! for `available_size()`.  `egui` is not available in this build, so the three
-//! things the recovered functions actually touch are modelled here:
+//! Phase 1/2 modelled the three things the recovered draw code touches
+//! (`Vec2`/`Rect`/`Color32`, the painter's primitives and `Ui`'s two queries)
+//! because `egui` was not a dependency yet. Phase 4 re-bases the seam on the
+//! pinned `egui` (git rev `3da022d`, see `docs/EGUI.md`): the types *are*
+//! `egui`'s, and the names the recovered code used are kept as re-exports and
+//! aliases so the rest of the crate still reads the same.
 //!
-//! * [`Vec2`], [`Rect`] and [`Color32`] — the geometry/colour value types
-//!   (`egui::Vec2` is `{x: f32, y: f32}`, `egui::Color32` is four bytes with
-//!   alpha last, which is exactly how the recovered code builds colours: it
-//!   ORs `0xff000000` into the alpha byte, e.g. `bar::Bar::look` @0x10070863c).
-//! * [`Painter`] — every draw call the recovered code makes, as explicit
-//!   primitives.  [`RecordingPainter`] records them so tests can assert them.
-//! * [`Ui`] — the two queries the recovered layout code performs
-//!   (`available_size` and a text measurement).
-//!
-//! See `NOTES.md` for the departure list.
+//! The layout identity the old seam asserted still holds and is what makes the
+//! swap safe — `Color32` is four bytes with alpha last (`to_u32` packs
+//! `r | g << 8 | b << 16 | a << 24`, which is how the recovered code builds a
+//! colour, e.g. `bar::Bar::look` @`0x10070863c`), `Vec2` is 8 bytes, `Rect` 16,
+//! `egui::Event` 72 (proved by `keys::Keys::take`'s `0x48` stride
+//! @`0x1003d80dc`). [`tests::the_layout_identity_is_the_recovered_one`] asserts
+//! all of that, plus the `egui::Key` table the recovered `names::winit_name`
+//! walks.
 
-/// `egui::Vec2`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Vec2 {
-    pub x: f32,
-    pub y: f32,
+pub use egui::{Color32, Pos2, Rect, Vec2};
+
+/// A laid-out run of text. The recovered code only ever reads `Galley::size`
+/// (`bar::Bar::fitted` @`0x1007094d4` loads the two `f32` at `galley + 0x30`).
+pub type Galley = egui::Galley;
+
+/// The painter the recovered draw code hands its primitives to
+/// (`egui::Painter`; `bar::stack::Stack::paint` and friends take `&Painter`).
+pub type Painter = egui::Painter;
+
+/// The layout context: `egui::Ui`. The recovered queries are
+/// `Ui::available_size` (`bar::Bar::fitted` @`0x100709404`) and `Ui::style`'s
+/// text styles (`TextStyle::resolve` @`0x100709488`).
+pub type Ui = egui::Ui;
+
+/// The packed-`u32` accessors the recovered code uses.
+///
+/// `egui::Color32` stores `[r, g, b, a]` in memory and has no `to_u32` of its
+/// own, but `bar::Bar::look` (@`0x100708610`) forces alpha with
+/// `orr w12, w12, #0xff000000` on the packed word and `Look`'s JSON writes the
+/// packed word, so the two conversions stay.
+pub trait Color32Ext: Copy {
+    /// The `u32` a colour transposes to (little-endian `r, g, b, a`).
+    fn to_u32(self) -> u32;
+    /// The inverse of [`Color32Ext::to_u32`].
+    fn from_u32(v: u32) -> Self;
+    /// The same colour with a forced `0xff` alpha — the recovered
+    /// `orr w12, w12, #0xff000000`.
+    fn opaque(self) -> Self;
 }
 
-impl Vec2 {
-    pub const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
-
-    pub const fn new(x: f32, y: f32) -> Self {
-        Vec2 { x, y }
+impl Color32Ext for Color32 {
+    fn to_u32(self) -> u32 {
+        u32::from_le_bytes([self.r(), self.g(), self.b(), self.a()])
     }
 
-    pub fn splat(v: f32) -> Self {
-        Vec2 { x: v, y: v }
-    }
-
-    pub fn min(self, other: Vec2) -> Vec2 {
-        Vec2::new(self.x.min(other.x), self.y.min(other.y))
-    }
-
-    pub fn max(self, other: Vec2) -> Vec2 {
-        Vec2::new(self.x.max(other.x), self.y.max(other.y))
-    }
-
-    pub fn length(self) -> f32 {
-        (self.x * self.x + self.y * self.y).sqrt()
-    }
-}
-
-impl std::ops::Add for Vec2 {
-    type Output = Vec2;
-    fn add(self, rhs: Vec2) -> Vec2 {
-        Vec2::new(self.x + rhs.x, self.y + rhs.y)
-    }
-}
-
-impl std::ops::Sub for Vec2 {
-    type Output = Vec2;
-    fn sub(self, rhs: Vec2) -> Vec2 {
-        Vec2::new(self.x - rhs.x, self.y - rhs.y)
-    }
-}
-
-/// `egui::Rect` — always `min`/`max`, never `x`/`y`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Rect {
-    pub min: Vec2,
-    pub max: Vec2,
-}
-
-impl Rect {
-    pub fn from_min_size(min: Vec2, size: Vec2) -> Self {
-        Rect { min, max: min + size }
-    }
-
-    pub fn size(&self) -> Vec2 {
-        self.max - self.min
-    }
-
-    pub fn width(&self) -> f32 {
-        self.max.x - self.min.x
-    }
-
-    pub fn height(&self) -> f32 {
-        self.max.y - self.min.y
-    }
-
-    pub fn center(&self) -> Vec2 {
-        Vec2::new(
-            self.min.x + self.width() / 2.0,
-            self.min.y + self.height() / 2.0,
-        )
-    }
-
-    pub fn contains(&self, p: Vec2) -> bool {
-        self.min.x <= p.x && p.x <= self.max.x && self.min.y <= p.y && p.y <= self.max.y
-    }
-
-    /// Grow/shrink on every side; positive `by` shrinks.
-    pub fn shrink(&self, by: f32) -> Rect {
-        Rect {
-            min: Vec2::new(self.min.x + by, self.min.y + by),
-            max: Vec2::new(self.max.x - by, self.max.y - by),
-        }
-    }
-}
-
-/// `egui::Color32` — `r`, `g`, `b`, `a` in memory order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Color32(pub u8, pub u8, pub u8, pub u8);
-
-impl Color32 {
-    pub const TRANSPARENT: Color32 = Color32(0, 0, 0, 0);
-    pub const BLACK: Color32 = Color32(0, 0, 0, 255);
-    pub const WHITE: Color32 = Color32(255, 255, 255, 255);
-
-    pub const fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Color32(r, g, b, 255)
-    }
-
-    pub const fn from_rgba_premultiplied(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Color32(r, g, b, a)
-    }
-
-    /// The `u32` an `egui::Color32` transposes to (little endian `r,g,b,a`).
-    pub fn to_u32(self) -> u32 {
-        u32::from_le_bytes([self.0, self.1, self.2, self.3])
-    }
-
-    pub fn from_u32(v: u32) -> Self {
+    fn from_u32(v: u32) -> Self {
         let [r, g, b, a] = v.to_le_bytes();
-        Color32(r, g, b, a)
+        Color32::from_rgba_premultiplied(r, g, b, a)
     }
 
-    pub fn r(&self) -> u8 {
-        self.0
-    }
-    pub fn g(&self) -> u8 {
-        self.1
-    }
-    pub fn b(&self) -> u8 {
-        self.2
-    }
-    pub fn a(&self) -> u8 {
-        self.3
+    fn opaque(self) -> Self {
+        Color32::from_rgba_premultiplied(self.r(), self.g(), self.b(), 0xff)
     }
 }
 
-/// A laid-out run of text (`egui::Galley`, of which the recovered code only
-/// ever reads `size`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Galley {
-    pub size: Vec2,
+/// A `Vec2` as a point (they are layout-identical: two `f32`).
+///
+/// `egui::Rect::from_min_size` takes a [`Pos2`] while the recovered layout code
+/// thinks in [`Vec2`] offsets, so the helpers below bridge at the seam instead
+/// of at every call site.
+pub fn pos(v: Vec2) -> Pos2 {
+    Pos2::new(v.x, v.y)
 }
 
-/// One primitive handed to a [`Painter`].
-#[derive(Clone, Debug, PartialEq)]
-pub enum Draw {
-    Rect {
-        rect: Rect,
-        fill: Color32,
-        rounding: f32,
-    },
-    Text {
-        pos: Vec2,
-        text: String,
-        size: f32,
-        color: Color32,
-    },
-    Line {
-        from: Vec2,
-        to: Vec2,
-        width: f32,
-        color: Color32,
-    },
-    Circle {
-        center: Vec2,
-        radius: f32,
-        fill: Color32,
-    },
-    /// A raster image, as raw RGBA rows (see `badge::pixels`).
-    Image {
-        rect: Rect,
-        size: [u32; 2],
-    },
+/// A rectangle from a corner and a size — `Rect::from_min_size` with a [`Vec2`]
+/// origin.
+pub fn rect(min: Vec2, size: Vec2) -> Rect {
+    Rect::from_min_size(pos(min), size)
 }
 
-/// Everything the recovered code asks a painter to do.
-pub trait Painter {
-    /// `Context::fonts(..).layout_no_wrap(text, font_id, color).size()`
-    /// (`bar::Bar::fitted` @0x1007094cc does exactly this).
-    fn layout_no_wrap(&mut self, text: &str, size: f32, color: Color32) -> Galley;
-    fn rect_filled(&mut self, rect: Rect, rounding: f32, fill: Color32);
-    fn text(&mut self, pos: Vec2, text: &str, size: f32, color: Color32);
-    fn line_segment(&mut self, from: Vec2, to: Vec2, width: f32, color: Color32);
-    fn circle_filled(&mut self, center: Vec2, radius: f32, fill: Color32);
-    fn image(&mut self, rect: Rect, size: [u32; 2]);
-}
-
-/// A [`Painter`] that records every primitive and measures text with a fixed
-/// monospace metric, so layout tests are deterministic.
-#[derive(Clone, Debug, Default)]
-pub struct RecordingPainter {
-    pub draws: Vec<Draw>,
-    /// Advance per character, as a fraction of the font size.
-    pub advance: f32,
-    /// Line height, as a multiple of the font size.
-    pub line_height: f32,
-}
-
-impl RecordingPainter {
-    pub fn new() -> Self {
-        RecordingPainter {
-            draws: Vec::new(),
-            advance: 0.6,
-            line_height: 1.2,
-        }
-    }
-
-    pub fn rects(&self) -> impl Iterator<Item = (&Rect, &Color32)> {
-        self.draws.iter().filter_map(|d| match d {
-            Draw::Rect { rect, fill, .. } => Some((rect, fill)),
-            _ => None,
-        })
-    }
-
-    pub fn texts(&self) -> impl Iterator<Item = (&str, Color32)> {
-        self.draws.iter().filter_map(|d| match d {
-            Draw::Text { text, color, .. } => Some((text.as_str(), *color)),
-            _ => None,
-        })
-    }
-}
-
-impl Painter for RecordingPainter {
-    fn layout_no_wrap(&mut self, text: &str, size: f32, _color: Color32) -> Galley {
-        let chars = text.chars().count() as f32;
-        Galley {
-            size: Vec2::new(chars * self.advance * size, self.line_height * size),
-        }
-    }
-
-    fn rect_filled(&mut self, rect: Rect, rounding: f32, fill: Color32) {
-        self.draws.push(Draw::Rect { rect, fill, rounding });
-    }
-
-    fn text(&mut self, pos: Vec2, text: &str, size: f32, color: Color32) {
-        self.draws.push(Draw::Text {
-            pos,
-            text: text.to_string(),
-            size,
-            color,
-        });
-    }
-
-    fn line_segment(&mut self, from: Vec2, to: Vec2, width: f32, color: Color32) {
-        self.draws.push(Draw::Line {
-            from,
-            to,
-            width,
-            color,
-        });
-    }
-
-    fn circle_filled(&mut self, center: Vec2, radius: f32, fill: Color32) {
-        self.draws.push(Draw::Circle {
-            center,
-            radius,
-            fill,
-        });
-    }
-
-    fn image(&mut self, rect: Rect, size: [u32; 2]) {
-        self.draws.push(Draw::Image { rect, size });
-    }
-}
-
-/// The parts of `egui::Ui` the recovered code uses.
-pub trait Ui {
-    /// `Ui::available_size()` (`bar::Bar::fitted` @0x100709404).
-    fn available_size(&self) -> Vec2;
-    /// The painter for this frame.
-    fn painter(&mut self) -> &mut dyn Painter;
-    /// Body text size, i.e. what `TextStyle::Body.resolve(..)` yields
-    /// (`bar::Bar::fitted` @0x100709488).
-    fn text_size(&self) -> f32;
-}
-
-/// A minimal [`Ui`] over a [`RecordingPainter`] with a fixed frame size.
-pub struct TestUi {
-    pub available: Vec2,
-    pub text_size: f32,
-    pub painter: RecordingPainter,
-}
-
-impl TestUi {
-    pub fn new(available: Vec2) -> Self {
-        TestUi {
-            available,
-            text_size: 14.0,
-            painter: RecordingPainter::new(),
-        }
-    }
-}
-
-impl Default for TestUi {
-    fn default() -> Self {
-        TestUi::new(Vec2::new(400.0, 300.0))
-    }
-}
-
-impl Ui for TestUi {
-    fn available_size(&self) -> Vec2 {
-        self.available
-    }
-
-    fn painter(&mut self) -> &mut dyn Painter {
-        &mut self.painter
-    }
-
-    fn text_size(&self) -> f32 {
-        self.text_size
-    }
+/// A rectangle from two corners given as [`Vec2`]s.
+pub fn rect_from_min_max(min: Vec2, max: Vec2) -> Rect {
+    Rect::from_min_max(pos(min), pos(max))
 }
 
 #[cfg(test)]
@@ -329,37 +87,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color32_packs_like_egui() {
+    fn the_layout_identity_is_the_recovered_one() {
+        // The ABI facts the crate notes record (`docs/EGUI.md` §5.3).
+        assert_eq!(std::mem::size_of::<Color32>(), 4);
+        assert_eq!(std::mem::size_of::<Vec2>(), 8);
+        assert_eq!(std::mem::size_of::<Pos2>(), 8);
+        assert_eq!(std::mem::size_of::<Rect>(), 16);
+        // `Keys::take` walks `Vec<egui::Event>` with a 0x48 stride
+        // (`add x21, x21, #0x48` @0x1003d80dc).
+        assert_eq!(std::mem::size_of::<egui::Event>(), 72);
+        // `names::winit_name` indexes the `egui::Key` name table with 117 codes.
+        assert_eq!(egui::Key::ALL.len(), 117);
+        assert_eq!(egui::Key::H as u8, 0x35);
+        assert_eq!(egui::Key::I as u8, 0x36);
+        assert_eq!(egui::Key::IntlBackslash as u8, 0x74);
+    }
+
+    #[test]
+    fn color32_packs_like_the_recovered_code() {
         // The recovered code builds a colour as r | g<<8 | b<<16 | 0xff000000.
         let packed = 0x10u32 | 0x20u32 << 8 | 0x30u32 << 16 | 0xff00_0000;
-        let c = Color32::from_u32(packed);
+        let c = <Color32 as Color32Ext>::from_u32(packed);
         assert_eq!((c.r(), c.g(), c.b(), c.a()), (0x10, 0x20, 0x30, 0xff));
         assert_eq!(c.to_u32(), packed);
+        assert_eq!(c.opaque(), c);
+        let faded = Color32::from_rgba_premultiplied(1, 2, 3, 0x40);
+        assert_eq!(faded.opaque(), Color32::from_rgb(1, 2, 3));
     }
 
     #[test]
     fn rect_geometry() {
-        let r = Rect::from_min_size(Vec2::new(10.0, 20.0), Vec2::new(30.0, 40.0));
+        let r = rect(Vec2::new(10.0, 20.0), Vec2::new(30.0, 40.0));
         assert_eq!(r.width(), 30.0);
         assert_eq!(r.height(), 40.0);
-        assert_eq!(r.center(), Vec2::new(25.0, 40.0));
-        assert!(r.contains(Vec2::new(11.0, 21.0)));
-        assert!(!r.contains(Vec2::new(41.0, 21.0)));
+        assert_eq!(r.center(), Pos2::new(25.0, 40.0));
+        assert!(r.contains(Pos2::new(11.0, 21.0)));
+        assert!(!r.contains(Pos2::new(41.0, 21.0)));
         assert_eq!(r.shrink(5.0).size(), Vec2::new(20.0, 30.0));
-    }
-
-    #[test]
-    fn recording_painter_measures_and_records() {
-        let mut p = RecordingPainter::new();
-        let g = p.layout_no_wrap("north", 10.0, Color32::WHITE);
-        assert_eq!(g.size, Vec2::new(5.0 * 6.0, 12.0));
-        p.rect_filled(
-            Rect::from_min_size(Vec2::ZERO, Vec2::splat(4.0)),
-            0.0,
-            Color32::WHITE,
+        assert_eq!(
+            rect_from_min_max(Vec2::ZERO, Vec2::splat(4.0)),
+            rect(Vec2::ZERO, Vec2::splat(4.0))
         );
-        p.text(Vec2::ZERO, "hi", 10.0, Color32::BLACK);
-        assert_eq!(p.rects().count(), 1);
-        assert_eq!(p.texts().next(), Some(("hi", Color32::BLACK)));
     }
 }

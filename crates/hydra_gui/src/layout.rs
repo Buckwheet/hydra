@@ -64,7 +64,7 @@ mod tests {
             ..Layout::default()
         };
         let rect = layout.main_rect(crate::seam::Vec2::new(800.0, 600.0));
-        assert_eq!(rect.min, crate::seam::Vec2::new(0.0, 0.0));
+        assert_eq!(rect.min, crate::seam::pos(crate::seam::Vec2::ZERO));
         assert_eq!(rect.size(), crate::seam::Vec2::new(800.0, 600.0));
     }
 
@@ -73,7 +73,10 @@ mod tests {
         let mut layout = Layout::default();
         layout.drawers.top.open = true;
         let rect = layout.main_rect(crate::seam::Vec2::new(800.0, 600.0));
-        assert_eq!(rect.min, crate::seam::Vec2::new(0.0, 160.0));
+        assert_eq!(
+            rect.min,
+            crate::seam::pos(crate::seam::Vec2::new(0.0, 160.0))
+        );
         assert_eq!(rect.size(), crate::seam::Vec2::new(800.0, 440.0));
     }
 }

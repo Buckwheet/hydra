@@ -14,9 +14,11 @@
 //! | `TitleBar::set` | `0x1003da938` | not reconstructed |
 //! | `TitleBar::page` | `0x1003db164` | not reconstructed |
 //!
-//! The original was `egui`-based (`TitleBar::set`/`page` paint through
-//! `egui::Context`); the recovered layout/state lives here and painting is a
-//! documented seam.
+//! The original was `egui`-based: `TitleBar::set` @`0x1003da938` rebuilds the
+//! three item lists and `TitleBar::page` @`0x1003db164` paints them. Neither
+//! body was read instruction by instruction, so [`TitleBar::ui`] draws one real
+//! `egui` button per item — the recovered text is `Item::label`, and the three
+//! lists are laid out left, middle and right of the strip it is given.
 
 use crate::json::{self, Value};
 
@@ -237,6 +239,41 @@ pub struct TitleBar {
     pub settled: bool,
 }
 
+impl TitleBar {
+    /// Every item, in the order the bar draws them: left, middle, then right.
+    pub fn items(&self) -> Vec<Item> {
+        self.left
+            .iter()
+            .chain(self.middle.iter())
+            .chain(self.right.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// Draw the bar into the `Ui` it is given, one button per item.
+    ///
+    /// The left and middle lists run left-to-right; the right list is laid out
+    /// right-to-left so it hangs off the strip's right edge. The returned pairs
+    /// are what the caller needs to react to a click (see `app::Hub::press`).
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<(Item, egui::Response)> {
+        let mut responses = Vec::new();
+        // One row, whichever way the surrounding `Ui` lays out.
+        ui.horizontal(|ui| {
+            for item in self.left.iter().chain(self.middle.iter()) {
+                let response = ui.button(item.label());
+                responses.push((item.clone(), response));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for item in self.right.iter().rev() {
+                    let response = ui.button(item.label());
+                    responses.push((item.clone(), response));
+                }
+            });
+        });
+        responses
+    }
+}
+
 /// The left-hand entries a title bar starts with.
 ///
 /// `left_at_first` @`0x1003d97c0` allocates a two-entry `Vec<Item>`
@@ -425,6 +462,78 @@ mod tests {
             r#"{"left":["character","connection"],"middle":["zoom"],"right":["menu","zoom"],"tucked":true}"#
         );
         assert_eq!(Written::from_json(&json::parse(&text).unwrap()), written);
+    }
+
+    #[test]
+    fn items_lists_left_then_middle_then_right() {
+        let written = Written {
+            left: vec![Item::Character],
+            middle: vec![Item::Log],
+            right: vec![Item::Menu, Item::Zoom],
+            tucked: true,
+        };
+        let bar = TitleBar::from(written);
+        assert_eq!(
+            bar.items(),
+            vec![Item::Character, Item::Log, Item::Menu, Item::Zoom]
+        );
+    }
+
+    #[test]
+    fn the_bar_draws_one_button_per_item_with_the_recovered_labels() {
+        let mut bar = TitleBar::default();
+        let (responses, out) = crate::headless::frame(
+            &egui::Context::default(),
+            egui::Vec2::new(660.0, 24.0),
+            |ui| bar.ui(ui),
+        );
+        // `TitleBar as Default`: Character, Connection | (none) | Menu, Zoom.
+        // The responses come back in *paint* order, and the right-hand list is
+        // added right-to-left (so `Menu` sits left of `Zoom`, as written).
+        let items: Vec<String> = responses
+            .iter()
+            .map(|(item, _)| item.label().to_string())
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                "Character".to_string(),
+                "Connection".to_string(),
+                "Zoom \u{2212} and +".to_string(),
+                "Menu".to_string()
+            ]
+        );
+        // The same four labels are what the frame actually painted.
+        let mut painted = crate::headless::texts(&out);
+        painted.sort();
+        assert_eq!(
+            painted,
+            vec![
+                "Character".to_string(),
+                "Connection".to_string(),
+                "Menu".to_string(),
+                "Zoom \u{2212} and +".to_string()
+            ]
+        );
+        // Every button is inside the strip it was given.
+        for (_, response) in &responses {
+            assert!(response.rect.min.y >= 0.0);
+            assert!(response.rect.max.y <= 24.0);
+            assert!(response.rect.height() > 0.0);
+        }
+        // The right-hand pair hangs off the right edge: `Zoom` is the rightmost.
+        let zoom = responses
+            .iter()
+            .find(|(item, _)| *item == Item::Zoom)
+            .map(|(_, response)| response.rect)
+            .unwrap();
+        let character = responses
+            .iter()
+            .find(|(item, _)| *item == Item::Character)
+            .map(|(_, response)| response.rect)
+            .unwrap();
+        assert_eq!(zoom.max.x, 660.0);
+        assert_eq!(character.min.x, 0.0);
     }
 
     #[test]

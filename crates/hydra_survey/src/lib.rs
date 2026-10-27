@@ -1,22 +1,20 @@
-#![allow(dead_code,unused)]
+//! The room survey: the log a survey walk writes, the graph it builds out of
+//! that log, and the two probes that ask a room whether magic works and whether
+//! it can be splashed.
+//!
+//! Reconstructed from the arm64 binary `/Users/cpmbpro/Code/hydra-inspect/hydra`
+//! (no DWARF). `NOTES.md` holds the legend, the per-function evidence and every
+//! departure from the original; the two that shape the crate:
+//!
+//! * the original deserialised the log with `serde`/`serde_json` over nine
+//!   derived types (`Record`, `Happening`, `Body`, `Via`, `EdgeRecord`,
+//!   `EdgeResult`, `RoomRecord`, `VerbRecord`, `EventRecord`). This build has no
+//!   dependencies, so [`json`] is a small reader and [`log`] carries the
+//!   hand-written field readers with the *recovered* names, order and types.
+//! * the graph itself is `std` only (`BTreeMap`, `BTreeSet`, `HashMap`), which
+//!   is what the original used too.
+
 pub mod graph;
+pub mod json;
 pub mod log;
 pub mod probes;
-
-/* unresolved symbols (trait impls, closures, generics):
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Via>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c29d4
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Record>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c29e8
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Via>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Body>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c2b94
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::EdgeRecord>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c2e40
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::RoomRecord>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c2fb4
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::VerbRecord>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c2fc8
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::EventRecord>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001013c2fdc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Record>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::Happening>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c2b94
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::EdgeRecord>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::EdgeResult>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c2b94
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::RoomRecord>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::VerbRecord>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
- <hydra_survey::log::_::<impl serde_core::de::Deserialize for hydra_survey::log::EventRecord>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x00000001013c29fc
-*/

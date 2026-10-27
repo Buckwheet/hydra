@@ -11,6 +11,8 @@ pub mod lookout_seed;
 pub mod menu_store;
 pub mod notes;
 pub mod notice;
+mod pattern;
+pub mod password;
 pub mod player_log;
 pub mod queue;
 pub mod saves;
@@ -19,19 +21,24 @@ pub mod steps;
 pub mod store;
 pub mod stream_rules;
 pub mod supervisor;
+mod textfmt;
 
-/* unresolved symbols (trait impls, closures, generics):
- hydra_session::notes::<impl core::convert::From<hydra_session::notes::Refused> for std::io::error::Error>::from @0x0000000101a527c8
- <hydra_session::notes::_::<impl serde_core::de::Deserialize for hydra_session::notes::File>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a54fb4
- <hydra_session::notes::_::<impl serde_core::de::Deserialize for hydra_session::notes::Note>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a54fc8
- <hydra_session::alias::_::<impl serde_core::de::Deserialize for hydra_session::alias::AliasFile>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101ab13e0
- <hydra_session::notes::_::<impl serde_core::de::Deserialize for hydra_session::notes::File>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x0000000101a54fdc
- <hydra_session::notes::_::<impl serde_core::de::Deserialize for hydra_session::notes::Note>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x0000000101a54fdc
- <hydra_session::notes::_::<impl serde_core::de::Deserialize for hydra_session::notes::Clipped>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x0000000101a54fdc
- <hydra_session::claimant::_::<impl serde_core::de::Deserialize for hydra_session::claimant::Settings>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a809fc
- <hydra_session::settings_store::_::<impl serde_core::de::Deserialize for hydra_session::settings_store::SettingsFile>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a06d8c
- <hydra_session::player_log::links::_::<impl serde_core::de::Deserialize for hydra_session::player_log::links::LogLink>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a550c0
- <hydra_session::player_log::feed::_::<impl serde_core::de::Deserialize for hydra_session::player_log::feed::LogSettings>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101a89050
- <hydra_session::player_log::links::_::<impl serde_core::de::Deserialize for hydra_session::player_log::links::Does>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x0000000101a55254
- <hydra_session::player_log::links::_::<impl serde_core::de::Deserialize for hydra_session::player_log::links::LogLink>::deserialize::__FieldVisitor as serde_core::de::Visitor>::expecting @0x0000000101a54fdc
+/* Unresolved symbols in the original binary (trait impls, closures, generics).
+   They are listed so the recovery is auditable; all of them are now covered
+   here, either by hand or by the std-only replacements documented in NOTES.md:
+
+   hydra_session::notes::<impl From<notes::Refused> for std::io::Error>::from  @0x101a527c8
+       -> notes::Refused + `impl From<Refused> for io::Error`               (recovered)
+   <impl Deserialize for notes::File / notes::Note / notes::Clipped>::…__Visitor
+       -> textfmt::parse_json + notes::Notes::from_json                       (replaced)
+   <impl Deserialize for alias::AliasFile>::…__Visitor
+       -> textfmt::parse_json + alias::AliasFile::absorb                      (replaced)
+   <impl Deserialize for claimant::Settings>::…__Visitor
+       -> claimant::Settings (a plain Option<Desk>)                           (replaced)
+   <impl Deserialize for settings_store::SettingsFile>::…__Visitor
+       -> textfmt::parse_json + settings_store::SettingsFile::from_json       (replaced)
+   <impl Deserialize for player_log::links::{LogLink, Does}>::…__Visitor
+       -> textfmt::parse_json + player_log::links::{read, Does::of}            (replaced)
+   <impl Deserialize for player_log::feed::LogSettings>::…__Visitor
+       -> player_log::feed::LogSettings (plain fields)                        (replaced)
 */

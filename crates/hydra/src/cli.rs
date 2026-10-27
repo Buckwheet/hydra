@@ -65,8 +65,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One of the command lines the reference build understands.
 ///
-/// The variants that need the GUI or a live game connection are recognised but
-/// not wired up in this headless phase; see `NOTES.md`.
+/// Every variant is recognised; what each one *runs* is set out in `NOTES.md`
+/// §8 (`login` and `play` log in for real since Phase 6, `serve` is still the
+/// Lich side only, the hub window and the ledger are still reported).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// No arguments at all: the hub window (`hydra::gui::run`).

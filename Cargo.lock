@@ -1367,8 +1367,11 @@ dependencies = [
  "eframe",
  "hydra_gui",
  "hydra_lich",
+ "hydra_mocks",
+ "hydra_net",
  "hydra_protocol",
  "hydra_session",
+ "hydra_table",
  "tokio",
 ]
 
@@ -1501,9 +1504,11 @@ name = "hydra_net"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "hydra_mocks",
  "jiff",
  "regex",
  "reqwest",
+ "rustls",
  "tokio",
  "tokio-tungstenite",
 ]

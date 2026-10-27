@@ -27,6 +27,13 @@ path = "src/main.rs"
 hydra_protocol = { path = "../hydra_protocol" }
 hydra_session = { path = "../hydra_session" }
 hydra_lich = { path = "../hydra_lich" }
+# Phase 6: `hydra login`/`hydra play` log in for real — `hydra_net`'s eaccess
+# handshake (`eaccess::handshake`) and game socket (`eaccess::game`) — and take
+# the account, the game and the data folder from `hydra_table` (the roster and
+# `account::data_dir`).  Both are the siblings the recovered `hydra::connect`
+# (`0x10021b8d`) called.
+hydra_net = { path = "../hydra_net" }
+hydra_table = { path = "../hydra_table" }
 tokio = { workspace = true }
 # `hydra::gui::run` (`0x1001103f4`, 9716 bytes) is the eframe boundary: the
 # recovered `hydra_gui::app::run` builds the "Hydra" window (660 × 520, "hub",
@@ -35,3 +42,8 @@ tokio = { workspace = true }
 # built `NativeOptions` — the types come from the same pinned git rev.
 hydra_gui = { path = "../hydra_gui" }
 eframe = { workspace = true }
+
+[dev-dependencies]
+# The loopback mock eaccess and game servers: every `play`/`login` integration
+# test runs against these on 127.0.0.1, never a real host (see tests/login.rs).
+hydra_mocks = { path = "../hydra_mocks" }

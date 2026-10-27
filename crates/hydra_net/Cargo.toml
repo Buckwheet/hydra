@@ -12,3 +12,16 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# Phase 6: the eaccess login is a real TLS client (`eaccess::handshake`), built on
+# rustls's synchronous `ClientConnection` + `StreamOwned` over a `TcpStream` — not
+# on `tokio-rustls`, which is not in the offline registry either.  rustls's
+# default provider is `aws-lc-rs`, which is *also* not in the registry, so the
+# `ring` provider is selected explicitly and the default features are off.  This
+# is deliberately not a workspace pin: `hydra_mocks` (the test-only mock server)
+# declares the same version and feature set for itself.  See NOTES.md §6.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+# The loopback mock eaccess/game servers the login is tested against: real TLS,
+# a certificate generated at test time, no network, no credentials.
+hydra_mocks = { path = "../hydra_mocks" }

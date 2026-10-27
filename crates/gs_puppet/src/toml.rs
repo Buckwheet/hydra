@@ -103,6 +103,39 @@ pub fn parse(src: &str) -> Result<Table, String> {
         if line.is_empty() {
             continue;
         }
+        if let Some(rest) = line.strip_prefix("[[") {
+            // Array of tables: `[[name.sub]]` appends a fresh table.
+            let Some(inner) = rest.strip_suffix("]]") else {
+                return Err(format!("line {lineno}: unterminated array header"));
+            };
+            let inner = inner.trim();
+            if inner.is_empty() {
+                return Err(format!("line {lineno}: empty array header"));
+            }
+            path = inner.split('.').map(|s| s.trim().to_string()).collect();
+            let mut cur = &mut root;
+            for seg in &path[..path.len() - 1] {
+                let entry = cur
+                    .entry(seg.clone())
+                    .or_insert_with(|| Value::Table(Table::new()));
+                if entry.as_table().is_none() {
+                    return Err(format!("line {lineno}: `{seg}` is not a table"));
+                }
+                cur = match entry {
+                    Value::Table(t) => t,
+                    _ => unreachable!(),
+                };
+            }
+            let last = path.last().unwrap().clone();
+            let entry = cur
+                .entry(last)
+                .or_insert_with(|| Value::Arr(Vec::new()));
+            let Value::Arr(items) = entry else {
+                return Err(format!("line {lineno}: `{}` is not an array", path.last().unwrap()));
+            };
+            items.push(Value::Table(Table::new()));
+            continue;
+        }
         if let Some(rest) = line.strip_prefix('[') {
             let Some(inner) = rest.strip_suffix(']') else {
                 return Err(format!("line {lineno}: unterminated table header"));
@@ -146,6 +179,12 @@ pub fn parse(src: &str) -> Result<Table, String> {
                 .or_insert_with(|| Value::Table(Table::new()))
             {
                 Value::Table(t) => t,
+                // `[[arr]]` leaves an array here: the following keys belong to its
+                // last element.
+                Value::Arr(items) => match items.last_mut() {
+                    Some(Value::Table(t)) => t,
+                    _ => return Err(format!("line {lineno}: `{seg}` is not a table")),
+                },
                 _ => return Err(format!("line {lineno}: `{seg}` is not a table")),
             };
         }
@@ -290,6 +329,16 @@ period = 3.6
     fn comments_inside_strings_are_kept() {
         let doc = parse("k = \"a # b\" # trailing\n").unwrap();
         assert_eq!(doc["k"].as_str(), Some("a # b"));
+    }
+
+    #[test]
+    fn parses_arrays_of_tables() {
+        let src = "[[segment]]\nname = \"root\"\nradius = 0.1\n[[segment]]\nname = \"neck\"\nradius = 0.2\n";
+        let doc = parse(src).unwrap();
+        let arr = doc["segment"].as_arr().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_table().unwrap()["name"].as_str(), Some("root"));
+        assert_eq!(arr[1].as_table().unwrap()["radius"].as_f32(), Some(0.2));
     }
 
     #[test]

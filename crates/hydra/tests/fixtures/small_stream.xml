@@ -1,0 +1,7 @@
+<preset id="roomName">Town Square</preset>
+<room name="Town Square" id="42"/>
+You see a fountain here, its water &lt;cold&gt; and clear.
+<a exist="-1001" noun="gem">a blue gem</a> glitters on the ground.
+<pushBold/>Vaalor’s gate creaks.<popBold/>
+<questState id="7">ready</questState>
+<prompt>&gt;</prompt>

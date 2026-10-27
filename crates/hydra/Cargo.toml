@@ -1,0 +1,30 @@
+# The original package: the panic paths in `__cstring` read
+# `crates/hydra/src/{main,gui,play,connect,rest,update,instance}.rs`
+# (0x103e21a91 … 0x103e22d78), and the local symbol table carries `hydra::main`,
+# `hydra::gui::*`, `hydra::play::*`, `hydra::replay::*`, `hydra::connect::*`,
+# `hydra::instance::*`, `hydra::rest::*`, `hydra::started::*`,
+# `hydra::startup::*`, `hydra::render::*`, `hydra::status::*` and
+# `hydra::lookout_seed` — i.e. one binary crate.  See NOTES.md.
+
+[package]
+name = "hydra"
+# The version the reference build reports as its own: `hydra_update::VERSION`,
+# i.e. the `semver::Version::parse("0.1.0-beta.7")` call in `hydra::update::keep`
+# (0x10009e744) and the `hydra/0.1.0-beta.7` user agent.
+version = "0.1.0-beta.7"
+edition = "2021"
+description = "Hydra: the GemStone IV front end, recovered and running headless"
+
+[[bin]]
+name = "hydra"
+path = "src/main.rs"
+
+[dependencies]
+# The three siblings the binary drives: `hydra::replay::replay` (0x100205ff4)
+# calls `hydra_protocol`'s `Parser::push_bytes` directly, `hydra::play::run`
+# drives `hydra_session::command::SessionHandle`, and the relay is
+# `hydra_lich`'s.  `tokio` is the workspace pin (`cargo --offline`).
+hydra_protocol = { path = "../hydra_protocol" }
+hydra_session = { path = "../hydra_session" }
+hydra_lich = { path = "../hydra_lich" }
+tokio = { workspace = true }

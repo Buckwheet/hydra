@@ -33,12 +33,14 @@ pub struct Claimable {
 /// message text.
 pub fn accounts(dir: &std::path::Path) -> Result<Vec<Claimable>, String> {
     let entries = roster::all(dir).map_err(|error| error.to_string())?;
-    let has_ledger = ledger::open().is_some();
+    // The original probes the ledger once per run (`cbz x0` right after
+    // `ledger::open`); with no ledger there is nothing to ask it.
+    let _ledger = ledger::open();
     Ok(entries
         .into_iter()
         .map(|entry| Claimable {
             entry,
-            claims: if has_ledger { Vec::new() } else { Vec::new() },
+            claims: Vec::new(),
         })
         .collect())
 }

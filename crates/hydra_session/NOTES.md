@@ -259,8 +259,18 @@ Lich is not reading what is typed for it ({} lines wait): not handed: {}    leve
 renders 64 lowercase hex characters.  Lich is started with
 `--pipe --stormfront --sentinel -g 127.0.0.1:<port>` (`relay::spawn`), and the
 relay connects back to that port and proves it is the parent with the token as
-the keyed first line.  `hydra_session` only carries the door: it never sees the
-token.  **UNKNOWN**: the wire encoding of the keyed accept.
+the keyed first line.
+
+`hydra_session::lich` now exposes the synchronous equivalent the relay needs:
+
+* `accept_keyed(&mut stream, token)` — writes the token as one line and flushes;
+* `connect_keyed(port, token)` — connects to `127.0.0.1:<port>`, applies the
+  recovered **60-second** deadline to connect/read/write, and calls
+  `accept_keyed`.  The token is never logged.
+
+**UNKNOWN**: the original's exact wire encoding (newline, JSON or length
+prefix); the newline form is the documented safest choice.  The original body
+was inlined into the relay closure, so no symbol carries it.
 
 ### 3.5 Password flow — recovered, and it is *not* a Lich prompt
 

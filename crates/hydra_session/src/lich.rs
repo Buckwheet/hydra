@@ -83,9 +83,12 @@
 
 use crate::command::{Event, SessionHandle};
 use crate::notice::{Notice, LEVEL_INFO, LEVEL_WARN};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// How many lines the door buffers coming *from* Lich
 /// (**ESTABLISHED**: `Semaphore::new(0x1000)` in `LichDoor::claim`).
@@ -609,6 +612,43 @@ impl SessionHandle {
     }
 }
 
+/// The 60-second deadline the relay allows Lich to connect
+/// (`hydra_lich/NOTES.md` §2.2: "did not connect within 60 seconds").
+pub const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Perform the keyed accept for Lich's local `--pipe`.
+///
+/// **ESTABLISHED** (from `hydra_lich`): the relay mints a 64-character token
+/// with `hydra_lich::child::new_token`, starts Lich with
+/// `--pipe --stormfront --sentinel -g 127.0.0.1:<port>`, connects back to that
+/// port and hands the token to an inlined `accept_keyed` future with a
+/// 60-second deadline.
+///
+/// **UNKNOWN**: the exact wire encoding of the keyed first line (newline,
+/// JSON or a length prefix).  This synchronous helper uses the simplest
+/// keyed-first-line form: the token followed by `\n`, then a flush.  The
+/// caller can then read Lich's acknowledgement from the same stream.  The
+/// token itself is never logged.
+pub fn accept_keyed<S: Read + Write>(stream: &mut S, token: &str) -> io::Result<()> {
+    stream.write_all(token.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+/// Connect to Lich's local pipe and perform [`accept_keyed`].
+///
+/// The address is always `127.0.0.1:<port>` (**ESTABLISHED**: the relay's
+/// `build_command` appends that string).  The connection, read and write all
+/// use [`ACCEPT_TIMEOUT`].
+pub fn connect_keyed(port: u16, token: &str) -> io::Result<TcpStream> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, ACCEPT_TIMEOUT)?;
+    stream.set_read_timeout(Some(ACCEPT_TIMEOUT))?;
+    stream.set_write_timeout(Some(ACCEPT_TIMEOUT))?;
+    accept_keyed(&mut stream, token)?;
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +779,14 @@ mod tests {
         assert_eq!(t.waiting(), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(t.take(), vec!["a".to_string(), "b".to_string()]);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn keyed_accept_sends_one_token_line() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut wire = std::io::Cursor::new(Vec::new());
+        accept_keyed(&mut wire, token).unwrap();
+        assert_eq!(wire.into_inner(), format!("{token}\n").into_bytes());
+        assert_eq!(ACCEPT_TIMEOUT, Duration::from_secs(60));
     }
 }

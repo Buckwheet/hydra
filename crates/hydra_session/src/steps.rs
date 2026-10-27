@@ -6,29 +6,47 @@
 //! **ESTABLISHED**:
 //! * `said` (`0x101aafedc`) maps a `&[Step]` (element stride `0x30` = 48 bytes,
 //!   `madd x1, x1, 48, x0`) to strings and joins them with a **7-byte**
-//!   separator (`join_generic_copy` with length 7).  The only 7-byte
-//!   separator that renders a list of steps as a sentence is `", then "`.
-//! * `wait` (`0x101aaffb8`) looks at the first character and formats the
+//!   separator (`join_generic_copy` with length 7) whose bytes are at
+//!   `0x1039c770b`: `", then "`.
+//! * The step renderings (the `Map::fold` inlined at `0x101a9e900`):
+//!   discriminant `0` is the line itself; discriminant `1` is a real-time wait,
+//!   formatted from the step's `Duration` as `format!("wait {} s", secs_f64)`
+//!   (the `f32` divisor at `0x101a9e960` is `1e9`); discriminant `2` is the
+//!   23-byte literal `"wait for roundtime"` (`0x1039c751b`) and discriminant `3`
+//!   the 18-byte `"wait for cast roundtime"` (`0x1039c7509`); every other
+//!   discriminant goes through `steps::behaviour_said` (`0x101aafd40`).
+//! * `wait` (`0x101aaffb8`) decodes the **first character** of the piece and
+//!   compares it case-insensitively against `'s'` (`and w9, w9, #0xffffffdf` /
+//!   `cmp w9, #0x53`), parses the rest as an **`f32`** (`<f32 as FromStr>`), and
+//!   requires `0.0 <= s < 60.0` (`cmp x8, #0x3c`); anything else formats the
 //!   literal at `0x103e7cc12`, which decodes (length-prefixed pieces) to
-//!   `` `{}` waits from a moment to {} seconds ``.  So a `wait` word is
-//!   either bare ("a moment") or carries a whole number of seconds, and there
-//!   is an upper bound that produces that message.
+//!   `` `{}` waits from a moment to {} seconds `` with `60` as the second
+//!   argument.  So the original's wait spelling is `s<seconds>`, not
+//!   `wait <seconds>`.
+//! * `steps` (`0x101ab01e8`) calls `pieces` (`0x101ab0c08`) and then `wait` on
+//!   each piece, sending the piece unchanged when `wait` refuses it.
 //! * `Aliases::expand` (`0x101aaead4`) calls `steps::pieces`, and
 //!   `AliasFile::put` (`0x101aae1ac`) calls `steps::steps`: the alias layer
 //!   splits a line into pieces and parses each piece into a step.
+//! * The piece separator: `pieces` (2 KB of hand-written char handling)
+//!   compares each character against `','` (`0x2c`), `'['` (`0x5b`), `']'` and
+//!   `'\\'` (`0x5c`), so **a comma separates steps** and a backslash escapes the
+//!   next character.  [`pieces`] splits on `,` and honours `\,`; `;` and `\n`
+//!   are kept as tolerated extras the original does not have.
 //!
-//! **UNKNOWN:** the piece separator.  The binary inlines the split, so we
-//! choose `;` (and accept `\n`), which is the separator Lich and Stormfront use
-//! for multi-command lines.  The upper bound on a wait is not recoverable
-//! either; 60 seconds is our choice and is reported by [`MAX_WAIT`].
+//! **UNKNOWN**: what `[`/`]` group in the original, and what the other step
+//! kinds are (`steps::behaviour_said` is a thin tail call), so [`Step`] models
+//! only "send a line" and "wait N seconds".
 
 use std::time::Duration;
 
-/// The longest single wait a step may ask for.
+/// The longest single wait a step may ask for (**ESTABLISHED**: `cmp x8, #0x3c`
+/// in `steps::wait`).
 pub const MAX_WAIT: u64 = 60;
-/// The word that introduces a wait step.
+/// The word that introduces a wait step in this crate's spelling.
 pub const WAIT_WORD: &str = "wait";
-/// What [`said`] puts between two steps (**ESTABLISHED**: 7 bytes).
+/// What [`said`] puts between two steps (**ESTABLISHED**: the 7 bytes at
+/// `0x1039c770b`).
 pub const SEPARATOR: &str = ", then ";
 
 /// One thing to do, in order.
@@ -42,12 +60,12 @@ pub enum Step {
 
 impl Step {
     /// How this step reads in [`said`].
+    ///
+    /// **ESTABLISHED**: a wait renders as `format!("wait {} s", secs_f64)`.
     pub fn text(&self) -> String {
         match self {
             Step::Send(line) => line.clone(),
-            Step::Wait(0) => "wait a moment".to_string(),
-            Step::Wait(1) => "wait 1 second".to_string(),
-            Step::Wait(n) => format!("wait {n} seconds"),
+            Step::Wait(n) => format!("wait {n} s"),
         }
     }
 
@@ -70,59 +88,93 @@ impl Step {
 
 /// Split a typed line into its pieces.
 ///
-/// **UNKNOWN** separator: see the module note.  Blank pieces are dropped, so
-/// `"a;;b;"` is two pieces.
+/// **ESTABLISHED**: a comma separates steps and a backslash escapes the next
+/// character (`0x101ab0c08` compares against `,`, `[`, `]` and `\`).  Blank
+/// pieces are dropped, so `"a,,b,"` is two pieces.  `;` and `\n` are tolerated
+/// extras the original does not have; what `[`/`]` group is **UNKNOWN**.
 pub fn pieces(line: &str) -> Vec<String> {
-    line.split([';', '\n'])
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped) => current.push(escaped),
+                None => current.push('\\'),
+            },
+            ',' | ';' | '\n' => {
+                let piece = current.trim();
+                if !piece.is_empty() {
+                    out.push(piece.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let piece = current.trim();
+    if !piece.is_empty() {
+        out.push(piece.to_string());
+    }
+    out
 }
 
-/// Parse one `wait` word: `wait` alone is "a moment", `wait 5` is five
-/// seconds, and anything else is an error with the recovered message.
+/// The recovered refusal for a wait that is not a number of seconds
+/// (**ESTABLISHED**: `` `{}` waits from a moment to 60 seconds ``).
+fn not_seconds(piece: &str) -> String {
+    format!("`{piece}` waits from a moment to {MAX_WAIT} seconds")
+}
+
+/// Parse one wait word.
 ///
-/// **ESTABLISHED** message: `` `{word}` waits from a moment to {MAX_WAIT}
-/// seconds ``.
+/// **ESTABLISHED** spelling (`0x101aaffb8`): `s<seconds>` — the first
+/// character is compared case-insensitively against `'s'` and the rest parses
+/// as an `f32` in `0.0..60.0`.  The original's step holds the `Duration`, so a
+/// fractional wait keeps its fraction there; [`Step::Wait`] is whole seconds, so
+/// `s2.5` is truncated to two seconds here.
+///
+/// The crate also accepts the more explicit `wait <seconds>`, and bare `wait`
+/// for a zero-second wait; the original has no such spelling.
 pub fn wait(piece: &str) -> Result<Step, String> {
+    let piece = piece.trim();
+    let mut chars = piece.chars();
+    if let Some(first) = chars.next() {
+        if first.eq_ignore_ascii_case(&'s') {
+            return match chars.as_str().parse::<f32>() {
+                Ok(seconds)
+                    if seconds.is_finite() && seconds >= 0.0 && seconds < MAX_WAIT as f32 =>
+                {
+                    Ok(Step::Wait(seconds as u64))
+                }
+                _ => Err(not_seconds(piece)),
+            };
+        }
+    }
     let mut parts = piece.split_whitespace();
     let word = parts.next().unwrap_or("");
     if !word.eq_ignore_ascii_case(WAIT_WORD) {
-        return Err(format!(
-            "`{word}` is not a wait: `wait` or `wait <seconds>`"
-        ));
+        return Err(format!("`{word}` is not a wait: `wait` or `s<seconds>`"));
     }
     match parts.next() {
         None => Ok(Step::Wait(0)),
         Some(number) => match number.parse::<u64>() {
             Ok(n) if n <= MAX_WAIT => Ok(Step::Wait(n)),
-            _ => Err(if number.parse::<u64>().is_ok() {
-                format!("`{piece}` waits from a moment to {MAX_WAIT} seconds")
-            } else {
-                format!("`{piece}` is not a number of seconds")
-            }),
+            _ => Err(not_seconds(piece)),
         },
     }
 }
 
 /// Parse a whole typed line into steps.
 ///
-/// A piece that starts with the wait word becomes [`Step::Wait`]; everything
-/// else is sent as-is.
+/// **ESTABLISHED** (`0x101ab01e8`): split the line with [`pieces`] and run
+/// [`wait`] over **every** piece; a piece `wait` refuses is sent as-is.
 pub fn steps(line: &str) -> Vec<Step> {
     let mut out = Vec::new();
     for piece in pieces(line) {
-        let first = piece.split_whitespace().next().unwrap_or("");
-        if first.eq_ignore_ascii_case(WAIT_WORD) {
-            match wait(&piece) {
-                Ok(step) => out.push(step),
-                // A malformed wait is sent through unchanged: the game will
-                // reject it, which is better than dropping the line.
-                Err(_) => out.push(Step::Send(piece)),
-            }
-        } else {
-            out.push(Step::Send(piece));
+        match wait(&piece) {
+            Ok(step) => out.push(step),
+            // A piece that is not a wait is sent through unchanged.
+            Err(_) => out.push(Step::Send(piece)),
         }
     }
     out
@@ -142,11 +194,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pieces_drops_blanks() {
-        assert_eq!(pieces("a;b"), vec!["a", "b"]);
-        assert_eq!(pieces(" a ;; b ; "), vec!["a", "b"]);
+    fn pieces_splits_on_commas_and_drops_blanks() {
+        // The recovered separator is ',' (0x101ab0c08).
+        assert_eq!(pieces("go north, kill rat"), vec!["go north", "kill rat"]);
+        assert_eq!(pieces("a,,b,"), vec!["a", "b"]);
         assert_eq!(pieces(""), Vec::<String>::new());
         assert_eq!(pieces("go north"), vec!["go north"]);
+        // ';' and '\n' are this crate's tolerated extras.
+        assert_eq!(pieces("a;b"), vec!["a", "b"]);
+        assert_eq!(pieces(" a ;; b ; "), vec!["a", "b"]);
+        // A backslash escapes the next character.
+        assert_eq!(pieces(r"say hi\, friend"), vec!["say hi, friend"]);
     }
 
     #[test]
@@ -156,13 +214,25 @@ mod tests {
         assert_eq!(wait("WAIT 60"), Ok(Step::Wait(60)));
         let e = wait("wait 61").unwrap_err();
         assert_eq!(e, "`wait 61` waits from a moment to 60 seconds");
-        assert!(wait("wait soon").is_err());
         assert!(wait("run").unwrap_err().contains("is not a wait"));
+        // The recovered spelling: 's' (any case) then an f32 in 0.0..60.0.
+        assert_eq!(wait("s2"), Ok(Step::Wait(2)));
+        assert_eq!(wait("S2.5"), Ok(Step::Wait(2)));
+        assert_eq!(wait("s0"), Ok(Step::Wait(0)));
+        assert_eq!(
+            wait("s60").unwrap_err(),
+            "`s60` waits from a moment to 60 seconds"
+        );
+        assert_eq!(
+            wait("soon").unwrap_err(),
+            "`soon` waits from a moment to 60 seconds"
+        );
+        assert!(wait("s-1").is_err());
     }
 
     #[test]
     fn steps_split_waits_from_sends() {
-        let s = steps("go north; wait 2; kill rat");
+        let s = steps("go north, wait 2, kill rat");
         assert_eq!(
             s,
             vec![
@@ -170,6 +240,11 @@ mod tests {
                 Step::Wait(2),
                 Step::Send("kill rat".into())
             ]
+        );
+        // The recovered spelling goes through the same path.
+        assert_eq!(
+            steps("go north, s2"),
+            vec![Step::Send("go north".into()), Step::Wait(2)]
         );
         assert_eq!(Step::Wait(2).duration(), Some(Duration::from_secs(2)));
         assert_eq!(Step::Send("x".into()).duration(), None);
@@ -179,11 +254,12 @@ mod tests {
     #[test]
     fn said_joins_with_the_seven_byte_separator() {
         assert_eq!(SEPARATOR.len(), 7);
+        assert_eq!(SEPARATOR, ", then ");
         assert_eq!(
             said(&[Step::Send("go north".into()), Step::Wait(2), Step::Wait(0)]),
-            "go north, then wait 2 seconds, then wait a moment"
+            "go north, then wait 2 s, then wait 0 s"
         );
         assert_eq!(said(&[]), "");
-        assert_eq!(said(&[Step::Wait(1)]), "wait 1 second");
+        assert_eq!(said(&[Step::Wait(1)]), "wait 1 s");
     }
 }

@@ -8,8 +8,8 @@
 //!
 //! plus the inlined helper the original imported from the vendored
 //! `vellum_light` crate, `vellum_light::phase_keyframes` @0x100ac3dcc, which is
-//! reproduced here as [`phase_keyframes`] (**std departure**: the original
-//! depended on an external crate).
+//! reproduced here as [`phase_keyframes`].  It stays hand-written: `vellum_light`
+//! is a vendored crate, not a registry crate, so there is nothing to re-pin.
 //!
 //! ## `phase_keyframes`
 //!
@@ -51,9 +51,10 @@ use crate::sky::Sky;
 
 /// Stand-in for `vellum_light::phase_keyframes`.
 ///
-/// **std departure.**  Returns a `Vec` like the original (heap allocated, built
-/// with `alloc(8, 4)` / `alloc(16, 4)`), but the tags and weights are the
-/// recovered ones.
+/// Kept by hand (`vellum_light` is a vendored crate, not on the registry).
+/// Returns a `Vec` like the original (heap allocated, built with
+/// `alloc(8, 4)` / `alloc(16, 4)`), but the tags and weights are the recovered
+/// ones.
 pub fn phase_keyframes(times: &[f32; 4], hour: f32) -> Vec<Keyframe> {
     let h = hour.rem_euclid(24.0);
     let (t0, t1, t2, t3) = (times[0], times[1], times[2], times[3]);

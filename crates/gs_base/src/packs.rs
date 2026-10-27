@@ -34,21 +34,23 @@
 //! pack file '{}' is not under global/
 //! ```
 //!
-//! ## std departures
+//! ## Dependencies (Phase 1)
 //!
 //! | original | here |
 //! |---|---|
-//! | `sha2::Sha256` | [`Sha256`], written from scratch |
-//! | `zip` crate (`zlib_rs` inflate) | [`ZipArchive`], with a small DEFLATE decoder |
-//! | `toml` + `serde` | a minimal parser in [`Manifest::from_toml`] / [`parse_toml`] |
-//! | `anyhow` | `crate::Error` |
+//! | `anyhow` 1.0.104 | the real crate, re-exported as `crate::Error` / `crate::Result`; every message below is still a plain `format!` string |
+//! | `zip` 9.0.0 (+ its `zlib_rs` inflater) | the real `zip` crate behind [`ZipArchive`]; [`inflate`] now wraps `flate2` 1.1.10 |
+//! | `toml` 1.1.6 + `serde` 1.0.229 | the real crates: [`Manifest`] and [`Ledger`] derive `Deserialize`, [`parse_toml`] maps `toml::Table` onto [`TomlValue`] |
+//! | `sha2::Sha256` | **[`Sha256`] is kept** — the original had no `sha2` dependency (`PLAN.md`); `compress256` is inlined in the binary |
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Error, Result};
+use anyhow::{anyhow, bail};
+
+use crate::Result;
 
 // ---------------------------------------------------------------------------
 // SHA-256
@@ -76,7 +78,12 @@ pub static SHA256_K: [u32; 64] = [
 ///
 /// The binary inlines `sha2::sha256::compress256` and the standard IV; the
 /// second `compress256` call with a zero-filled final block is the
-/// `0x80`/length padding.  **std departure**: replaces the `sha2` crate.
+/// `0x80`/length padding.
+///
+/// **Kept by hand** (not reconnected): `PLAN.md` records that the original had
+/// no `sha2` crate, and the round function really is inlined in the binary
+/// rather than called through a library boundary, so this is the original code
+/// rather than a stand-in.
 #[derive(Clone)]
 pub struct Sha256 {
     state: [u32; 8],
@@ -256,14 +263,54 @@ pub const FILE_PREFIX: &str = "global/";
 /// field *names* (`id`, `format`, `files`) are, via the two validation messages
 /// ("id '{}' is not lower snake case", "pack '{}' is format {}, newer than this
 /// build understands ({})") and "pack file '{}' is not under global/".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The struct is deserialized by the real `serde` + `toml` crates; unknown keys
+/// are ignored, exactly as the previous hand-written reader ignored them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct Manifest {
     /// Pack id; must be lower `snake_case`.
+    #[serde(default)]
     pub id: String,
     /// Manifest format version.
+    #[serde(default, deserialize_with = "de_format")]
     pub format: u32,
     /// Files the pack ships, each under `global/`.
+    #[serde(default)]
     pub files: Vec<String>,
+}
+
+/// `format` accepts an integer or an integer written as a string.
+///
+/// The recovered reader did the same (`Some(Integer(n)) if n >= 0` otherwise
+/// `Some(String(s)) => s.parse()`, anything else `0`); a string that is not a
+/// number is now a deserialization error instead of the "newer than this build
+/// understands" message, which was only ever reached for a numeric string.
+fn de_format<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Int(i64),
+        Text(String),
+    }
+
+    Ok(match Raw::deserialize(deserializer)? {
+        // Mirrors the recovered `Some(Integer(n)) if *n >= 0 => *n as u32, _ => 0`.
+        Raw::Int(n) => {
+            if n < 0 {
+                0
+            } else {
+                n as u32
+            }
+        }
+        Raw::Text(s) => s
+            .parse::<u32>()
+            .map_err(|_| serde::de::Error::custom(format!("format '{s}' is not a number")))?,
+    })
 }
 
 impl Manifest {
@@ -274,45 +321,32 @@ impl Manifest {
     /// * `pack '{}' is format {}, newer than this build understands ({})`
     /// * `pack file '{}' is not under global/`
     ///
-    /// **std departure**: the original used `toml` + `serde`.
+    /// The text is parsed by the real `toml` crate, so a *syntax* error now
+    /// carries that crate's wording ("TOML parse error at line …, column …")
+    /// instead of the hand parser's `pack.toml: cannot parse line '…'`, which
+    /// was never a recovered literal.
     pub fn from_toml(text: &str) -> Result<Manifest> {
-        let doc = parse_toml(text)?;
-        let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !is_lower_snake_case(&id) {
-            return Err(Error::msg(format!(
-                "pack.toml: id '{id}' is not lower snake case"
-            )));
+        let manifest: Manifest = toml::from_str(text)?;
+        if !is_lower_snake_case(&manifest.id) {
+            bail!(
+                "pack.toml: id '{}' is not lower snake case",
+                manifest.id
+            );
         }
-        let format = match doc.get("format") {
-            Some(TomlValue::Integer(n)) if *n >= 0 => *n as u32,
-            Some(TomlValue::String(s)) => s.parse::<u32>().map_err(|_| {
-                Error::msg(format!(
-                    "pack '{id}' is format {s}, newer than this build understands ({SUPPORTED_FORMAT})"
-                ))
-            })?,
-            _ => 0,
-        };
-        if format > SUPPORTED_FORMAT {
-            return Err(Error::msg(format!(
-                "pack '{id}' is format {format}, newer than this build understands ({SUPPORTED_FORMAT})"
-            )));
+        if manifest.format > SUPPORTED_FORMAT {
+            bail!(
+                "pack '{}' is format {}, newer than this build understands ({})",
+                manifest.id,
+                manifest.format,
+                SUPPORTED_FORMAT
+            );
         }
-        let mut files = Vec::new();
-        if let Some(TomlValue::Array(items)) = doc.get("files") {
-            for item in items {
-                let path = match item {
-                    TomlValue::String(s) => s.clone(),
-                    _ => String::new(),
-                };
-                if !path.starts_with(FILE_PREFIX) {
-                    return Err(Error::msg(format!(
-                        "pack file '{path}' is not under global/"
-                    )));
-                }
-                files.push(path);
+        for path in &manifest.files {
+            if !path.starts_with(FILE_PREFIX) {
+                bail!("pack file '{path}' is not under global/");
             }
         }
-        Ok(Manifest { id, format, files })
+        Ok(manifest)
     }
 }
 
@@ -327,15 +361,20 @@ pub fn is_lower_snake_case(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// A very small TOML subset
+// TOML
 // ---------------------------------------------------------------------------
 
-/// Value of the TOML subset this crate understands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Value of the TOML subset this crate cares about.
+///
+/// `toml::Value` mapped one-for-one (a date-time is carried as its textual
+/// form); `f64` is why this type is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TomlValue {
     String(String),
     Integer(i64),
+    Float(f64),
     Boolean(bool),
+    Datetime(String),
     Array(Vec<TomlValue>),
     Table(BTreeMap<String, TomlValue>),
 }
@@ -349,149 +388,37 @@ impl TomlValue {
     }
 }
 
-/// A flat `key = value` / `[section]` document.
+/// Parse a TOML document into nested [`TomlValue`]s.
 ///
-/// **std departure** — replaces `toml`.  Keys inside `[a.b]` sections are stored
-/// with their dotted path.  Supports strings (basic and literal), integers,
-/// booleans, single-line arrays, and `#` comments.
+/// Deferred to the real `toml` crate (pinned 1.1.6): dotted keys and `[a.b]`
+/// headers nest the same way the recovered subset did, and arrays, inline
+/// tables, floats and date-times are now accepted too.  Only the error *text*
+/// changed — see [`Manifest::from_toml`].
 pub fn parse_toml(text: &str) -> Result<BTreeMap<String, TomlValue>> {
-    let mut root: BTreeMap<String, TomlValue> = BTreeMap::new();
-    let mut section: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = strip_comment(raw).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = rest.trim().split('.').map(|p| p.trim().to_string()).collect();
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(Error::msg(format!("pack.toml: cannot parse line '{line}'")));
-        };
-        let key = key.trim().to_string();
-        let (value, rest) = parse_value(value.trim())?;
-        if !rest.trim().is_empty() {
-            return Err(Error::msg(format!(
-                "pack.toml: trailing text after '{}'",
-                key
-            )));
-        }
-        let mut path = section.clone();
-        path.push(key);
-        insert_path(&mut root, &path, value);
-    }
-    Ok(root)
+    let table: toml::Table = toml::from_str(text)?;
+    Ok(table
+        .into_iter()
+        .map(|(key, value)| (key, from_toml_value(value)))
+        .collect())
 }
 
-fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_str: Option<u8> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        match in_str {
-            Some(q) => {
-                if b == q {
-                    in_str = None;
-                }
-            }
-            None => {
-                if b == b'"' || b == b'\'' {
-                    in_str = Some(b);
-                } else if b == b'#' {
-                    return &line[..i];
-                }
-            }
+fn from_toml_value(value: toml::Value) -> TomlValue {
+    match value {
+        toml::Value::String(s) => TomlValue::String(s),
+        toml::Value::Integer(n) => TomlValue::Integer(n),
+        toml::Value::Float(f) => TomlValue::Float(f),
+        toml::Value::Boolean(b) => TomlValue::Boolean(b),
+        toml::Value::Datetime(d) => TomlValue::Datetime(d.to_string()),
+        toml::Value::Array(items) => {
+            TomlValue::Array(items.into_iter().map(from_toml_value).collect())
         }
+        toml::Value::Table(table) => TomlValue::Table(
+            table
+                .into_iter()
+                .map(|(key, value)| (key, from_toml_value(value)))
+                .collect(),
+        ),
     }
-    line
-}
-
-fn insert_path(
-    root: &mut BTreeMap<String, TomlValue>,
-    path: &[String],
-    value: TomlValue,
-) {
-    if path.len() == 1 {
-        root.insert(path[0].clone(), value);
-        return;
-    }
-    let entry = root
-        .entry(path[0].clone())
-        .or_insert_with(|| TomlValue::Table(BTreeMap::new()));
-    if let TomlValue::Table(map) = entry {
-        insert_path(map, &path[1..], value);
-    }
-}
-
-fn parse_value(s: &str) -> Result<(TomlValue, &str)> {
-    if let Some(mut rest) = s.strip_prefix('"') {
-        let mut out = String::new();
-        loop {
-            let Some(pos) = rest.find(['"', '\\']) else {
-                return Err(Error::msg("pack.toml: unterminated string"));
-            };
-            out.push_str(&rest[..pos]);
-            if rest.as_bytes()[pos] == b'"' {
-                return Ok((TomlValue::String(out), &rest[pos + 1..]));
-            }
-            // Escape.
-            let mut it = rest[pos + 1..].chars();
-            match it.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some(other) => out.push(other),
-                None => return Err(Error::msg("pack.toml: truncated escape")),
-            }
-            rest = it.as_str();
-        }
-    }
-    if let Some(rest) = s.strip_prefix('\'') {
-        let Some(pos) = rest.find('\'') else {
-            return Err(Error::msg("pack.toml: unterminated literal string"));
-        };
-        return Ok((TomlValue::String(rest[..pos].to_string()), &rest[pos + 1..]));
-    }
-    if let Some(rest) = s.strip_prefix('[') {
-        let mut items = Vec::new();
-        let mut tail = rest.trim_start();
-        if let Some(t) = tail.strip_prefix(']') {
-            return Ok((TomlValue::Array(items), t));
-        }
-        loop {
-            let (v, t) = parse_value(tail)?;
-            items.push(v);
-            tail = t.trim_start();
-            if let Some(t) = tail.strip_prefix(',') {
-                tail = t.trim_start();
-                if let Some(t) = tail.strip_prefix(']') {
-                    return Ok((TomlValue::Array(items), t));
-                }
-                continue;
-            }
-            if let Some(t) = tail.strip_prefix(']') {
-                return Ok((TomlValue::Array(items), t));
-            }
-            return Err(Error::msg("pack.toml: malformed array"));
-        }
-    }
-    // Bare token: integer or boolean.
-    let end = s
-        .find(|c: char| c == ',' || c == ']' || c.is_whitespace())
-        .unwrap_or(s.len());
-    let (token, rest) = s.split_at(end);
-    if token == "true" {
-        return Ok((TomlValue::Boolean(true), rest));
-    }
-    if token == "false" {
-        return Ok((TomlValue::Boolean(false), rest));
-    }
-    if let Ok(n) = token.replace('_', "").parse::<i64>() {
-        return Ok((TomlValue::Integer(n), rest));
-    }
-    Err(Error::msg(format!("pack.toml: bad value '{token}'")))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,8 +485,9 @@ pub const LEDGER_FILE: &str = "installed.toml";
 /// INFERRED: serde's field name `files` is in the pool; the value shape
 /// (a list of file names) is inferred from the `remove` walk, which joins each
 /// element onto the pack's directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Installed {
+    #[serde(default)]
     pub files: Vec<String>,
 }
 
@@ -568,56 +496,54 @@ pub struct Installed {
 /// INFERRED: serde's struct name `Ledger` and field name `format` are in the
 /// pool, as is `Installed`/`files`.  A `pack` field name is also present but its
 /// owner could not be pinned down, so it is left out (see NOTES.md).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Deserializing a `Ledger` directly expects the `[installed.…]` table shape;
+/// [`ledger`] accepts either spelling and writes the `[packs.…]` one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Ledger {
+    #[serde(default)]
     pub format: u32,
+    #[serde(default)]
     pub installed: BTreeMap<String, Installed>,
+}
+
+/// The on-disk file, which may spell the pack table `[packs.…]` *or*
+/// `[installed.…]` (NOTES unknown 6).
+#[derive(serde::Deserialize)]
+struct LedgerFile {
+    #[serde(default)]
+    format: u32,
+    #[serde(default)]
+    packs: Option<BTreeMap<String, Installed>>,
+    #[serde(default)]
+    installed: Option<BTreeMap<String, Installed>>,
+}
+
+/// The shape this crate writes: `format = n` plus one `[packs.<id>]` table per
+/// installed pack.
+#[derive(serde::Serialize)]
+struct LedgerOut<'a> {
+    format: u32,
+    packs: &'a BTreeMap<String, Installed>,
 }
 
 /// Read `<root>/packs/installed.toml`.
 ///
 /// `@0x100a78740` — `root.join("packs").join("installed.toml")`, then
 /// `fs::read_to_string`, then the TOML deserializer wrapped in
-/// `anyhow::Context`.
+/// `anyhow::Context`.  Both the `[packs.…]` and the `[installed.…]` table
+/// shapes are accepted, `packs` winning if a file somehow carries both.
 pub fn ledger(root: &Path) -> Result<Ledger> {
     let path = root.join(PACKS_DIR).join(LEDGER_FILE);
     let text = fs::read_to_string(&path)?;
-    let doc = parse_toml(&text)?;
-    let format = match doc.get("format") {
-        Some(TomlValue::Integer(n)) if *n >= 0 => *n as u32,
-        _ => 0,
-    };
-    let mut installed = BTreeMap::new();
-    if let Some(TomlValue::Table(packs)) = doc.get(PACKS_DIR) {
-        for (id, value) in packs {
-            let mut files = Vec::new();
-            if let TomlValue::Table(fields) = value {
-                if let Some(TomlValue::Array(items)) = fields.get("files") {
-                    for item in items {
-                        if let TomlValue::String(s) = item {
-                            files.push(s.clone());
-                        }
-                    }
-                }
-            }
-            installed.insert(id.clone(), Installed { files });
-        }
-    } else if let Some(TomlValue::Table(packs)) = doc.get("installed") {
-        for (id, value) in packs {
-            let mut files = Vec::new();
-            if let TomlValue::Table(fields) = value {
-                if let Some(TomlValue::Array(items)) = fields.get("files") {
-                    for item in items {
-                        if let TomlValue::String(s) = item {
-                            files.push(s.clone());
-                        }
-                    }
-                }
-            }
-            installed.insert(id.clone(), Installed { files });
-        }
-    }
-    Ok(Ledger { format, installed })
+    let file: LedgerFile = toml::from_str(&text)?;
+    Ok(Ledger {
+        format: file.format,
+        installed: file
+            .packs
+            .or(file.installed)
+            .unwrap_or_default(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +563,7 @@ pub fn remove(root: &Path, id: &str) -> Result<Report> {
     let entry = book
         .installed
         .remove(id)
-        .ok_or_else(|| Error::msg(format!("no pack '{id}' is installed")))?;
+        .ok_or_else(|| anyhow!("no pack '{id}' is installed"))?;
     let dir = root.join(PACKS_DIR).join(id);
     let mut removed = Vec::new();
     for file in &entry.files {
@@ -661,25 +587,18 @@ pub fn remove(root: &Path, id: &str) -> Result<Report> {
 }
 
 /// Serialise and write the ledger back.
+///
+/// Now serialised by the real `toml` crate (pinned 1.1.6) instead of by hand;
+/// the keys, the `format = n` line and the `[packs.<id>]` tables are unchanged.
 pub fn write_ledger(root: &Path, book: &Ledger) -> Result<()> {
     let dir = root.join(PACKS_DIR);
     fs::create_dir_all(&dir)?;
-    let mut out = String::new();
-    out.push_str(&format!("format = {}\n", book.format));
-    for (id, entry) in &book.installed {
-        out.push_str(&format!("\n[{PACKS_DIR}.{id}]\nfiles = ["));
-        for (i, f) in entry.files.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push('"');
-            out.push_str(&f.replace('\\', "\\\\").replace('"', "\\\""));
-            out.push('"');
-        }
-        out.push_str("]\n");
-    }
+    let text = toml::to_string(&LedgerOut {
+        format: book.format,
+        packs: &book.installed,
+    })?;
     let mut f = fs::File::create(dir.join(LEDGER_FILE))?;
-    f.write_all(out.as_bytes())?;
+    f.write_all(text.as_bytes())?;
     Ok(())
 }
 
@@ -721,54 +640,62 @@ pub fn install_zip(zip: &[u8], expected_sha256: &str, global: &Path) -> Result<R
     let actual = sha256_hex(zip);
     let expected = expected_sha256.trim();
     if !actual.eq_ignore_ascii_case(expected) {
-        return Err(Error::msg(format!(
-            "the pack's SHA-256 is {actual}, not {expected}: not installed"
-        )));
+        bail!("the pack's SHA-256 is {actual}, not {expected}: not installed");
     }
 
-    let archive = ZipArchive::new(zip)?;
-    if archive.entries.len() > MAX_ENTRIES {
-        return Err(Error::msg("the zip holds more files than a pack may"));
+    let mut archive = open_zip(zip)?;
+    let count = archive.len();
+    if count > MAX_ENTRIES {
+        bail!("the zip holds more files than a pack may");
     }
 
     // Find and parse pack.toml.
-    let manifest_entry = archive
-        .entry("pack.toml")
-        .ok_or_else(|| Error::msg("the zip has no pack.toml"))?;
-    let raw = archive.read(manifest_entry)?;
-    let text = std::str::from_utf8(&raw)
-        .map_err(|_| Error::msg("pack.toml is not text"))?
-        .to_string();
+    let manifest_index = archive
+        .index_for_name("pack.toml")
+        .ok_or_else(|| anyhow!("the zip has no pack.toml"))?;
+    let text = {
+        let mut entry = archive.by_index(manifest_index)?;
+        let mut raw = Vec::new();
+        entry.read_to_end(&mut raw)?;
+        String::from_utf8(raw).map_err(|_| anyhow!("pack.toml is not text"))?
+    };
     let manifest = Manifest::from_toml(&text)?;
+
+    // Central-directory metadata for the guards below.
+    let meta = archive.metadata();
 
     // Size guard before writing anything.
     let mut total: u64 = 0;
-    for entry in &archive.entries {
-        total = total.saturating_add(entry.uncompressed_size);
+    for index in 0..count {
+        let entry = meta.entry(index).map_err(|_| anyhow!("not a zip"))?;
+        total = total.saturating_add(entry.size());
     }
     if total > MAX_UNPACKED_BYTES {
-        return Err(Error::msg(
-            "the zip unpacks to more than a pack may",
-        ));
+        bail!("the zip unpacks to more than a pack may");
     }
 
     // Validate every entry before touching the filesystem, so a hostile archive
     // never leaves a staging directory behind.
     let mut planned: Vec<(usize, PathBuf)> = Vec::new();
-    for (idx, entry) in archive.entries.iter().enumerate() {
-        let name = entry.name.clone();
+    for index in 0..count {
+        let entry = meta.entry(index).map_err(|_| anyhow!("not a zip"))?;
+        let name = entry
+            .name()
+            .map_err(|_| anyhow!("not a zip"))?
+            .into_owned();
         if name == "pack.toml" {
             continue;
         }
         // A ZIP symlink is marked by S_IFLNK in the external attributes.
         if entry.is_symlink() {
-            return Err(Error::msg(format!("{name}: a pack holds no links")));
+            bail!("{name}: a pack holds no links");
         }
         let Some(rel) = safe_relative(&name) else {
-            return Err(Error::msg(format!("{name}: outside the pack's folder")));
+            bail!("{name}: outside the pack's folder");
         };
-        planned.push((idx, rel));
+        planned.push((index, rel));
     }
+    drop(meta);
 
     let pack_dir = global.join(PACKS_DIR).join(&manifest.id);
     let staging = global.join(PACKS_DIR).join("pack-tmp");
@@ -781,19 +708,24 @@ pub fn install_zip(zip: &[u8], expected_sha256: &str, global: &Path) -> Result<R
     };
     let mut written: Vec<String> = Vec::new();
 
-    for (idx, rel) in &planned {
-        let entry = &archive.entries[*idx];
+    for (index, rel) in &planned {
         let dest = staging.join(rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = match archive.read(entry) {
-            Ok(b) => b,
+        let mut bytes = Vec::new();
+        match archive.by_index(*index) {
+            Ok(mut entry) => {
+                if let Err(e) = entry.read_to_end(&mut bytes) {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(e.into());
+                }
+            }
             Err(e) => {
                 let _ = fs::remove_dir_all(&staging);
-                return Err(e);
+                return Err(anyhow!("not a zip: {e}"));
             }
-        };
+        }
         fs::write(&dest, &bytes)?;
         written.push(rel.to_string_lossy().replace('\\', "/"));
     }
@@ -824,12 +756,8 @@ pub fn install_zip(zip: &[u8], expected_sha256: &str, global: &Path) -> Result<R
 
     // Update the ledger.
     let mut book = ledger(global).unwrap_or_default();
-    book.installed.insert(
-        manifest.id.clone(),
-        Installed {
-            files: written,
-        },
-    );
+    book.installed
+        .insert(manifest.id.clone(), Installed { files: written });
     write_ledger(global, &book)?;
 
     Ok(report)
@@ -878,13 +806,14 @@ pub struct ZipEntry {
     pub name: String,
     /// Compression method (`0` = stored, `8` = deflate).
     pub method: u16,
-    /// CRC-32 as recorded in the central directory (not verified).
+    /// CRC-32 as recorded in the central directory.
     pub crc32: u32,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
     /// Unix mode bits from the "external attributes" field, if any.
     pub unix_mode: u32,
-    local_header_offset: u64,
+    /// Index into the real archive, used by [`ZipArchive::read`].
+    index: usize,
 }
 
 impl ZipEntry {
@@ -901,11 +830,16 @@ pub const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
 pub const CDFH_SIG: u32 = 0x0201_4b50;
 pub const LFH_SIG: u32 = 0x0403_4b50;
 
-/// A minimal ZIP archive reader: EOCD → central directory → local headers.
+/// An archive listing with entry-by-entry reads.
 ///
-/// **std departure** — replaces the `zip` crate.  ZIP64 EOCD locators are
-/// recognised (the markers are in the pool) but not parsed; archives needing
-/// them fall back to the 32-bit central-directory values.
+/// Thin wrapper over `zip::ZipArchive` (pinned 9.0.0): the metadata recorded in
+/// [`ZipEntry`] is copied out of the crate's central directory, and [`read`]
+/// re-opens the archive (the crate needs `&mut` for a read while this API is
+/// `&self`) to decompress one entry.  Because the real crate does the parsing it
+/// also verifies each entry's CRC-32, which the hand-written reader did not, and
+/// it understands ZIP64 and every method the crate was built with.
+///
+/// [`read`]: ZipArchive::read
 #[derive(Debug, Clone)]
 pub struct ZipArchive<'a> {
     data: &'a [u8],
@@ -915,59 +849,23 @@ pub struct ZipArchive<'a> {
 impl<'a> ZipArchive<'a> {
     /// Parse the central directory.
     pub fn new(data: &'a [u8]) -> Result<ZipArchive<'a>> {
-        let eocd = find_eocd(data).ok_or_else(|| Error::msg("not a zip"))?;
-        // EOCD: sig(4) disk(2) cd_disk(2) n_disk(2) n_total(2) cd_size(4) cd_off(4) comment(2)
-        if eocd + 22 > data.len() {
-            return Err(Error::msg("not a zip"));
-        }
-        let n_total = u16::from_le_bytes([data[eocd + 10], data[eocd + 11]]) as usize;
-        let cd_size = u32::from_le_bytes([
-            data[eocd + 12],
-            data[eocd + 13],
-            data[eocd + 14],
-            data[eocd + 15],
-        ]) as usize;
-        let cd_off = u32::from_le_bytes([
-            data[eocd + 16],
-            data[eocd + 17],
-            data[eocd + 18],
-            data[eocd + 19],
-        ]) as usize;
-        if cd_off.saturating_add(cd_size) > data.len() {
-            return Err(Error::msg("not a zip"));
-        }
-
-        let mut entries = Vec::with_capacity(n_total.min(1024));
-        let mut p = cd_off;
-        for _ in 0..n_total {
-            if p + 46 > data.len() || u32::from_le_bytes(rd4(data, p)) != CDFH_SIG {
-                break;
-            }
-            let method = u16::from_le_bytes([data[p + 10], data[p + 11]]);
-            let crc32 = u32::from_le_bytes(rd4(data, p + 16));
-            let compressed_size = u32::from_le_bytes(rd4(data, p + 20)) as u64;
-            let uncompressed_size = u32::from_le_bytes(rd4(data, p + 24)) as u64;
-            let name_len = u16::from_le_bytes([data[p + 28], data[p + 29]]) as usize;
-            let extra_len = u16::from_le_bytes([data[p + 30], data[p + 31]]) as usize;
-            let comment_len = u16::from_le_bytes([data[p + 32], data[p + 33]]) as usize;
-            let unix_mode = u32::from_le_bytes(rd4(data, p + 38)) >> 16;
-            let local_header_offset = u32::from_le_bytes(rd4(data, p + 42)) as u64;
-            let name_start = p + 46;
-            let name_end = name_start + name_len;
-            if name_end > data.len() {
-                return Err(Error::msg("not a zip"));
-            }
-            let name = String::from_utf8_lossy(&data[name_start..name_end]).into_owned();
+        let archive = open_zip(data)?;
+        let meta = archive.metadata();
+        let mut entries = Vec::with_capacity(meta.len());
+        for index in 0..meta.len() {
+            let entry = meta.entry(index).map_err(|_| anyhow!("not a zip"))?;
             entries.push(ZipEntry {
-                name,
-                method,
-                crc32,
-                compressed_size,
-                uncompressed_size,
-                unix_mode,
-                local_header_offset,
+                name: entry
+                    .name()
+                    .map_err(|_| anyhow!("not a zip"))?
+                    .into_owned(),
+                method: method_code(entry.compression()),
+                crc32: entry.crc32(),
+                compressed_size: entry.compressed_size(),
+                uncompressed_size: entry.size(),
+                unix_mode: entry.unix_mode().unwrap_or(0),
+                index,
             });
-            p = name_end + extra_len + comment_len;
         }
         Ok(ZipArchive { data, entries })
     }
@@ -979,40 +877,32 @@ impl<'a> ZipArchive<'a> {
 
     /// Decompress one entry.
     pub fn read(&self, entry: &ZipEntry) -> Result<Vec<u8>> {
-        let off = entry.local_header_offset as usize;
-        if off + 30 > self.data.len() || u32::from_le_bytes(rd4(self.data, off)) != LFH_SIG {
-            return Err(Error::msg("not a zip"));
-        }
-        let name_len = u16::from_le_bytes([self.data[off + 26], self.data[off + 27]]) as usize;
-        let extra_len = u16::from_le_bytes([self.data[off + 28], self.data[off + 29]]) as usize;
-        let start = off + 30 + name_len + extra_len;
-        let end = start
-            .checked_add(entry.compressed_size as usize)
-            .filter(|e| *e <= self.data.len())
-            .ok_or_else(|| Error::msg("not a zip"))?;
-        let raw = &self.data[start..end];
-        match entry.method {
-            0 => Ok(raw.to_vec()),
-            8 => inflate(raw, entry.uncompressed_size as usize),
-            m => Err(Error::msg(format!("a name in the zip: method {m}"))),
-        }
+        let mut archive = open_zip(self.data)?;
+        let mut file = archive.by_index(entry.index)?;
+        let mut out = Vec::with_capacity(entry.uncompressed_size.min(1 << 20) as usize);
+        file.read_to_end(&mut out)?;
+        Ok(out)
     }
 }
 
-fn rd4(d: &[u8], p: usize) -> [u8; 4] {
-    [d[p], d[p + 1], d[p + 2], d[p + 3]]
+/// Open a ZIP over an in-memory slice; anything the crate rejects is the
+/// recovered literal `not a zip`.
+fn open_zip(data: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>> {
+    zip::ZipArchive::new(Cursor::new(data)).map_err(|_| anyhow!("not a zip"))
 }
 
-/// Locate the end-of-central-directory record.
-fn find_eocd(data: &[u8]) -> Option<usize> {
-    if data.len() < 22 {
-        return None;
+/// The numeric ZIP method code for a method the crate knows.
+///
+/// The crate only exposes `from_u16`, so the code is found by inverting it over
+/// the u16 space; the deprecated `Unsupported(code)` variant answers directly.
+#[allow(deprecated)]
+fn method_code(method: zip::CompressionMethod) -> u16 {
+    if let zip::CompressionMethod::Unsupported(code) = method {
+        return code;
     }
-    let stop = data.len().saturating_sub(22);
-    let start = stop.saturating_sub(0xFFFF);
-    (start..=stop)
-        .rev()
-        .find(|&i| u32::from_le_bytes(rd4(data, i)) == EOCD_SIG)
+    (0..=u16::MAX)
+        .find(|code| zip::CompressionMethod::from_u16(*code) == method)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,265 +911,15 @@ fn find_eocd(data: &[u8]) -> Option<usize> {
 
 /// Decode a raw DEFLATE stream.
 ///
-/// **std departure** — replaces the `zlib_rs` inflater vendored by the `zip`
-/// crate.  Fixed *and* dynamic Huffman blocks, with the standard length/distance
-/// tables.
+/// This was a hand-written inflater standing in for the `zlib_rs` decoder the
+/// `zip` crate vendored; it now wraps `flate2` (pinned 1.1.10), so the error
+/// text of a malformed stream is `flate2`'s `io::Error` instead of the previous
+/// `not a zip: …` wording (never a recovered literal).
 pub fn inflate(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
-    let mut state = BitReader::new(input);
-    let mut out: Vec<u8> = Vec::with_capacity(expected_len.max(16));
-    loop {
-        let last = state.bits(1)? == 1;
-        let btype = state.bits(2)?;
-        match btype {
-            0 => inflate_stored(&mut state, &mut out)?,
-            1 => {
-                let (lit, dist) = fixed_tables();
-                inflate_block(&mut state, &mut out, &lit, &dist)?;
-            }
-            2 => {
-                let (lit, dist) = dynamic_tables(&mut state)?;
-                inflate_block(&mut state, &mut out, &lit, &dist)?;
-            }
-            _ => return Err(Error::msg("not a zip: bad deflate block")),
-        }
-        if last {
-            return Ok(out);
-        }
-    }
-}
-
-fn inflate_stored(r: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<()> {
-    r.align();
-    let len = r.u16()? as usize;
-    let nlen = r.u16()? as usize;
-    if len != !nlen & 0xffff {
-        return Err(Error::msg("not a zip: stored length mismatch"));
-    }
-    out.extend_from_slice(r.bytes(len)?);
-    Ok(())
-}
-
-struct Huffman {
-    counts: [u16; 16],
-    symbols: Vec<u16>,
-}
-
-impl Huffman {
-    fn new(lengths: &[u8]) -> Result<Huffman> {
-        let mut counts = [0u16; 16];
-        for &l in lengths {
-            counts[l as usize] += 1;
-        }
-        counts[0] = 0;
-        let mut offs = [0u16; 16];
-        for i in 1..16 {
-            offs[i] = offs[i - 1] + counts[i - 1];
-        }
-        let mut symbols = vec![0u16; lengths.len()];
-        for (sym, &l) in lengths.iter().enumerate() {
-            if l != 0 {
-                symbols[offs[l as usize] as usize] = sym as u16;
-                offs[l as usize] += 1;
-            }
-        }
-        Ok(Huffman { counts, symbols })
-    }
-
-    fn decode(&self, r: &mut BitReader<'_>) -> Result<u16> {
-        let mut code: i32 = 0;
-        let mut first: i32 = 0;
-        let mut index: i32 = 0;
-        for len in 1..16 {
-            code |= r.bits(1)? as i32;
-            let count = self.counts[len] as i32;
-            if code - count < first {
-                return Ok(self.symbols[(index + (code - first)) as usize]);
-            }
-            index += count;
-            first += count;
-            first <<= 1;
-            code <<= 1;
-        }
-        Err(Error::msg("not a zip: bad huffman code"))
-    }
-}
-
-fn fixed_tables() -> (Huffman, Huffman) {
-    let mut lit = [0u8; 288];
-    for (i, slot) in lit.iter_mut().enumerate() {
-        *slot = if i < 144 {
-            8
-        } else if i < 256 {
-            9
-        } else if i < 280 {
-            7
-        } else {
-            8
-        };
-    }
-    let dist = [5u8; 30];
-    (
-        Huffman::new(&lit).expect("fixed literal table"),
-        Huffman::new(&dist).expect("fixed distance table"),
-    )
-}
-
-const LEN_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-    163, 195, 227, 258,
-];
-const LEN_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-];
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
-    13,
-];
-
-fn dynamic_tables(r: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
-    const ORDER: [usize; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-    let hlit = r.bits(5)? as usize + 257;
-    let hdist = r.bits(5)? as usize + 1;
-    let hclen = r.bits(4)? as usize + 4;
-    let mut cl = [0u8; 19];
-    for &slot in ORDER.iter().take(hclen) {
-        cl[slot] = r.bits(3)? as u8;
-    }
-    let clh = Huffman::new(&cl)?;
-    let mut lengths = vec![0u8; hlit + hdist];
-    let mut i = 0;
-    while i < lengths.len() {
-        let sym = clh.decode(r)?;
-        match sym {
-            0..=15 => {
-                lengths[i] = sym as u8;
-                i += 1;
-            }
-            16 => {
-                if i == 0 {
-                    return Err(Error::msg("not a zip: bad length repeat"));
-                }
-                let prev = lengths[i - 1];
-                let replay = 3 + r.bits(2)? as usize;
-                for _ in 0..replay {
-                    if i >= lengths.len() {
-                        break;
-                    }
-                    lengths[i] = prev;
-                    i += 1;
-                }
-            }
-            17 => {
-                let replay = 3 + r.bits(3)? as usize;
-                i += replay;
-            }
-            18 => {
-                let replay = 11 + r.bits(7)? as usize;
-                i += replay;
-            }
-            _ => return Err(Error::msg("not a zip: bad code length symbol")),
-        }
-    }
-    if i > lengths.len() {
-        return Err(Error::msg("not a zip: length overflow"));
-    }
-    let lit = Huffman::new(&lengths[..hlit])?;
-    let dist = Huffman::new(&lengths[hlit..])?;
-    Ok((lit, dist))
-}
-
-fn inflate_block(
-    r: &mut BitReader<'_>,
-    out: &mut Vec<u8>,
-    lit: &Huffman,
-    dist: &Huffman,
-) -> Result<()> {
-    loop {
-        let sym = lit.decode(r)?;
-        match sym {
-            0..=255 => out.push(sym as u8),
-            256 => return Ok(()),
-            257..=285 => {
-                let idx = (sym - 257) as usize;
-                let len = LEN_BASE[idx] as usize + r.bits(LEN_EXTRA[idx] as u32)? as usize;
-                let dsym = dist.decode(r)? as usize;
-                if dsym >= DIST_BASE.len() {
-                    return Err(Error::msg("not a zip: bad distance code"));
-                }
-                let d = DIST_BASE[dsym] as usize + r.bits(DIST_EXTRA[dsym] as u32)? as usize;
-                if d == 0 || d > out.len() {
-                    return Err(Error::msg("not a zip: distance out of range"));
-                }
-                let start = out.len() - d;
-                for k in 0..len {
-                    let b = out[start + k];
-                    out.push(b);
-                }
-            }
-            _ => return Err(Error::msg("not a zip: bad literal code")),
-        }
-    }
-}
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    bit: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        BitReader {
-            data,
-            pos: 0,
-            bit: 0,
-        }
-    }
-
-    fn bits(&mut self, n: u32) -> Result<u32> {
-        let mut out = 0u32;
-        for i in 0..n {
-            if self.pos >= self.data.len() {
-                return Err(Error::msg("not a zip: truncated deflate stream"));
-            }
-            let b = (self.data[self.pos] >> self.bit) & 1;
-            out |= (b as u32) << i;
-            self.bit += 1;
-            if self.bit == 8 {
-                self.bit = 0;
-                self.pos += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    fn align(&mut self) {
-        if self.bit != 0 {
-            self.bit = 0;
-            self.pos += 1;
-        }
-    }
-
-    fn u16(&mut self) -> Result<u16> {
-        let lo = self.bits(8)? as u16;
-        let hi = self.bits(8)? as u16;
-        Ok(lo | hi << 8)
-    }
-
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.data.len() {
-            return Err(Error::msg("not a zip: truncated stored block"));
-        }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
+    let mut out = Vec::with_capacity(expected_len.min(1 << 20));
+    let mut decoder = flate2::read::DeflateDecoder::new(input);
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1350,16 +990,72 @@ mod tests {
     #[test]
     fn manifest_rejections_use_the_recovered_wording() {
         let e = Manifest::from_toml(r#"id = "HydraMaps""#).unwrap_err();
-        assert_eq!(e.message(), "pack.toml: id 'HydraMaps' is not lower snake case");
-        let e = Manifest::from_toml(r#"id = "ok"
-format = 9"#)
+        assert_eq!(
+            e.to_string(),
+            "pack.toml: id 'HydraMaps' is not lower snake case"
+        );
+        let e = Manifest::from_toml(
+            r#"id = "ok"
+format = 9"#,
+        )
         .unwrap_err();
         assert_eq!(
-            e.message(),
+            e.to_string(),
             "pack 'ok' is format 9, newer than this build understands (1)"
         );
         let e = Manifest::from_toml("id = \"ok\"\nfiles = [\"maps/a.png\"]").unwrap_err();
-        assert_eq!(e.message(), "pack file 'maps/a.png' is not under global/");
+        assert_eq!(e.to_string(), "pack file 'maps/a.png' is not under global/");
+    }
+
+    /// The real deserializer ignores keys the schema does not know, exactly as
+    /// the hand-written reader did.
+    #[test]
+    fn manifest_ignores_unknown_keys() {
+        let m = Manifest::from_toml(
+            r#"
+            id = "hydra_maps"
+            format = 1
+            files = ["global/a.png"]
+            description = "the recovered schema never mentions this"
+            [extra]
+            nested = 1
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m.id, "hydra_maps");
+        assert_eq!(m.files, vec!["global/a.png".to_string()]);
+
+        // Missing keys fall back to the recovered defaults: no id is invalid.
+        let e = Manifest::from_toml("format = 1").unwrap_err();
+        assert_eq!(e.to_string(), "pack.toml: id '' is not lower snake case");
+    }
+
+    /// `format` may be written as an integer or as a numeric string (the
+    /// recovered reader accepted both through `parse::<u32>`).
+    #[test]
+    fn manifest_accepts_a_quoted_format() {
+        let m = Manifest::from_toml("id = \"p\"\nformat = \"1\"").unwrap();
+        assert_eq!(m.format, 1);
+        let e = Manifest::from_toml("id = \"p\"\nformat = \"2\"").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "pack 'p' is format 2, newer than this build understands (1)"
+        );
+        // A negative integer used to fall back to 0 rather than being rejected.
+        assert_eq!(Manifest::from_toml("id = \"p\"\nformat = -1").unwrap().format, 0);
+        // A non-numeric string is now a deserialization error.
+        let e = Manifest::from_toml("id = \"p\"\nformat = \"soon\"").unwrap_err();
+        assert!(e.to_string().contains("format 'soon' is not a number"), "{e}");
+    }
+
+    /// Syntax errors come from the `toml` crate now; the hand parser's
+    /// `pack.toml: cannot parse line '…'` wording was never recovered.
+    #[test]
+    fn manifest_syntax_errors_come_from_the_toml_crate() {
+        let e = Manifest::from_toml("id = \"unterminated\n").unwrap_err();
+        let text = e.to_string();
+        assert!(text.contains("TOML parse error"), "{text}");
+        assert!(!text.contains("cannot parse line"), "{text}");
     }
 
     #[test]
@@ -1395,122 +1091,37 @@ format = 9"#)
 
     // ---- ZIP --------------------------------------------------------------
 
-    /// Build a stored (uncompressed) ZIP.
-    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut cdir = Vec::new();
+    /// Build a ZIP with the real `zip` writer.
+    fn make_zip_with(files: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in files {
-            let crc = crc32(body);
-            let off = out.len() as u32;
-            out.extend_from_slice(&LFH_SIG.to_le_bytes());
-            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
-            out.extend_from_slice(&0u16.to_le_bytes()); // flags
-            out.extend_from_slice(&0u16.to_le_bytes()); // method = stored
-            out.extend_from_slice(&0u16.to_le_bytes()); // time
-            out.extend_from_slice(&0u16.to_le_bytes()); // date
-            out.extend_from_slice(&crc.to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // extra
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(body);
-
-            cdir.extend_from_slice(&CDFH_SIG.to_le_bytes());
-            cdir.extend_from_slice(&20u16.to_le_bytes()); // version made by
-            cdir.extend_from_slice(&20u16.to_le_bytes()); // version needed
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // flags
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // method
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // time
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // date
-            cdir.extend_from_slice(&crc.to_le_bytes());
-            cdir.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            cdir.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            cdir.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // extra
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // comment
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // disk
-            cdir.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-            cdir.extend_from_slice(&0u32.to_le_bytes()); // external attrs
-            cdir.extend_from_slice(&off.to_le_bytes());
-            cdir.extend_from_slice(name.as_bytes());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(method)
+                .unix_permissions(0o644);
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(body).unwrap();
         }
-        let cd_off = out.len() as u32;
-        out.extend_from_slice(&cdir);
-        out.extend_from_slice(&EOCD_SIG.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(cdir.len() as u32).to_le_bytes());
-        out.extend_from_slice(&cd_off.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
+        writer.finish().unwrap().into_inner()
     }
 
-    /// Like `make_zip`, but with explicit unix modes in the external attributes.
-    fn make_zip_with_mode(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut cdir = Vec::new();
-        for (name, body, mode) in files {
-            let crc = crc32(body);
-            let off = out.len() as u32;
-            out.extend_from_slice(&LFH_SIG.to_le_bytes());
-            out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&crc.to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(body);
-
-            cdir.extend_from_slice(&CDFH_SIG.to_le_bytes());
-            cdir.extend_from_slice(&20u16.to_le_bytes());
-            cdir.extend_from_slice(&20u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&crc.to_le_bytes());
-            cdir.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            cdir.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            cdir.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&0u16.to_le_bytes());
-            cdir.extend_from_slice(&(mode << 16).to_le_bytes());
-            cdir.extend_from_slice(&off.to_le_bytes());
-            cdir.extend_from_slice(name.as_bytes());
-        }
-        let cd_off = out.len() as u32;
-        out.extend_from_slice(&cdir);
-        out.extend_from_slice(&EOCD_SIG.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(cdir.len() as u32).to_le_bytes());
-        out.extend_from_slice(&cd_off.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
+    /// A stored (uncompressed) ZIP.
+    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        make_zip_with(files, zip::CompressionMethod::Stored)
     }
 
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for &b in data {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
+    /// A deflated ZIP.
+    fn make_deflated_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        make_zip_with(files, zip::CompressionMethod::Deflated)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        // Keep test scratch inside the (gitignored) workspace `target/` tree so
+        // the sandbox allows the writes.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gs_base-test");
+        let dir = base.join(tag);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -1520,10 +1131,53 @@ format = 9"#)
         assert_eq!(ar.entries.len(), 2);
         assert_eq!(ar.entries[0].name, "a.txt");
         assert_eq!(ar.entries[0].method, 0);
+        // CRC-32 of "hello", recorded by the real writer in the central dir.
+        assert_eq!(ar.entries[0].crc32, 0x3610_a686);
+        assert_eq!(ar.entries[0].uncompressed_size, 5);
+        assert!(!ar.entries[0].is_symlink());
         assert_eq!(ar.read(&ar.entries[0]).unwrap(), b"hello");
         assert_eq!(ar.read(&ar.entries[1]).unwrap(), vec![1, 2, 3]);
         assert!(ar.entry("nope").is_none());
-        assert!(ZipArchive::new(b"garbage").is_err());
+        assert_eq!(ar.entry("dir/b.bin").unwrap().name, "dir/b.bin");
+    }
+
+    #[test]
+    fn zip_round_trip_deflated() {
+        let body = b"the pool holds the same line over and over and over and over\n".repeat(40);
+        let zip = make_deflated_zip(&[("global/log.txt", &body), ("global/small.txt", b"x")]);
+        let ar = ZipArchive::new(&zip).unwrap();
+        assert_eq!(ar.entries.len(), 2);
+        assert_eq!(ar.entries[0].method, 8);
+        assert_eq!(ar.entries[0].uncompressed_size, body.len() as u64);
+        assert!(
+            ar.entries[0].compressed_size < body.len() as u64,
+            "deflate should shrink the repetitive body"
+        );
+        assert_eq!(ar.read(&ar.entries[0]).unwrap(), body);
+        assert_eq!(ar.read(&ar.entries[1]).unwrap(), b"x");
+    }
+
+    /// The writer really emits the three `PK` markers the literal pool keeps.
+    #[test]
+    fn zip_writer_emits_the_recovered_markers() {
+        let zip = make_zip(&[("a.txt", b"hello")]);
+        let find = |sig: u32| {
+            zip.windows(4)
+                .any(|w| w == sig.to_le_bytes())
+        };
+        assert!(find(LFH_SIG), "local file header");
+        assert!(find(CDFH_SIG), "central directory header");
+        assert!(find(EOCD_SIG), "end of central directory");
+        // ZIP64 records are only written for ZIP64 archives.
+        assert!(!find(ZIP64_EOCD_SIG));
+    }
+
+    #[test]
+    fn zip_rejects_garbage_with_the_recovered_wording() {
+        let e = ZipArchive::new(b"garbage").unwrap_err();
+        assert_eq!(e.to_string(), "not a zip");
+        let e = ZipArchive::new(&[]).unwrap_err();
+        assert_eq!(e.to_string(), "not a zip");
     }
 
     #[test]
@@ -1535,16 +1189,30 @@ format = 9"#)
         assert_eq!(inflate(&stored, 3).unwrap(), b"abc");
     }
 
+    /// `inflate` reads what the real `flate2` encoder writes.
+    #[test]
+    fn inflate_round_trips_the_deflate_encoder() {
+        let body = b"hydra hydra hydra hydra hydra hydra hydra hydra\n".repeat(32);
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < body.len());
+        assert_eq!(inflate(&compressed, body.len()).unwrap(), body);
+        // Truncated input is an error rather than a silent short read.
+        assert!(inflate(&compressed[..compressed.len() / 2], body.len()).is_err());
+    }
+
     #[test]
     fn install_rejects_bad_hash_first() {
         let zip = make_zip(&[]);
         let err = install_zip(&zip, "deadbeef", Path::new("/nonexistent")).unwrap_err();
         assert!(
-            err.message().starts_with("the pack's SHA-256 is "),
+            err.to_string().starts_with("the pack's SHA-256 is "),
             "{}",
-            err.message()
+            err
         );
-        assert!(err.message().ends_with(": not installed"));
+        assert!(err.to_string().ends_with(": not installed"));
     }
 
     #[test]
@@ -1552,14 +1220,26 @@ format = 9"#)
         let zip = make_zip(&[("a.txt", b"x")]);
         let digest = sha256_hex(&zip);
         let err = install_zip(&zip, &digest, Path::new("/nonexistent")).unwrap_err();
-        assert_eq!(err.message(), "the zip has no pack.toml");
+        assert_eq!(err.to_string(), "the zip has no pack.toml");
 
         // A manifest plus a traversal entry.
         let manifest = "id = \"p\"\nformat = 1\nfiles = []\n";
         let zip = make_zip(&[("pack.toml", manifest.as_bytes()), ("../evil", b"x")]);
         let digest = sha256_hex(&zip);
         let err = install_zip(&zip, &digest, Path::new("/nonexistent")).unwrap_err();
-        assert_eq!(err.message(), "../evil: outside the pack's folder");
+        assert_eq!(err.to_string(), "../evil: outside the pack's folder");
+
+        // An absolute entry is refused the same way.
+        let zip = make_zip(&[("pack.toml", manifest.as_bytes()), ("/etc/passwd", b"x")]);
+        let digest = sha256_hex(&zip);
+        let err = install_zip(&zip, &digest, Path::new("/nonexistent")).unwrap_err();
+        assert_eq!(err.to_string(), "/etc/passwd: outside the pack's folder");
+
+        // A manifest that is not UTF-8 is the recovered `pack.toml is not text`.
+        let zip = make_zip(&[("pack.toml", &[0xff, 0xfe, 0x00])]);
+        let digest = sha256_hex(&zip);
+        let err = install_zip(&zip, &digest, Path::new("/nonexistent")).unwrap_err();
+        assert_eq!(err.to_string(), "pack.toml is not text");
     }
 
     #[test]
@@ -1574,20 +1254,11 @@ format = 9"#)
         assert_eq!(safe_relative("."), None);
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        // Keep test scratch inside the (gitignored) workspace `target/` tree so
-        // the sandbox allows the writes.
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gs_base-test");
-        let dir = base.join(tag);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn install_writes_files_and_records_the_ledger() {
         let root = scratch("install");
-        let manifest = "id = \"hydra_maps\"\nformat = 1\nfiles = [\"global/a.txt\", \"global/b/c.txt\"]\n";
+        let manifest =
+            "id = \"hydra_maps\"\nformat = 1\nfiles = [\"global/a.txt\", \"global/b/c.txt\"]\n";
         let zip = make_zip(&[
             ("pack.toml", manifest.as_bytes()),
             ("global/a.txt", b"hello"),
@@ -1597,7 +1268,7 @@ format = 9"#)
 
         // Wrong digest is refused.
         let err = install_zip(&zip, &"0".repeat(64), &root).unwrap_err();
-        assert!(err.message().starts_with("the pack's SHA-256 is "));
+        assert!(err.to_string().starts_with("the pack's SHA-256 is "));
 
         let report = install_zip(&zip, &digest, &root).unwrap();
         assert_eq!(report.pack, "hydra_maps");
@@ -1640,7 +1311,7 @@ format = 9"#)
 
         // Removing again uses the recovered wording.
         let err = remove(&root, "hydra_maps").unwrap_err();
-        assert_eq!(err.message(), "no pack 'hydra_maps' is installed");
+        assert_eq!(err.to_string(), "no pack 'hydra_maps' is installed");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1667,20 +1338,121 @@ format = 9"#)
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A pack whose entries the real crate has to inflate.
+    #[test]
+    fn install_deflated_pack_end_to_end() {
+        let root = scratch("deflated");
+        let manifest = "id = \"tall_pack\"\nformat = 1\nfiles = [\"global/log.txt\"]\n";
+        let body = b"the same line, again and again and again\n".repeat(50);
+        let zip = make_deflated_zip(&[
+            ("pack.toml", manifest.as_bytes()),
+            ("global/log.txt", body.as_slice()),
+        ]);
+        let report = install_zip(&zip, &sha256_hex(&zip), &root).unwrap();
+        assert_eq!(report.added, vec!["global/log.txt".to_string()]);
+        assert_eq!(
+            fs::read(root.join("packs/tall_pack/global/log.txt")).unwrap(),
+            body
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn install_rejects_symlinks() {
         let root = scratch("symlink");
-        // The "external attributes" field carries the unix mode; 0o120777 is S_IFLNK.
-        let zip = make_zip_with_mode(&[
-            (
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
                 "pack.toml",
-                b"id = \"p\"\nformat = 1\nfiles = []\n".as_slice(),
-                0o100644,
-            ),
-            ("global/link", b"target".as_slice(), 0o120777),
-        ]);
+                zip::write::SimpleFileOptions::default().compression_method(
+                    zip::CompressionMethod::Stored,
+                ),
+            )
+            .unwrap();
+        writer.write_all(b"id = \"p\"\nformat = 1\nfiles = []\n").unwrap();
+        writer
+            .add_symlink(
+                "global/link",
+                "/etc/passwd",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let zip = writer.finish().unwrap().into_inner();
+
         let err = install_zip(&zip, &sha256_hex(&zip), &root).unwrap_err();
-        assert_eq!(err.message(), "global/link: a pack holds no links");
+        assert_eq!(err.to_string(), "global/link: a pack holds no links");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- Ledger / TOML ----------------------------------------------------
+
+    #[test]
+    fn ledger_round_trips_through_the_real_toml_writer() {
+        let root = scratch("ledger");
+        let mut book = Ledger {
+            format: 3,
+            ..Default::default()
+        };
+        book.installed.insert(
+            "alpha".into(),
+            Installed {
+                files: vec!["global/a.txt".into(), "global/b/c.txt".into()],
+            },
+        );
+        book.installed.insert("beta".into(), Installed::default());
+        write_ledger(&root, &book).unwrap();
+
+        let text = fs::read_to_string(root.join(PACKS_DIR).join(LEDGER_FILE)).unwrap();
+        assert!(text.contains("format = 3"), "{text}");
+        assert!(text.contains("[packs.alpha]"), "{text}");
+        assert!(text.contains("[packs.beta]"), "{text}");
+
+        assert_eq!(ledger(&root).unwrap(), book);
+
+        // The serde `Serialize`/`Deserialize` impls round-trip as well.
+        let encoded = toml::to_string(&book).unwrap();
+        let decoded: Ledger = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, book);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The file may spell the table `[packs.…]` or `[installed.…]`; `packs`
+    /// wins if a file somehow has both.
+    #[test]
+    fn ledger_accepts_packs_and_installed_shapes() {
+        for (tag, table) in [
+            ("shape-packs", "packs"),
+            ("shape-installed", "installed"),
+        ] {
+            let root = scratch(tag);
+            let dir = root.join(PACKS_DIR);
+            fs::create_dir_all(&dir).unwrap();
+            let text = format!(
+                "format = 2\n\n[{table}.hydra_maps]\nfiles = [\"global/a.png\"]\n"
+            );
+            fs::write(dir.join(LEDGER_FILE), text).unwrap();
+            let book = ledger(&root).unwrap();
+            assert_eq!(book.format, 2);
+            assert_eq!(book.installed.len(), 1);
+            assert_eq!(
+                book.installed["hydra_maps"].files,
+                vec!["global/a.png".to_string()]
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        // Unknown tables and keys are ignored, as serde does by default.
+        let root = scratch("shape-extra");
+        let dir = root.join(PACKS_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(LEDGER_FILE),
+            "format = 1\n[other]\nx = 1\n\n[packs.p]\nfiles = []\nnote = \"ignored\"\n",
+        )
+        .unwrap();
+        let book = ledger(&root).unwrap();
+        assert_eq!(book.installed.len(), 1);
+        assert!(book.installed["p"].files.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1693,8 +1465,10 @@ format = 9"#)
             c = true
             d = [1, 2, 3]
             e = ['lit']
+            f = 1.5
+            g = 1979-05-27T07:32:00Z
             [tbl]
-            f = "y"
+            h = "y"
         "#,
         )
         .unwrap();
@@ -1709,10 +1483,43 @@ format = 9"#)
                 TomlValue::Integer(3)
             ])
         );
-        assert_eq!(doc["e"], TomlValue::Array(vec![TomlValue::String("lit".into())]));
+        assert_eq!(
+            doc["e"],
+            TomlValue::Array(vec![TomlValue::String("lit".into())])
+        );
+        assert_eq!(doc["f"], TomlValue::Float(1.5));
+        assert_eq!(
+            doc["g"],
+            TomlValue::Datetime("1979-05-27T07:32:00Z".into())
+        );
         match &doc["tbl"] {
-            TomlValue::Table(t) => assert_eq!(t["f"], TomlValue::String("y".into())),
+            TomlValue::Table(t) => assert_eq!(t["h"], TomlValue::String("y".into())),
             other => panic!("expected table, got {other:?}"),
         }
+        assert_eq!(doc["a"].as_str(), Some("x"));
+        assert_eq!(doc["b"].as_str(), None);
+
+        // Nested headers land in nested tables, as the recovered subset had it.
+        let doc = parse_toml("[a.b]\nc = 1\n").unwrap();
+        match &doc["a"] {
+            TomlValue::Table(t) => match &t["b"] {
+                TomlValue::Table(inner) => assert_eq!(inner["c"], TomlValue::Integer(1)),
+                other => panic!("expected table, got {other:?}"),
+            },
+            other => panic!("expected table, got {other:?}"),
+        }
+
+        assert!(parse_toml("a = ").is_err());
+    }
+
+    // ---- anyhow -----------------------------------------------------------
+
+    /// `crate::Error` is the real `anyhow::Error`, so the io error inside a
+    /// `?` is downcastable and its text is unchanged.
+    #[test]
+    fn io_errors_stay_typed_in_the_anyhow_chain() {
+        let err = ledger(Path::new("/gs-base-no-such-root")).unwrap_err();
+        assert!(err.downcast_ref::<std::io::Error>().is_some(), "{err:?}");
+        assert!(!err.to_string().is_empty());
     }
 }

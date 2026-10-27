@@ -1,0 +1,152 @@
+# Poses for every family rigged from the "multileg" template.
+#
+# ANGLES ONLY, in degrees, so a pose transfers to any family of this body
+# type. Keys are BONE names. A key with no _l / _r that names no bone is a
+# PAIR: "leg" poses leg_l as written and leg_r mirrored (y, z negated).
+#
+#   rot  = [x, y, z]  Euler, for the bone's FIRST segment about its pivot, in
+#                     its parent's frame (x = left, y = up, z = front), applied
+#                     Rx * Rz * Ry: twist (y), then spread (z), then swing (x).
+#                     A limb hanging down: +x swings it BACK, -x forward;
+#                     +z lifts a LEFT limb out to the side.
+#   bend = [deg, ..]  one per INNER segment of the chain (elbow; knee, ankle;
+#                     stifle, hock), about its natural hinge. + swings the far
+#                     end BACK for a hanging limb: knees +, elbows -.
+#   root = [x, y, z]  turns the whole figure about the root bone's pivot.
+#
+# No translations: after FK the figure is rested on the ground.
+
+body_type = "multileg"
+
+[pose.stand]
+
+# Resting: every leg swung up and out (+z) so the legs lie splayed flat
+# and grounding lets the body settle onto the floor. Knees cannot fold
+# inward (a leg's knee hinge swings its tip fore-aft), so a spider rests
+# spread, not tucked. Serves kneel and sit too (they fall back to lie).
+[pose.lie]
+leg1 = { rot = [0.0, 0.0, 25.0] }
+leg2 = { rot = [0.0, 0.0, 25.0] }
+leg3 = { rot = [0.0, 0.0, 25.0] }
+leg4 = { rot = [0.0, 0.0, 25.0] }
+leg5 = { rot = [0.0, 0.0, 25.0] }
+
+# Rolled onto its right side. The upper (left) legs fall across the belly
+# (-z), the lower (right) legs fold toward it too (+z on a right leg), so
+# none of them props the body up; front and rear pairs converge.
+[pose.fallen_side]
+root = [0.0, 0.0, 90.0]
+leg1_l = { rot = [0.0, 0.0, -50.0] }
+leg2_l = { rot = [15.0, 0.0, -55.0] }
+leg3_l = { rot = [5.0, 0.0, -60.0] }
+leg4_l = { rot = [-5.0, 0.0, -60.0] }
+leg5_l = { rot = [-15.0, 0.0, -55.0] }
+leg1_r = { rot = [0.0, 0.0, 40.0] }
+leg2_r = { rot = [10.0, 0.0, 45.0] }
+leg3_r = { rot = [0.0, 0.0, 55.0] }
+leg4_r = { rot = [0.0, 0.0, 55.0] }
+leg5_r = { rot = [-10.0, 0.0, 50.0] }
+
+# Dazed on its feet: nose down, abdomen sagging, legs splayed wide,
+# the arm pairs curled and drooping.
+[pose.stunned]
+root = [14.0, 0.0, 6.0]
+skull = { rot = [18.0, 0.0, 0.0] }
+abdomen = { rot = [16.0, 0.0, 0.0] }
+leg1 = { rot = [10.0, 0.0, -12.0] }
+leg1_tip = { rot = [0.0, 0.0, 25.0] }
+leg2 = { rot = [-10.0, 0.0, 20.0], bend = [-20.0] }
+leg3 = { rot = [0.0, 0.0, 18.0] }
+leg4 = { rot = [0.0, 0.0, 18.0] }
+leg5 = { rot = [10.0, 0.0, 16.0] }
+
+# The classic dead spider: on its back, every leg drawn in over the belly
+# and bunched fore-aft (front pairs swing back, rear pairs forward).
+[pose.dead]
+root = [0.0, 0.0, 180.0]
+leg1 = { rot = [0.0, 0.0, -15.0] }
+leg1_tip = { rot = [0.0, 0.0, 25.0] }
+leg2 = { rot = [25.0, 0.0, -38.0], bend = [25.0] }
+leg3 = { rot = [12.0, 0.0, -38.0], bend = [25.0] }
+leg4 = { rot = [-12.0, 0.0, -38.0], bend = [-25.0] }
+leg5 = { rot = [-25.0, 0.0, -35.0], bend = [-30.0] }
+
+# Threat display: front raised, the two arm pairs (palps and first legs on
+# a spider, claws and the raised first walking leg on a crab) lifted up
+# and forward; the rear legs stay planted.
+[pose.rear]
+root = [-25.0, 0.0, 0.0]
+leg1 = { rot = [-30.0, 0.0, 20.0] }
+leg2 = { rot = [-40.0, 0.0, 40.0] }
+
+
+# ---------------------------------------------------------------- families
+#
+# A crab's body is flat and wide and its legs short: pitched back as far as
+# the spider rears, it tips over onto its abdomen. It rears less and lets
+# the raised claws carry the pose.
+[family.crustacean.rear]
+root = [-8.0, 0.0, 0.0]
+leg1 = { rot = [-20.0, 0.0, 30.0] }
+
+# Joint limits: how far each bone may turn, [low, high] degrees per Euler
+# angle (x swing, y twist, z spread) and per bend, as poses write them. A pair
+# stem bounds the LEFT side; the right is mirrored. Every pose, blend and
+# death fall is held inside these; the pose editor's sliders stop at them.
+[limits]
+skull = { rot = [[-30.0, 40.0], [-40.0, 40.0], [-30.0, 30.0]] }
+abdomen = { rot = [[-40.0, 50.0], [-40.0, 40.0], [-40.0, 40.0]] }
+leg1 = { rot = [[-80.0, 80.0], [-45.0, 45.0], [-90.0, 70.0]], bend = [[-80.0, 80.0]] }
+leg2 = { rot = [[-80.0, 80.0], [-45.0, 45.0], [-90.0, 70.0]], bend = [[-80.0, 80.0]] }
+leg3 = { rot = [[-80.0, 80.0], [-45.0, 45.0], [-90.0, 70.0]], bend = [[-80.0, 80.0]] }
+leg4 = { rot = [[-80.0, 80.0], [-45.0, 45.0], [-90.0, 70.0]], bend = [[-80.0, 80.0]] }
+leg5 = { rot = [[-80.0, 80.0], [-45.0, 45.0], [-90.0, 70.0]], bend = [[-80.0, 80.0]] }
+leg1_tip = { rot = [[-60.0, 60.0], [-30.0, 30.0], [-80.0, 80.0]] }
+
+# Breathing at rest: the abdomen pulses, the head with it, and the legs
+# settle and rise a hair, each pair a beat behind the last.
+[idle]
+period = 2.8
+abdomen = { rot = [3.0, 0.0, 0.0] }
+skull = { rot = [-1.5, 0.0, 0.0] }
+leg1 = { rot = [0.0, 0.0, 1.5], bend = [1.8], phase = -0.05 }
+leg2 = { rot = [0.0, 0.0, 1.5], bend = [1.8], phase = -0.1 }
+leg3 = { rot = [0.0, 0.0, 1.5], bend = [1.8], phase = -0.15 }
+leg4 = { rot = [0.0, 0.0, 1.5], bend = [1.8], phase = -0.2 }
+leg5 = { rot = [0.0, 0.0, 1.5], bend = [1.8], phase = -0.25 }
+
+# Flinches (see `Pose::flinched`): PEAK offsets for a hit on the region,
+# written for the creature's RIGHT side and mirrored for the left. "arm" is
+# the front pair, "hand" its tip, "leg" the pairs behind.
+[flinch.head]
+skull = { rot = [10.0, 0.0, -8.0] }
+leg1 = { rot = [0.0, 0.0, 10.0], bend = [10.0] }
+
+[flinch.neck]
+skull = { rot = [8.0, 0.0, 0.0] }
+
+[flinch.chest]
+leg1 = { rot = [0.0, 0.0, 12.0], bend = [12.0] }
+leg2 = { rot = [0.0, 0.0, 8.0], bend = [8.0] }
+skull = { rot = [6.0, 0.0, 0.0] }
+
+[flinch.abdomen]
+abdomen = { rot = [12.0, 0.0, 0.0] }
+leg4 = { rot = [0.0, 0.0, 8.0], bend = [8.0] }
+leg5 = { rot = [0.0, 0.0, 8.0], bend = [8.0] }
+
+[flinch.back]
+abdomen = { rot = [-10.0, 0.0, 0.0] }
+
+[flinch.arm]
+leg1_r = { rot = [-16.0, 0.0, 18.0], bend = [16.0] }
+skull = { rot = [0.0, 0.0, -6.0] }
+
+[flinch.hand]
+leg1_r = { rot = [-8.0, 0.0, 10.0], bend = [10.0] }
+leg1_tip_r = { rot = [-18.0, 0.0, 0.0] }
+
+[flinch.leg]
+leg3_r = { rot = [-14.0, 0.0, 16.0], bend = [18.0] }
+leg4_r = { rot = [-10.0, 0.0, 12.0], bend = [14.0] }
+abdomen = { rot = [0.0, 6.0, 0.0] }

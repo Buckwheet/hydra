@@ -1,0 +1,130 @@
+# Poses for every family rigged from the "avian" template.
+#
+# ANGLES ONLY, in degrees, so a pose transfers to any family of this body
+# type. Keys are BONE names. A key with no _l / _r that names no bone is a
+# PAIR: "leg" poses leg_l as written and leg_r mirrored (y, z negated).
+#
+#   rot  = [x, y, z]  Euler, for the bone's FIRST segment about its pivot, in
+#                     its parent's frame (x = left, y = up, z = front), applied
+#                     Rx * Rz * Ry: twist (y), then spread (z), then swing (x).
+#                     A limb hanging down: +x swings it BACK, -x forward;
+#                     +z lifts a LEFT limb out to the side.
+#   bend = [deg, ..]  one per INNER segment of the chain (elbow; knee, ankle;
+#                     stifle, hock), about its natural hinge. + swings the far
+#                     end BACK for a hanging limb: knees +, elbows -.
+#   root = [x, y, z]  turns the whole figure about the root bone's pivot.
+#
+# No translations: after FK the figure is rested on the ground.
+
+body_type = "avian"
+
+[pose.stand]
+
+# Settled on the perch: legs folded under so the belly rests on the feet,
+# body tipped up, head raised and alert.
+[pose.sit]
+root = [-14.0, 0.0, 0.0]
+neck = { rot = [-12.0, 0.0, 0.0] }
+skull = { rot = [8.0, 0.0, 0.0] }
+tail = { rot = [-14.0, 0.0, 0.0] }
+leg = { rot = [-50.0, 0.0, 0.0], bend = [110.0, -60.0] }
+
+# Hunkered down flat on the belly, head drawn into the shoulders.
+[pose.lie]
+root = [12.0, 0.0, 0.0]
+neck = { rot = [30.0, 0.0, 0.0] }
+skull = { rot = [-20.0, 0.0, 0.0] }
+tail = { rot = [-10.0, 0.0, 0.0] }
+leg = { rot = [-70.0, 0.0, 0.0], bend = [140.0, -80.0] }
+
+# Wings flung open in a raised V, broad faces forward (a "displayed" eagle).
+[pose.spread]
+neck = { rot = [-8.0, 0.0, 0.0] }
+tail = { rot = [8.0, 0.0, 0.0] }
+wing = { rot = [0.0, -90.0, 55.0] }
+
+[pose.fallen_side]
+root = [0.0, 0.0, 90.0]
+neck = { rot = [10.0, 0.0, 20.0] }
+wing_l = { rot = [-10.0, 0.0, 8.0] }
+leg = { rot = [-30.0, 0.0, 0.0], bend = [40.0, -20.0] }
+
+[pose.stunned]
+root = [10.0, 0.0, 0.0]
+neck = { rot = [40.0, 0.0, 0.0] }
+skull = { rot = [20.0, 0.0, 0.0] }
+tail = { rot = [-18.0, 0.0, 0.0] }
+wing = { rot = [-22.0, 0.0, 18.0] }
+leg = { rot = [-10.0, 0.0, 6.0], bend = [30.0, -15.0] }
+
+[pose.dead]
+root = [0.0, 0.0, 90.0]
+neck = { rot = [30.0, 0.0, 45.0] }
+skull = { rot = [20.0, 0.0, 10.0] }
+tail = { rot = [-10.0, 0.0, 0.0] }
+wing_l = { rot = [-35.0, 0.0, 12.0] }
+leg = { rot = [-45.0, 0.0, 0.0], bend = [30.0, 50.0] }
+
+# On its back, wings flung open, feet curled up.
+[pose.dead_2]
+root = [0.0, 0.0, 180.0]
+neck = { rot = [-30.0, 0.0, 0.0] }
+wing = { rot = [0.0, -80.0, 0.0] }
+leg = { rot = [-20.0, 0.0, 0.0], bend = [70.0, 60.0] }
+
+# Joint limits: how far each bone may turn, [low, high] degrees per Euler
+# angle (x swing, y twist, z spread) and per bend, as poses write them. A pair
+# stem bounds the LEFT side; the right is mirrored. Every pose, blend and
+# death fall is held inside these; the pose editor's sliders stop at them.
+[limits]
+neck = { rot = [[-60.0, 70.0], [-80.0, 80.0], [-60.0, 60.0]] }
+skull = { rot = [[-45.0, 45.0], [-90.0, 90.0], [-40.0, 40.0]] }
+tail = { rot = [[-45.0, 45.0], [-30.0, 30.0], [-30.0, 30.0]] }
+leg = { rot = [[-100.0, 45.0], [-30.0, 30.0], [-30.0, 40.0]], bend = [[-20.0, 160.0], [-110.0, 90.0]] }
+wing = { rot = [[-60.0, 60.0], [-120.0, 30.0], [-30.0, 120.0]] }
+
+# Breathing at rest: the breast swells, the head bobs with it, and the
+# wings settle and lift a hair against the body.
+[idle]
+period = 2.4
+breast = { rot = [2.5, 0.0, 0.0] }
+neck = { rot = [2.5, 0.0, 0.0] }
+skull = { rot = [-1.5, 0.0, 0.0] }
+wing = { rot = [0.0, 0.0, -3.0], phase = -0.15 }
+tail = { rot = [2.0, 0.0, 0.0], phase = -0.25 }
+
+# Flinches (see `Pose::flinched`): PEAK offsets for a hit on the region,
+# written for the creature's RIGHT side and mirrored for the left. "arm" is
+# a wing.
+[flinch.head]
+skull = { rot = [12.0, 0.0, -8.0] }
+neck = { rot = [8.0, 0.0, -5.0] }
+
+[flinch.neck]
+neck = { rot = [12.0, 0.0, 0.0] }
+
+[flinch.chest]
+breast = { rot = [6.0, 0.0, 0.0] }
+neck = { rot = [-10.0, 0.0, 0.0] }
+wing = { rot = [0.0, 0.0, 24.0] }
+
+[flinch.abdomen]
+neck = { rot = [-6.0, 0.0, 0.0] }
+leg = { bend = [10.0, -6.0] }
+tail = { rot = [-12.0, 0.0, 0.0] }
+
+[flinch.back]
+tail = { rot = [-18.0, 0.0, 0.0] }
+wing = { rot = [0.0, 0.0, 14.0] }
+
+[flinch.arm]
+wing_r = { rot = [0.0, -12.0, 28.0] }
+neck = { rot = [0.0, 0.0, -6.0] }
+
+[flinch.hand]
+wing_r = { rot = [0.0, -8.0, 18.0] }
+wing_hand_r = { rot = [0.0, 0.0, 16.0] }
+
+[flinch.leg]
+leg_r = { rot = [-12.0, 0.0, 10.0], bend = [18.0, -8.0] }
+wing = { rot = [0.0, 0.0, 12.0] }

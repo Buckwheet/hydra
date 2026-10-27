@@ -1,0 +1,279 @@
+# Poses for every family rigged from the "winged_quadruped" template: the quadruped's
+# poses, with wings. Kept in step with quadruped.toml by hand.
+#
+# ANGLES ONLY, in degrees, so a pose transfers to any family of this body
+# type. Keys are BONE names. A key with no _l / _r that names no bone is a
+# PAIR: "leg" poses leg_l as written and leg_r mirrored (y, z negated).
+#
+#   rot  = [x, y, z]  Euler, for the bone's FIRST segment about its pivot, in
+#                     its parent's frame (x = left, y = up, z = front), applied
+#                     Rx * Rz * Ry: twist (y), then spread (z), then swing (x).
+#                     A limb hanging down: +x swings it BACK, -x forward;
+#                     +z lifts a LEFT limb out to the side.
+#   bend = [deg, ..]  one per INNER segment of the chain (elbow; knee, ankle;
+#                     stifle, hock), about its natural hinge. + swings the far
+#                     end BACK for a hanging limb: knees +, elbows -.
+#   root = [x, y, z]  turns the whole figure about the root bone's pivot.
+#
+# No translations: after FK the figure is rested on the ground.
+
+body_type = "winged_quadruped"
+
+[pose.stand]
+
+# Rump on the ground, forelegs a vertical prop, hindlegs folded alongside.
+# The hindleg is ALREADY a zigzag at rest (thigh +30, shank -30, pastern +29
+# from vertical), so bends compose onto an existing fold: near equal-and-
+# opposite values cancel into an accordion instead of swinging the hock back.
+[pose.sit]
+root = [-38.0, 0.0, 0.0]
+neck = { rot = [20.0, 0.0, 0.0] }
+skull = { rot = [20.0, 0.0, 0.0] }
+tail = { rot = [58.0, 0.0, 0.0] }
+foreleg = { rot = [38.0, 0.0, 0.0], bend = [-4.0] }
+hindleg = { rot = [-34.0, 0.0, 0.0], bend = [85.0, -52.0] }
+
+# Sternal: chest down, forelegs stretched out in front, hindlegs folded
+# tight alongside. Grounding rests the LOWEST surface on y = 0, so whatever
+# hangs lowest sets the body's height: a fold that leaves the paws dangling
+# props the trunk up at standing height instead of lowering it. The forelegs
+# therefore reach forward along the ground rather than tucking under.
+[pose.lie]
+neck = { rot = [16.0, 0.0, 0.0] }
+skull = { rot = [-10.0, 0.0, 0.0] }
+tail = { rot = [25.0, 0.0, 0.0] }
+foreleg = { rot = [-72.0, 0.0, 0.0], bend = [4.0] }
+forepaw = { rot = [66.0, 0.0, 0.0] }
+hindleg = { rot = [44.0, 0.0, 0.0], bend = [128.0, -86.0] }
+
+[pose.fallen_side]
+root = [0.0, 0.0, 90.0]
+neck = { rot = [14.0, 0.0, 0.0] }
+tail = { rot = [20.0, 0.0, 0.0] }
+foreleg = { rot = [-22.0, 0.0, 0.0], bend = [-30.0] }
+hindleg = { rot = [16.0, 0.0, 0.0], bend = [22.0, -24.0] }
+
+# Head hanging, legs splayed, tail tucked.
+[pose.stunned]
+neck = { rot = [38.0, 0.0, 0.0] }
+skull = { rot = [16.0, 0.0, 0.0] }
+tail = { rot = [-28.0, 0.0, 0.0] }
+foreleg = { rot = [-6.0, 0.0, 9.0] }
+hindleg = { rot = [6.0, 0.0, 9.0] }
+
+# Status poses (the stage picks these from crtrStatus; a missing one falls
+# back to its nearest: sleep -> lie, disoriented -> stunned).
+
+# Asleep: lying down, head resting low, tail tucked.
+[pose.sleep]
+neck = { rot = [24.0, 0.0, 0.0] }
+skull = { rot = [-4.0, 0.0, 0.0] }
+tail = { rot = [30.0, 0.0, 0.0] }
+foreleg = { rot = [-72.0, 0.0, 0.0], bend = [4.0] }
+forepaw = { rot = [66.0, 0.0, 0.0] }
+hindleg = { rot = [44.0, 0.0, 0.0], bend = [128.0, -86.0] }
+
+# Webbed: legs drawn in under the body, head up and straining.
+[pose.webbed]
+neck = { rot = [-12.0, 0.0, 0.0] }
+tail = { rot = [30.0, 0.0, 0.0] }
+foreleg = { rot = [12.0, 0.0, -7.0] }
+hindleg = { rot = [-12.0, 0.0, -7.0] }
+
+# Disoriented: head swinging low and to one side, legs splayed for balance.
+[pose.disoriented]
+neck = { rot = [30.0, 18.0, 0.0] }
+skull = { rot = [10.0, 0.0, 16.0] }
+tail = { rot = [-20.0, 14.0, 0.0] }
+foreleg_l = { rot = [-10.0, 0.0, 14.0] }
+foreleg_r = { rot = [4.0, 0.0, 4.0] }
+hindleg = { rot = [6.0, 0.0, 10.0], bend = [10.0, -6.0] }
+
+# Calmed: at rest on its feet, head lowered, tail down.
+[pose.calm]
+neck = { rot = [18.0, 0.0, 0.0] }
+skull = { rot = [8.0, 0.0, 0.0] }
+tail = { rot = [-12.0, 0.0, 0.0] }
+
+[pose.dead]
+root = [0.0, 0.0, 90.0]
+neck = { rot = [30.0, 0.0, 0.0] }
+skull = { rot = [10.0, 0.0, 0.0] }
+tail = { rot = [34.0, 0.0, 0.0] }
+foreleg_l = { rot = [-34.0, 0.0, 0.0], bend = [-18.0] }
+foreleg_r = { rot = [-8.0, 0.0, 0.0], bend = [-44.0] }
+hindleg_l = { rot = [28.0, 0.0, 0.0], bend = [14.0, -10.0] }
+hindleg_r = { rot = [4.0, 0.0, 0.0], bend = [36.0, -30.0] }
+
+
+# ---------------------------------------------------------------- families
+#
+# Per-family corrections: `[family.<family>.<pose>]` replaces just the keys
+# it names in that family's copy of the shared pose; everything it leaves
+# out is inherited. A family with no section here is unaffected.
+#
+# The poses above were authored on a WOLF. A dog's legs are zigzags -- its
+# hindleg's three segments lie at +30 / -30 / +29 degrees from vertical,
+# a 59-degree spread -- so `sit` can fold them under it like a deckchair.
+# An elephant's legs are straight columns: +13 / +3 / +13, a spread of 11
+# degrees. Handed the wolf's accordion the elephant does not fold; the
+# shared `root` pitch simply tips the whole animal onto its nose, and it
+# ends up TALLER sitting (4.27 ft) than standing (3.29 ft).
+
+# Two things about this rig drive the numbers below.
+#
+# The spine is the ROOT and it pivots at the WITHERS, so no amount of leg
+# folding lowers the body by itself: the figure hangs from the shoulder and
+# grounding simply drops whatever reaches lowest. Only `root` moves the
+# barrel, and a negative `root` (the shared sit's -38) rotates the animal
+# nose-UP about that shoulder -- which is exactly how the wolf sit made the
+# elephant taller than it stands.
+#
+# And an elephant standing has almost no ground clearance: its belly already
+# hangs to y = 0.05 of a 3.29 ft figure. So a lying elephant cannot drop
+# far -- about a tenth of its standing height is the honest floor, and what
+# sells the pose is the body going LEVEL and the legs tucking, not altitude.
+
+# Rump on the ground, hind legs folded forward under the body, forelegs
+# straight and propping, back sloping up to the shoulder. The trunk is
+# curled in: left hanging it reaches the ground and props the whole animal
+# up, which is its own way of defeating a lowered pose.
+[family.elephantid.sit]
+root = [-2.0, 0.0, 0.0]
+neck = { rot = [16.0, 0.0, 0.0] }
+skull = { rot = [-2.0, 0.0, 0.0] }
+tail = { rot = [40.0, 0.0, 0.0] }
+foreleg = { rot = [26.0, 0.0, 0.0], bend = [-24.0] }
+forepaw = { rot = [-14.0, 0.0, 0.0] }
+hindleg = { rot = [-118.0, 0.0, 0.0], bend = [160.0, -40.0] }
+trunk = { rot = [-76.0, 0.0, 0.0], bend = [-44.0, -44.0, -32.0] }
+
+# Resting sternally: body level and low, all four legs tucked close under
+# it, trunk curled. Not the dog's reach-forward, which on this body only
+# leaves the barrel propped at standing height.
+[family.elephantid.lie]
+root = [16.0, 0.0, 0.0]
+neck = { rot = [-6.0, 0.0, 0.0] }
+skull = { rot = [12.0, 0.0, 0.0] }
+tail = { rot = [14.0, 0.0, 0.0] }
+foreleg = { rot = [62.0, 0.0, 0.0], bend = [-112.0] }
+forepaw = { rot = [64.0, 0.0, 0.0] }
+hindleg = { rot = [-64.0, 0.0, 0.0], bend = [112.0, -34.0] }
+trunk = { rot = [-105.0, 0.0, 0.0], bend = [-60.0, -55.0, -40.0] }
+
+# A monitor lizard's legs sprawl out sideways from the body rather than
+# standing under it, so the shared poses -- which swing legs fore and aft
+# under a wolf -- twist them. A lizard does not sit: it lies. Dead, it lies
+# belly-up with its legs limp; fallen, on its side with the tail relaxed
+# (the shared tail angles, set for a dog's tail, stand it up as a spike),
+# its sprawled legs tucked back along the body so the upper pair does not
+# point at the sky. Belly-up, the neck (which rises at rest) is tipped so
+# the head lies flat instead of hanging below the body.
+[family.reptilian.sit]
+root = [0.0, 0.0, 0.0]
+neck = { rot = [10.0, 0.0, 0.0] }
+skull = { rot = [-6.0, 0.0, 0.0] }
+tail = { rot = [0.0, 0.0, 0.0] }
+foreleg = { rot = [-20.0, 0.0, 0.0] }
+hindleg = { rot = [20.0, 0.0, 0.0] }
+
+[family.reptilian.fallen_side]
+root = [0.0, 0.0, 90.0]
+neck = { rot = [6.0, 0.0, 0.0] }
+tail = { rot = [0.0, 0.0, 0.0] }
+foreleg = { rot = [-10.0, 0.0, -50.0] }
+hindleg = { rot = [10.0, 0.0, -50.0] }
+
+[family.reptilian.dead]
+root = [0.0, 0.0, 180.0]
+neck = { rot = [40.0, 0.0, 0.0] }
+skull = { rot = [0.0, 20.0, 0.0] }
+tail = { rot = [0.0, 0.0, 0.0] }
+foreleg = { rot = [-30.0, 0.0, -20.0], bend = [-20.0] }
+hindleg = { rot = [30.0, 0.0, -20.0], bend = [20.0] }
+
+# A bear's legs are short for its girth: on its side the shared angles
+# leave them inside the barrel of the body. Swung well forward and back
+# they show past the belly, which is what reads as a fallen animal.
+[family.ursine.dead]
+foreleg_l = { rot = [-55.0, 0.0, 0.0], bend = [-10.0] }
+foreleg_r = { rot = [-35.0, 0.0, 0.0], bend = [-30.0] }
+hindleg_l = { rot = [50.0, 0.0, 0.0], bend = [10.0, -10.0] }
+hindleg_r = { rot = [30.0, 0.0, 0.0], bend = [30.0, -20.0] }
+
+[family.ursine.fallen_side]
+foreleg = { rot = [-45.0, 0.0, 0.0], bend = [-20.0] }
+hindleg = { rot = [40.0, 0.0, 0.0], bend = [15.0, -15.0] }
+
+# Joint limits: how far each bone may turn, [low, high] degrees per Euler
+# angle (x swing, y twist, z spread) and per bend, as poses write them. A pair
+# stem bounds the LEFT side; the right is mirrored. Every pose, blend and
+# death fall is held inside these; the pose editor's sliders stop at them.
+[limits]
+wing = { rot = [[-60.0, 60.0], [-120.0, 30.0], [-30.0, 120.0]] }
+wing_hand = { rot = [[-40.0, 40.0], [-60.0, 60.0], [-60.0, 60.0]] }
+neck = { rot = [[-45.0, 70.0], [-60.0, 60.0], [-40.0, 40.0]] }
+skull = { rot = [[-40.0, 50.0], [-50.0, 50.0], [-35.0, 35.0]] }
+tail = { rot = [[-70.0, 90.0], [-60.0, 60.0], [-60.0, 60.0]] }
+foreleg = { rot = [[-110.0, 90.0], [-30.0, 30.0], [-60.0, 35.0]], bend = [[-150.0, 20.0]] }
+hindleg = { rot = [[-140.0, 75.0], [-30.0, 30.0], [-60.0, 35.0]], bend = [[-10.0, 170.0], [-120.0, 20.0]] }
+forepaw = { rot = [[-40.0, 100.0], [-20.0, 20.0], [-20.0, 20.0]] }
+
+# The elephant's trunk: a bone of its own rig, not of the template.
+[family_limits.elephantid]
+trunk = { rot = [[-140.0, 60.0], [-45.0, 45.0], [-45.0, 45.0]], bend = [[-90.0, 45.0], [-90.0, 45.0], [-90.0, 45.0]] }
+
+# Breathing at rest: the ribcage swells (brisket and underline drop a
+# touch), the head nods with it, and the tail sways from side to side on
+# a lagging beat.
+[idle]
+period = 3.6
+brisket = { rot = [2.8, 0.0, 0.0] }
+underline = { rot = [-2.0, 0.0, 0.0] }
+neck = { rot = [2.2, 0.0, 0.0] }
+skull = { rot = [-1.2, 0.0, 0.0] }
+tail = { rot = [1.5, 10.0, 0.0], phase = -0.25 }
+
+# The elephant is slow, and its trunk swings where a tail would.
+[family_idle.elephantid]
+period = 5.4
+tail = { rot = [1.0, 5.0, 0.0], phase = -0.25 }
+trunk = { rot = [3.0, 0.0, 0.0], bend = [2.0, 2.0, 2.0], phase = -0.2 }
+
+# Flinches (see `Pose::flinched`): PEAK offsets for a hit on the region,
+# written for the creature's RIGHT side and mirrored for the left. "arm" is
+# a foreleg, "hand" a forepaw, "leg" a hindleg.
+[flinch.head]
+skull = { rot = [12.0, 0.0, -8.0] }
+neck = { rot = [10.0, 0.0, -5.0] }
+
+[flinch.neck]
+neck = { rot = [12.0, 0.0, 0.0] }
+skull = { rot = [6.0, 0.0, 0.0] }
+
+[flinch.chest]
+brisket = { rot = [6.0, 0.0, 0.0] }
+neck = { rot = [-10.0, 0.0, 0.0] }
+foreleg = { rot = [-10.0, 0.0, 5.0], bend = [-8.0] }
+
+[flinch.abdomen]
+underline = { rot = [-6.0, 0.0, 0.0] }
+hindleg = { rot = [10.0, 0.0, 0.0], bend = [8.0, -4.0] }
+tail = { rot = [-24.0, 0.0, 0.0] }
+
+[flinch.back]
+spine = { rot = [-6.0, 0.0, 0.0] }
+neck = { rot = [-8.0, 0.0, 0.0] }
+tail = { rot = [-28.0, 0.0, 0.0] }
+
+[flinch.arm]
+foreleg_r = { rot = [-16.0, 0.0, 12.0], bend = [-16.0] }
+neck = { rot = [0.0, 0.0, -8.0] }
+
+[flinch.hand]
+foreleg_r = { rot = [-10.0, 0.0, 6.0], bend = [-12.0] }
+forepaw_r = { rot = [-22.0, 0.0, 0.0] }
+
+[flinch.leg]
+hindleg_r = { rot = [-14.0, 0.0, 12.0], bend = [18.0, -10.0] }
+tail = { rot = [10.0, 20.0, 0.0] }

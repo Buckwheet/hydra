@@ -1,0 +1,45 @@
+# Poses for every family rigged from the "fish" template. A fish hangs in
+# the water: no lying pose, and dead it turns belly up. See biped.toml for
+# the angle conventions.
+
+body_type = "fish"
+
+[pose.stand]
+
+[pose.stunned]
+skull = { rot = [12.0, 0.0, 0.0] }
+belly = { rot = [-8.0, 0.0, 0.0] }
+tail = { rot = [0.0, 20.0, 0.0] }
+
+[pose.fallen_side]
+root = [0.0, 0.0, 90.0]
+
+[pose.dead]
+root = [0.0, 0.0, 180.0]
+tail = { rot = [10.0, 0.0, 0.0] }
+
+[pose.dead_2]
+root = [0.0, 0.0, 90.0]
+skull = { rot = [-10.0, 0.0, 0.0] }
+
+[limits]
+skull = { rot = [[-30.0, 30.0], [-40.0, 40.0], [-30.0, 30.0]] }
+belly = { rot = [[-30.0, 30.0], [-45.0, 45.0], [-30.0, 30.0]] }
+tail = { rot = [[-30.0, 30.0], [-60.0, 60.0], [-30.0, 30.0]] }
+dorsal = { rot = [[-30.0, 30.0], [-30.0, 30.0], [-30.0, 30.0]] }
+pec = { rot = [[-40.0, 40.0], [-40.0, 40.0], [-40.0, 60.0]] }
+
+[idle]
+period = 2.0
+belly = { rot = [0.0, 3.0, 0.0] }
+tail = { rot = [0.0, 8.0, 0.0], phase = -0.25 }
+pec = { rot = [0.0, 0.0, 6.0], phase = -0.1 }
+
+[flinch.head]
+skull = { rot = [12.0, -10.0, 0.0] }
+[flinch.chest]
+belly = { rot = [0.0, 12.0, 0.0] }
+tail = { rot = [0.0, 20.0, 0.0] }
+[flinch.abdomen]
+belly = { rot = [0.0, -12.0, 0.0] }
+tail = { rot = [0.0, -20.0, 0.0] }

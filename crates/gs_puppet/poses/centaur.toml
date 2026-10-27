@@ -1,0 +1,80 @@
+# Poses for every family rigged from the "centaur" template: a quadruped's
+# body under a biped's torso. See biped.toml for the angle conventions.
+
+body_type = "centaur"
+
+[pose.stand]
+
+[pose.stunned]
+torso_upper = { rot = [16.0, 0.0, 0.0] }
+neck = { rot = [20.0, 0.0, 0.0] }
+skull = { rot = [16.0, 0.0, 0.0] }
+arm = { rot = [-40.0, 0.0, 6.0], bend = [-10.0] }
+foreleg = { rot = [-6.0, 0.0, 6.0] }
+
+[pose.lie]
+root = [-10.0, 0.0, 0.0]
+foreleg = { rot = [40.0, 0.0, 0.0], bend = [-120.0, 60.0] }
+hindleg = { rot = [-40.0, 0.0, 0.0], bend = [120.0, -70.0] }
+
+[pose.fallen_side]
+root = [0.0, 0.0, 90.0]
+torso_upper = { rot = [20.0, 0.0, 0.0] }
+neck = { rot = [10.0, 0.0, 20.0] }
+arm = { rot = [-30.0, 0.0, 20.0], bend = [-30.0] }
+foreleg = { rot = [-30.0, 0.0, 0.0], bend = [-40.0, 20.0] }
+hindleg = { rot = [-40.0, 0.0, 0.0], bend = [40.0, -20.0] }
+
+[pose.dead]
+root = [0.0, 0.0, 90.0]
+torso_upper = { rot = [30.0, 0.0, -10.0] }
+neck = { rot = [20.0, 0.0, 30.0] }
+skull = { rot = [10.0, 30.0, 0.0] }
+arm = { rot = [-50.0, 0.0, 30.0], bend = [-40.0] }
+foreleg = { rot = [-20.0, 0.0, 0.0], bend = [-30.0, 10.0] }
+hindleg = { rot = [-30.0, 0.0, 0.0], bend = [50.0, -30.0] }
+
+[pose.dead_2]
+root = [0.0, 0.0, 180.0]
+neck = { rot = [-20.0, 0.0, 0.0] }
+arm = { rot = [-80.0, 0.0, 20.0], bend = [-60.0] }
+foreleg = { rot = [-40.0, 0.0, 0.0], bend = [-60.0, 30.0] }
+hindleg = { rot = [-40.0, 0.0, 0.0], bend = [70.0, -50.0] }
+
+[limits]
+torso_lower = { rot = [[-30.0, 45.0], [-30.0, 30.0], [-20.0, 20.0]] }
+torso_upper = { rot = [[-30.0, 60.0], [-45.0, 45.0], [-30.0, 30.0]] }
+neck = { rot = [[-40.0, 50.0], [-60.0, 60.0], [-35.0, 35.0]] }
+skull = { rot = [[-40.0, 45.0], [-70.0, 70.0], [-30.0, 30.0]] }
+arm = { rot = [[-180.0, 60.0], [-90.0, 90.0], [-30.0, 180.0]], bend = [[-150.0, 0.0]] }
+tail = { rot = [[-70.0, 90.0], [-60.0, 60.0], [-60.0, 60.0]] }
+foreleg = { rot = [[-110.0, 90.0], [-30.0, 30.0], [-60.0, 35.0]], bend = [[-150.0, 20.0], [-60.0, 60.0]] }
+hindleg = { rot = [[-140.0, 75.0], [-30.0, 30.0], [-60.0, 35.0]], bend = [[-10.0, 170.0], [-120.0, 20.0]] }
+
+[idle]
+period = 4.0
+torso_upper = { rot = [-2.5, 0.0, 0.0] }
+neck = { rot = [2.0, 0.0, 0.0] }
+arm = { rot = [1.5, 0.0, 2.5], bend = [-2.0], phase = -0.16 }
+tail = { rot = [1.0, 4.0, 0.0], phase = -0.25 }
+
+[flinch.head]
+skull = { rot = [14.0, 0.0, -10.0] }
+neck = { rot = [10.0, 0.0, -5.0] }
+[flinch.chest]
+torso_upper = { rot = [12.0, 0.0, 0.0] }
+arm = { rot = [-14.0, 0.0, 8.0], bend = [-16.0] }
+[flinch.abdomen]
+torso_upper = { rot = [-14.0, 0.0, 0.0] }
+torso_lower = { rot = [-8.0, 0.0, 0.0] }
+[flinch.back]
+spine = { rot = [-6.0, 0.0, 0.0] }
+tail = { rot = [-24.0, 0.0, 0.0] }
+[flinch.arm]
+arm_r = { rot = [-18.0, 0.0, 16.0], bend = [-20.0] }
+torso_upper = { rot = [4.0, -8.0, 0.0] }
+[flinch.hand]
+arm_r = { rot = [-12.0, 0.0, 10.0], bend = [-28.0] }
+hand_r = { rot = [-20.0, 0.0, 0.0] }
+[flinch.leg]
+hindleg_r = { rot = [-14.0, 0.0, 12.0], bend = [18.0, -10.0] }

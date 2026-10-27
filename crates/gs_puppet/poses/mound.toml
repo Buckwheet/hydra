@@ -1,0 +1,61 @@
+# Poses for every family rigged from the "mound" template: a mass on the
+# ground with two arms and a head bump (lava and steam elementals, a thorny
+# clump). See biped.toml for the angle conventions.
+
+body_type = "mound"
+
+[pose.stand]
+
+# Stunned: reeling, arms thrown wide.
+[pose.stunned]
+mass = { rot = [6.0, 0.0, 0.0] }
+skull = { rot = [12.0, 0.0, 0.0] }
+arm = { rot = [-10.0, 0.0, 30.0], bend = [-10.0] }
+
+# Calmed: arms lowered.
+[pose.calm]
+arm = { rot = [10.0, 0.0, -10.0] }
+
+# Dead: slumped, the head down, the arms fallen.
+[pose.dead]
+root = [12.0, 0.0, 0.0]
+mass = { rot = [10.0, 0.0, 0.0] }
+skull = { rot = [30.0, 0.0, 0.0] }
+arm = { rot = [30.0, 0.0, -25.0], bend = [-20.0] }
+
+[pose.dead_2]
+root = [0.0, 0.0, 70.0]
+skull = { rot = [20.0, 0.0, 10.0] }
+arm = { rot = [20.0, 0.0, -30.0] }
+
+[limits]
+mass = { rot = [[-30.0, 30.0], [-40.0, 40.0], [-30.0, 30.0]] }
+skull = { rot = [[-40.0, 45.0], [-70.0, 70.0], [-30.0, 30.0]] }
+arm = { rot = [[-150.0, 60.0], [-90.0, 90.0], [-40.0, 150.0]], bend = [[-150.0, 0.0]] }
+
+# Breathing at rest: the mass heaves, the arms drift.
+[idle]
+period = 5.0
+mass = { rot = [-2.0, 0.0, 0.0] }
+skull = { rot = [1.5, 0.0, 0.0] }
+arm = { rot = [1.5, 0.0, 2.5], phase = -0.2 }
+
+# Flinches: a hit rocks the mass; an arm jerks back.
+[flinch.head]
+skull = { rot = [14.0, 0.0, -8.0] }
+mass = { rot = [4.0, 0.0, 0.0] }
+
+[flinch.chest]
+mass = { rot = [10.0, 0.0, 0.0] }
+arm = { rot = [-12.0, 0.0, 8.0] }
+
+[flinch.abdomen]
+mass = { rot = [-8.0, 0.0, 0.0] }
+
+[flinch.arm]
+arm_r = { rot = [-18.0, 0.0, 16.0], bend = [-18.0] }
+mass = { rot = [3.0, -6.0, 0.0] }
+
+[flinch.hand]
+arm_r = { rot = [-10.0, 0.0, 10.0], bend = [-24.0] }
+hand_r = { rot = [-20.0, 0.0, 0.0] }

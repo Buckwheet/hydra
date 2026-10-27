@@ -1,0 +1,50 @@
+# Poses for every family rigged from the "upright_insect" template. See
+# biped.toml for the angle conventions.
+
+body_type = "upright_insect"
+
+[pose.stand]
+
+[pose.stunned]
+thorax = { rot = [10.0, 0.0, 0.0] }
+skull = { rot = [16.0, 0.0, 0.0] }
+arm = { rot = [-30.0, 0.0, 12.0], bend = [-20.0] }
+leg = { rot = [-10.0, 0.0, 4.0], bend = [20.0, -10.0] }
+
+[pose.dead]
+root = [0.0, 0.0, 90.0]
+skull = { rot = [20.0, 0.0, 10.0] }
+arm = { rot = [-40.0, 0.0, 30.0], bend = [-60.0] }
+leg = { rot = [-30.0, 0.0, 10.0], bend = [50.0, -30.0] }
+wing = { rot = [0.0, 0.0, 20.0] }
+
+[pose.dead_2]
+root = [0.0, 0.0, 180.0]
+arm = { rot = [-70.0, 0.0, 20.0], bend = [-80.0] }
+leg = { rot = [-60.0, 0.0, 10.0], bend = [70.0, -40.0] }
+
+[limits]
+thorax = { rot = [[-30.0, 40.0], [-40.0, 40.0], [-30.0, 30.0]] }
+abdomen = { rot = [[-40.0, 40.0], [-30.0, 30.0], [-30.0, 30.0]] }
+skull = { rot = [[-40.0, 45.0], [-70.0, 70.0], [-30.0, 30.0]] }
+arm = { rot = [[-150.0, 60.0], [-90.0, 90.0], [-30.0, 150.0]], bend = [[-150.0, 0.0]] }
+leg = { rot = [[-120.0, 45.0], [-45.0, 45.0], [-30.0, 70.0]], bend = [[-20.0, 150.0], [-60.0, 70.0]] }
+wing = { rot = [[-60.0, 60.0], [-90.0, 30.0], [-30.0, 120.0]] }
+
+[idle]
+period = 2.6
+thorax = { rot = [-2.0, 0.0, 0.0] }
+abdomen = { rot = [2.5, 0.0, 0.0] }
+wing = { rot = [0.0, 0.0, -3.0], phase = -0.15 }
+
+[flinch.head]
+skull = { rot = [14.0, 0.0, -10.0] }
+[flinch.chest]
+thorax = { rot = [12.0, 0.0, 0.0] }
+arm = { rot = [-14.0, 0.0, 8.0], bend = [-16.0] }
+[flinch.abdomen]
+abdomen = { rot = [-14.0, 0.0, 0.0] }
+[flinch.arm]
+arm_r = { rot = [-18.0, 0.0, 16.0], bend = [-20.0] }
+[flinch.leg]
+leg_r = { rot = [-12.0, 0.0, 8.0], bend = [24.0, -8.0] }

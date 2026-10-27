@@ -782,6 +782,8 @@ dependencies = [
  "hydra_model",
  "hydra_protocol",
  "hydra_session",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

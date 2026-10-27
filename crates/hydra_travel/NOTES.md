@@ -2,11 +2,15 @@
 
 Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hydra`
 (demangled globals in `/Users/cpmbpro/Code/hydra-inspect/symbols_demangled.txt`).
-The crate has 75 `todo!()` stubs over 40 files; nothing is left
+The crate had 75 `todo!()` stubs over 40 files; nothing is left
 (`grep -R "todo!()\|unimplemented!()" crates/hydra_travel/src` is empty) and
 
-* `cargo check -p hydra_travel` — clean, no warnings
-* `cargo test -p hydra_travel` — **154 tests pass**
+* `cargo check -p hydra_travel --offline` — clean, no warnings
+* `cargo test -p hydra_travel --offline` — **164 tests pass**
+
+Phase 1 reconnected `serde` 1.0.229 and `serde_json` 1.0.151 (the `travel.json`
+document); everything else in the crate is still std-only. See
+"Phase 1 reconnection" and "`std`-only departures".
 
 ---
 
@@ -71,12 +75,16 @@ pub enum Refused { Read(String), Newer(u32), NoName }
 //   "the character has no name a file can hold"                      0x10241bce0
 // From<Refused> for io::Error: kind 0x15 (InvalidData) at 0x101505470.
 
+// All four of the types below carry the recovered `Serialize`/`Deserialize`
+// derives since Phase 1; `json::Value` is `serde_json::Value`.
+#[derive(Serialize, Deserialize)]      // visitor at 0x101509934
 pub struct Spot {                       // serde names from 0x101509934
     pub memories: BTreeMap<String, json::Value>,   // drop glue 0x10150a8c4
     pub targets: BTreeMap<String, Vec<u32>>,       // drop glue 0x10150a8c4
     pub last_room: u32,
 }
-pub struct Shared {                     // "struct Shared with 4 elements" 0x10241dfac
+#[derive(Serialize, Deserialize)]      // "struct Shared with 4 elements" 0x10241dfac
+pub struct Shared {
     pub schema_version: u32,            // +0x48, 0x101508f68
     pub characters: BTreeMap<String, Spot>,
     pub instabilities: BTreeMap<String, Vec<walk::instability::Seen>>,
@@ -84,11 +92,15 @@ pub struct Shared {                     // "struct Shared with 4 elements" 0x102
 }
 
 // walk/instability.rs — "struct Seen with 3 elements" 0x10241dfd6
+#[derive(Serialize, Deserialize)]
 pub struct Seen { pub room: u32, pub element: String, pub seen: u32 }  // 0x10241f4ee
 
 // walk/routines.rs — the field names are the serializer's (0x101572368)
+#[derive(Serialize, Deserialize)]
 pub struct Routine { kind, rooms, hands_free_in, by_uid, enter, batter, puzzle,
                      route, errand, starts, landmarks, after, noun, open }
+#[derive(Serialize, Deserialize)]
+pub struct Landmark { noun, open, enter, after }  // 0x1024224bd
 pub const KINDS: [&str; 31] = …        // 0x1024223ed..0x10242264d
 ```
 
@@ -403,21 +415,119 @@ ordinals, `go`/`climb`/`open`/`stow`, `Roundtime`, the `typeahead` description).
 
 ## `std`-only departures
 
+Rows struck through are **gone**: Phase 1 put the real crate back (see
+"Phase 1 reconnection" below for the versions and the behaviour that came with
+them).
+
 | original dependency | recovered use | what this build does |
 |---|---|---|
-| `serde` + `serde_core::de::Visitor` | `file::{Spot,Shared}`, `walk::instability::Seen` (all four `expecting` symbols are in the crate's unresolved list) | plain structs with hand-written `to_json`/`from_json`; the *field names and types* are the recovered ones, the derive machinery is not reproduced. |
-| `serde_json` | `travel.json`, `routine_name`'s `Value` index | `crate::json` — a small `Value` with a parser and writer (objects, arrays, strings, numbers, `true`/`false`/`null`, six escapes, surrogate pairs). |
-| `hydra_session::store::changing` | read/edit/write of `travel.json` | `file::changing(dir, closure)`: read, edit, write. The original closure-based version is not part of the reconstructed `hydra_session`. |
-| `cena_map` (external crate) | `Map::room`, `Cost::price`, `Cond::ask`, `cena_map::locate`, `routine::Routine` | `crate::map`: a room index with the same accessors (`room`, `room_id`, `area`, `exits`, `routines`). The routine *field names* and *kind words* are the recovered ones. |
-| `hashbrown`/`BTreeMap` in `TravelSettings` | settings map | `std::collections::BTreeMap` (the original used a `HashMap` for `for_walker`; the ordering is not observable). |
-| `tokio` | none observed in this crate | n/a |
-| `regex` | none observed in this crate | n/a |
+| ~~`serde` + `serde_core::de::Visitor`~~ | ~~`file::{Spot,Shared}`, `walk::instability::Seen` (all four `expecting` symbols are in the crate's unresolved list)~~ | **Reconnected.** `#[derive(Serialize, Deserialize)]` on `file::{Spot,Shared}`, `walk::instability::Seen` and `walk::routines::{Routine,Landmark}`; the field names, order and defaults are the recovered ones. |
+| ~~`serde_json`~~ | ~~`travel.json`, `routine_name`'s `Value` index~~ | **Reconnected.** `crate::json` is now a three-line alias over `serde_json`: `crate::json::Value` *is* `serde_json::Value`, and `file::{read,write}` go through `from_str`/`to_string`. |
+| `hydra_session::store::changing` | read/edit/write of `travel.json` | **Kept (seam).** `file::changing(dir, closure)`: read, edit, write. `hydra_session::store::changing` does not exist in the reconnected `hydra_session` — `hydra_session::store` exposes `safe_component`, `character_path`, `temp_extension`, `thread_hash` and `save_bytes`, and has no `changing` counterpart — so the read/edit/write cycle lives here. If `changing` comes back to `hydra_session`, `file::changing` becomes a two-line call to it. |
+| `cena_map` (external crate) | `Map::room`, `Cost::price`, `Cond::ask`, `cena_map::locate`, `routine::Routine` | **Kept, deliberately.** `cena_map` (and `cena_map_layout`) are **not in the workspace pins** (root `Cargo.toml` `[workspace.dependencies]`), so there is nothing to reconnect to. `crate::map` stays: a room index with the same accessors (`room`, `room_id`, `area`, `exits`, `routines`). The routine *field names* and *kind words* are the recovered ones and its serde shape is real (see above). |
+| `hashbrown`/`BTreeMap` in `TravelSettings` | settings map | `std::collections::BTreeMap` (the original used a `HashMap` for `for_walker`; the ordering is not observable). Not a workspace pin, and not worth adding `hashbrown` for. |
+| `tokio` | none observed in this crate | n/a — nothing async to reconnect, so the pin was not added. |
+| `regex` | none observed in this crate | n/a — no `regex` call site in this crate, so the pin was not added. |
 
 `hydra_model`, `hydra_protocol` and `hydra_session` are used as path
 dependencies (allowed and encouraged): `GameState`, `state::lines::ChunkLine`,
-`spells::spell_named`/`spell` and `store::safe_component`. Adding them updates
-`Cargo.lock` by three lines (the dependency edges of `hydra_travel`); nothing
-else in the workspace changed.
+`spells::spell_named`/`spell` and `store::safe_component`.
+
+---
+
+## Phase 1 reconnection
+
+Both dependencies are workspace pins, declared as `x = { workspace = true }` in
+this crate's `Cargo.toml` and used through `cargo --offline`:
+
+| real crate (pin) | replaced | where |
+|---|---|---|
+| `serde` **1.0.229** (feature `derive`) | the hand-written `to_json`/`from_json` bodies | `file::{Spot, Shared}`, `walk::instability::Seen`, `walk::routines::{Routine, Landmark}` |
+| `serde_json` **1.0.151** | `src/json.rs`'s parser/writer and `Value` | `file::{read, write, to_json, from_json}`, `walk::instability::Seen::{to_json,from_json}`, `crate::json` (the alias), `settings::TravelSettings::{from_memories, memories}` |
+
+`Cargo.lock` gained the two dependency edges of `hydra_travel` and nothing else.
+
+### Why these two are the *recovered* ones, not a guess
+
+* The binary carries the derive machinery for exactly the three types this crate
+  persists: `<impl Deserialize for file::Spot>::Visitor::expecting`
+  (`0x101509934`, literal `struct Spot` at `0x10241bc8b`),
+  `<… for file::Shared>` (`0x10241bc96`, field count
+  `struct Shared with 4 elements` at `0x10241dfac`) and
+  `<… for walk::instability::Seen>` (`0x10241dfd6`, `struct Seen with 3
+  elements`). A hand-written reader would not produce `expecting`/field-count
+  constants.
+* The file format is `serde_json`: `serde_json::de::from_trait` at `0x101537760`
+  is what `file::read` calls, and `serde_json::ser::Serializer` is inlined into
+  `file::Shared::serialize` (`0x101506304`).
+* The free-form maps are `serde_json::Value`: `drop_in_place<file::Spot>`
+  (`0x10150a8c4`) drops a `BTreeMap<String, serde_json::Value>`, and
+  `walk::drive::routine_name` (`0x10153831c`) reads a `Value::String`'s
+  `ptr`/`len` at `+0x10`/`+0x18` of it.
+
+### Behaviour that changed as a direct result of using the real crates
+
+1. **On-disk field order.** The old writer built a `BTreeMap`-backed `Value`, so
+   the document came out alphabetically (`characters`, `instabilities`,
+   `schema_version`). `serde_json::to_string(&Shared)` writes the *recovered*
+   serializer order — `schema_version`, `characters`, `instabilities`, then
+   `memories` when it is not empty — which is what `Shared::serialize` at
+   `0x10241bc46`/`0x10241bc54`/`0x10241bc2c` does. The names, nesting, and the
+   single trailing newline are unchanged; `file::tests::on_disk_document_is_the_
+   recovered_field_order` pins the bytes both with and without a non-empty root
+   `memories`.
+2. **Integer fidelity in `memories`.** The hand-written `Value` kept every number
+   as `f64`, so anything past 2^53 was rounded; `serde_json` keeps the integer
+   and round-trips it exactly (`json::tests::integers_stay_exact`).
+3. **Broken-file message.** It is still `Refused::Read(String)`, but the string
+   is `serde_json`'s (`expected value at line 1 column 3`) instead of the old
+   `… at byte N`. A document with **no** `schema_version` is now
+   `missing field \`schema_version\`` from `serde`, not the stand-in's
+   `missing schema_version`; it is still a refusal, because `schema_version` is
+   the one field without `#[serde(default)]`.
+4. **Malformed spot rows fail the whole file.** The old reader `filter_map`ped a
+   non-integer out of a `targets` path; `Vec<u32>` now rejects the document
+   (`invalid type`), which is what the derived `Deserialize` the binary carries
+   would do.
+5. **Absent fields still default** (`#[serde(default)]`): the three `Spot` fields,
+   `Seen::seen`, `Shared::{characters,instabilities,memories}` and every
+   `Routine`/`Landmark` field. Unknown keys are ignored, as before.
+6. **Free-form object key order inside `memories` is normalised** to
+   `serde_json`'s default `Map` (`BTreeMap`), i.e. sorted. The old `Value` did
+   the same, so nothing regressed; adding `serde_json`'s `preserve_order`
+   feature would change it and was not done.
+
+### `Routine`/`Landmark`
+
+`cena_map`'s routine type was a serde document (`routine_name` reads a
+deserialized routine), so the *serialization* is recoverable even though the
+crate itself is not pinned: `walk::routines::{Routine, Landmark}` now derive
+`Serialize`/`Deserialize` in the recovered declaration order (the serializer at
+`0x101572368` writes `kind`, `rooms`, `hands_free_in`, `by_uid`, `enter`,
+`batter`, `puzzle`, `route`, `errand`, `starts`, `landmarks`, `after`, `noun`,
+`open`). **INFERRED:** whether the original skipped a `None` field; the bare
+derive writes `null`.
+
+### Tests
+
+`cargo test -p hydra_travel --offline` is **164 passing** (154 before the pass,
+plus ten new ones; the three `src/json.rs` tests were rewritten in place because
+there is no hand-written parser left to test):
+
+* `json::tests` — the alias is really `serde_json::Value`, integers stay exact,
+  garbage is rejected.
+* `file::tests::{spot,shared}_round_trips_through_serde` — derive round trips,
+  free-form `memories` included, with the exact serialised text.
+* `file::tests::absent_fields_default_and_unknown_fields_are_ignored`.
+* `file::tests::schema_three_is_read_and_anything_newer_is_refused`.
+* `file::tests::on_disk_document_is_the_recovered_field_order`.
+* `file::tests::free_form_memories_survive_a_change` — a foreign `memories`
+  object survives `read` → edit → `write` intact, and `take_settings` still
+  reads the setting words out of it.
+* `walk::instability::tests::seen_serialises_in_the_recovered_order`,
+  `…::seen_defaults_and_ignores_unknown_fields`.
+* `walk::routines::tests::routine_serialises_in_the_recovered_field_order`,
+  `…::routine_reads_a_partial_document`.
 
 ---
 

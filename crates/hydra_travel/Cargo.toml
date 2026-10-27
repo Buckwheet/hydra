@@ -11,3 +11,20 @@ edition = "2021"
 hydra_model = { path = "../hydra_model" }
 hydra_protocol = { path = "../hydra_protocol" }
 hydra_session = { path = "../hydra_session" }
+
+# Phase 1 reconnection: the crates the original linked, both pinned in the
+# workspace root and used through `cargo --offline`.
+#
+# * `serde` 1.0.229 (derive) is the `Serialize`/`Deserialize` machinery behind
+#   `travel.json`: the binary carries the three visitor symbols
+#   `<impl Deserialize for file::Spot>::Visitor::expecting` (0x101509934),
+#   `<… for file::Shared>` (`struct Shared with 4 elements`, 0x10241dfac) and
+#   `<… for walk::instability::Seen>` (`struct Seen with 3 elements`,
+#   0x10241dfd6), plus the routine serializer at 0x101572368.
+# * `serde_json` 1.0.151 is the file format itself: `serde_json::de::from_trait`
+#   at 0x101537760, `serde_json::ser::Serializer` inlined in
+#   `file::Shared::serialize`, and the `serde_json::Value` the recovered
+#   `Spot::memories` / `Shared::memories` maps hold (drop glue 0x10150a8c4) and
+#   that `walk::drive::routine_name` reads as a `Value::String`.
+serde = { workspace = true }
+serde_json = { workspace = true }

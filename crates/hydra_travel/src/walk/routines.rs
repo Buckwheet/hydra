@@ -57,6 +57,8 @@ pub mod trinket;
 pub mod vaalorn_door;
 pub mod workshop_pillars;
 
+use serde::{Deserialize, Serialize};
+
 use crate::RoomId;
 
 /// The `kind` words a map routine can carry, in the order the literals appear
@@ -99,7 +101,16 @@ pub const KINDS: [&str; 31] = [
 ///
 /// The field names are the serializer's (`0x1024224bd`): `noun`, `open`,
 /// `enter`, `after`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// **Phase 1 reconnection:** `Serialize`/`Deserialize` are the original's — the
+/// routine type was a serde document (`walk::drive::routine_name` at
+/// `0x10153831c` reads a deserialized routine's `name` as a
+/// `serde_json::Value::String`). Whether the original skipped a `None` field is
+/// not recoverable, so the bare derive writes `null`; the struct-level
+/// `#[serde(default)]` keeps the `..Routine::default()` construction of this
+/// build readable from a partial document.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Landmark {
     pub noun: String,
     pub open: Option<String>,
@@ -108,7 +119,12 @@ pub struct Landmark {
 }
 
 /// The routine data attached to a room (`cena_map::routine::Routine`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// **Phase 1 reconnection:** the derive is the original's — the serializer at
+/// `0x101572368` writes exactly these fourteen names, in the declaration order
+/// below.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Routine {
     pub kind: String,
     pub rooms: Vec<RoomId>,
@@ -353,6 +369,46 @@ mod tests {
         for kind in KINDS {
             assert!(!kind.is_empty());
         }
+    }
+
+    /// The recovered serializer at `0x101572368` writes the fourteen names in
+    /// the declaration order below; `serde` now produces exactly that document.
+    #[test]
+    fn routine_serialises_in_the_recovered_field_order() {
+        let mut routine = Routine::with_rooms("mural_of_deities", &[7, 8]);
+        routine.hands_free_in = true;
+        routine.landmarks.push(Landmark {
+            noun: "mural".into(),
+            open: Some("push mural".into()),
+            ..Landmark::default()
+        });
+        let text = serde_json::to_string(&routine).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"kind":"mural_of_deities","rooms":[7,8],"hands_free_in":true,"#,
+                r#""by_uid":false,"enter":null,"batter":null,"puzzle":null,"#,
+                r#""route":null,"errand":null,"starts":[],"#,
+                r#""landmarks":[{"noun":"mural","open":"push mural","enter":null,"after":null}],"#,
+                r#""after":null,"noun":null,"open":null}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<Routine>(&text).unwrap(), routine);
+    }
+
+    /// A map file may carry only the fields a routine needs, and may carry keys
+    /// this build does not know; both read.
+    #[test]
+    fn routine_reads_a_partial_document() {
+        let partial: Routine =
+            serde_json::from_str(r#"{"kind":"day_pass","rooms":[4460],"extra":1}"#).unwrap();
+        assert_eq!(partial, Routine::with_rooms("day_pass", &[4460]));
+        assert_eq!(serde_json::from_str::<Routine>("{}").unwrap(), Routine::default());
+        // The kind word alone is the minimum the solvers dispatch on.
+        assert_eq!(
+            serde_json::from_str::<Landmark>(r#"{"noun":"door"}"#).unwrap().noun,
+            "door"
+        );
     }
 
     #[test]

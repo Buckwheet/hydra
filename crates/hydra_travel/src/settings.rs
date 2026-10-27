@@ -583,10 +583,13 @@ impl TravelSettings {
     }
 
     /// The words, for writing back into `memories`.
+    ///
+    /// **Phase 1 reconnection:** the values are `serde_json::Value`s now, so the
+    /// string arm is `Value::from(String)`.
     pub fn memories(&self) -> BTreeMap<String, json::Value> {
         self.values
             .iter()
-            .map(|(k, v)| (k.clone(), json::Value::string(v.clone())))
+            .map(|(k, v)| (k.clone(), json::Value::from(v.clone())))
             .collect()
     }
 

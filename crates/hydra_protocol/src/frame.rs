@@ -50,6 +50,22 @@ pub enum Frame {
     /// `0x8000_0000_0000_003a`): the head did not start with `<c>`, or there
     /// was no marker at all.
     ClientRegion,
+    /// One of the original's dedicated protocol frames, carrying the
+    /// original's own variant name as [`Frame::kind`].
+    ///
+    /// The original `Frame` has 59 tags; the reconstruction models the few it
+    /// interprets structurally (`Text`, `Prompt`, `Structural`, ...) and keeps
+    /// every other dedicated frame — `Component`, `ContainerItem`,
+    /// `DialogWidgets`, `StreamPop`, `MalformedTag`, … — as its exact
+    /// CamelCase variant name plus whatever text the variant displays.  That
+    /// keeps the `--summary` histogram byte-identical to the original's
+    /// (`{count:>8}  {Variant}`) without modelling 50 payload structs.
+    Event {
+        /// The original variant name (`"Component"`, `"StreamPop"`, ...).
+        kind: &'static str,
+        /// The frame's plain text; empty for variants that display none.
+        text: String,
+    },
 }
 
 impl Default for Frame {
@@ -76,6 +92,7 @@ impl Frame {
             // pushes after flushing the pending text frame.
             Frame::Structural { .. } | Frame::ClientRegion => String::new(),
             Frame::ClientText(text) => text.clone(),
+            Frame::Event { text, .. } => text.clone(),
         }
     }
 
@@ -88,6 +105,7 @@ impl Frame {
             Frame::Unknown { text, raw, .. } => text.is_empty() && raw.is_empty(),
             Frame::Structural { .. } | Frame::ClientRegion => true,
             Frame::ClientText(text) => text.is_empty(),
+            Frame::Event { text, .. } => text.is_empty(),
         }
     }
 
@@ -97,6 +115,38 @@ impl Frame {
             Frame::Text(runs) => Some(runs),
             _ => None,
         }
+    }
+
+    /// The original's variant name for this frame.
+    ///
+    /// These are the names the original's `--summary` histogram prints; see
+    /// [`crate::frame::Frame::Event`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Text(_) => "Text",
+            Frame::Prompt(_) => "Prompt",
+            Frame::Echo(_) => "Echo",
+            Frame::Raw(_) => "Raw",
+            Frame::MerchantStatus(_) => "MerchantStatus",
+            Frame::Unknown { .. } => "UnknownTag",
+            Frame::Structural { .. } => "Structural",
+            Frame::ClientText(_) => "ClientCommand",
+            Frame::ClientRegion => "ClientRegion",
+            Frame::Event { kind, .. } => kind,
+        }
+    }
+
+    /// Build a dedicated protocol frame from the original's variant name.
+    pub fn event(kind: &'static str) -> Frame {
+        Frame::Event {
+            kind,
+            text: String::new(),
+        }
+    }
+
+    /// Build a dedicated protocol frame that displays `text`.
+    pub fn event_text(kind: &'static str, text: String) -> Frame {
+        Frame::Event { kind, text }
     }
 
     /// The tag name captured for an unknown frame.

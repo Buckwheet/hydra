@@ -195,10 +195,14 @@ mod tests {
         let session = Headless::new("Aelith");
         let mut listener = session.subscribe();
 
-        assert_eq!(relay(&session, &mut source), 3);
+        // A text line, then an object link (open `Structural`, the text, close
+        // `Structural`), then the prompt.
+        assert_eq!(relay(&session, &mut source), 5);
 
         let events = listener.drain();
         match &events[0] {
+            // The two `Structural` frames carry no text, so the session keeps
+            // only the three text-bearing ones.
             Event::Frames(text) => assert_eq!(
                 text,
                 &vec!["you feel better".to_string(), "a gem".to_string(), ">".to_string()]

@@ -2,75 +2,96 @@
 //!
 //! # What the reference build prints
 //!
-//! `hydra::replay::replay` (`0x100205ff4`) does **not** use this module's
-//! line format.  It writes, per frame, either
-//!
-//! * `writeln!(stdout, "{}", frame)` — the default mode.  The `Display`
-//!   formatting function pointer loaded at `0x100206760`/`0x100206768` is the
-//!   standard in-crate `Frame` formatter, so the reference build prints whatever
-//!   `impl Display for Frame` renders; or
-//! * `writeln!(stdout, "{}", renderer.frame(frame))` — the `--text` mode, which
-//!   goes through `hydra::render::Renderer::frame` (`0x1002593ec`; the renderer
-//!   keeps a paragraph flag and brackets `death`/`group` frames, see
-//!   `NOTES.md`).
-//!
-//! `--summary` (`Show::Summary`) suppresses the per-frame lines and keeps only
-//! the tally.  Every mode then ends with the recovered footer format
-//! `"\n== "`, `" frames from "`, `" bytes\n"` (`__cstring` `0x103e24ce9`,
-//! printed at `0x100206b1c`), i.e. `== {frames} frames from {bytes} bytes`.
-//!
-//! Our `hydra_protocol::Frame` has no `Display` impl (the reconstruction models
-//! six of the original's variants and keeps the rest as data), so this crate
-//! documents its own line format instead of reproducing the original's opaque
-//! one:
+//! `hydra::replay::replay` (`0x100205ff4`) tallies the frames it decodes and,
+//! after `Parser::finish`, writes the recovered footer — the literals `"\n== "`,
+//! `" frames from "`, `" bytes\n"` at `__cstring 0x103e24ce9`, printed at
+//! `0x100206b1c` — followed by the per-kind counts and the unknown-tag block:
 //!
 //! ```text
-//! {index}\t{kind}\t{tag}\t{text}
+//! ␊== {frames} frames from {bytes} bytes␊
+//! {count:>8}  {Variant}␊            # only the non-zero kinds, sorted by name
+//! == no unknown tags␊               # or:
+//! == unknown tags␊
+//! {count:>8}  <{tag}>␊              # one line per name, sorted, open+close counted
 //! ```
 //!
-//! * `index` is the 1-based frame number in stream order;
-//! * `kind` is one of `text`, `prompt`, `echo`, `raw`, `merchant`, `tag`,
-//!   `structural`, `client-text`, `client-region`;
-//! * `tag` is the tag name for `tag` frames and `-` for every other kind;
-//! * `text` is the frame's plain text, or the raw line for `raw` frames.
+//! The histogram is printed in **every** mode, not just `--summary`:
+//! `--summary` merely suppresses the per-frame lines the default and `--text`
+//! modes write before it.
 //!
-//! Fields are tab separated, so the payload is escaped: `\` → `\\`, TAB →
-//! `\t`, LF → `\n`, CR → `\r`, and any other C0 control or DEL → `\xNN`.
-//! One frame is always exactly one line, which keeps the output
-//! line-comparable (and therefore diffable and testable).
+//! Our default mode still prints one line per frame in this crate's own
+//! documented format (`{index}\t{kind}\t{tag}\t{text}`, see
+//! [`crate::render::frame_line`]) because the reference build prints
+//! `Display for Frame`, which the reconstruction does not implement; the
+//! histogram after it is the recovered one.
 
 use hydra_protocol::Frame;
 
-/// The frame kinds, in report order.
+/// Every kind word the original's histogram can print, alphabetically.
 ///
-/// The last three are the protocol-audit variants added after this crate was
-/// first written (`Structural`, `ClientText`, `ClientRegion`); they are kept
-/// after the original six so the existing report remains stable.
-pub const KINDS: [&str; 9] = [
-    "text",
-    "prompt",
-    "echo",
-    "raw",
-    "merchant",
-    "tag",
-    "structural",
-    "client-text",
-    "client-region",
+/// These are the original `Frame` variant names (`Debug for Frame`'s switch);
+/// [`kind`] names the frames this crate emits, and
+/// [`hydra_protocol::Frame::Event`] carries the rest verbatim.
+pub const KINDS: [&str; 54] = [
+    "ActiveEffect",
+    "AimTime",
+    "AppInfo",
+    "CastTime",
+    "ClearContainer",
+    "ClearDialogData",
+    "ClearStream",
+    "ClientCommand",
+    "ClientRegion",
+    "ClientSettings",
+    "CloseDialog",
+    "CmdListUpdate",
+    "CmdTimestamp",
+    "Compass",
+    "Component",
+    "Container",
+    "ContainerItem",
+    "CreatureStatus",
+    "DeleteContainer",
+    "DialogOpen",
+    "DialogPanelOpen",
+    "DialogWidgets",
+    "EbonGateMerchant",
+    "Echo",
+    "EndSetup",
+    "Expose",
+    "InjuryImage",
+    "InlineImage",
+    "InventoryManager",
+    "InventoryViewItem",
+    "Label",
+    "LaunchUrl",
+    "LeftHand",
+    "MalformedTag",
+    "MenuResponse",
+    "MerchantStatus",
+    "ObjectivesUpdate",
+    "PantheonStatus",
+    "PlayerId",
+    "ProgressBar",
+    "Prompt",
+    "Pulse",
+    "QuickbarSwitch",
+    "Raw",
+    "RightHand",
+    "RoomId",
+    "RoomMeta",
+    "RoomPicture",
+    "RoundTime",
+    "SettingsInfo",
+    "StatusIndicator",
+    "Structural",
+    "Text",
+    "UnknownTag",
 ];
 
-/// The kind word for a frame.
+/// The kind word for a frame: the original variant name.
 pub fn kind(frame: &Frame) -> &'static str {
-    match frame {
-        Frame::Text(_) => "text",
-        Frame::Prompt(_) => "prompt",
-        Frame::Echo(_) => "echo",
-        Frame::Raw(_) => "raw",
-        Frame::MerchantStatus(_) => "merchant",
-        Frame::Unknown { .. } => "tag",
-        Frame::Structural { .. } => "structural",
-        Frame::ClientText(_) => "client-text",
-        Frame::ClientRegion => "client-region",
-    }
+    frame.kind()
 }
 
 /// Escape a payload so it never spans more than one line.
@@ -119,45 +140,41 @@ pub fn text_line(frame: &Frame) -> Option<String> {
     }
 }
 
-/// Per-kind frame counts, in [`KINDS`] order.
+/// Per-kind frame counts.
+///
+/// Sorted by kind name, which is also the order the histogram prints in; only
+/// the kinds that occurred are kept, because a zero row is never printed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
-    counts: [usize; KINDS.len()],
+    counts: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl Counts {
     /// Count one frame.
     pub fn add(&mut self, frame: &Frame) {
-        let word = kind(frame);
-        if let Some(slot) = KINDS.iter().position(|k| *k == word) {
-            self.counts[slot] += 1;
-        }
+        *self.counts.entry(kind(frame)).or_insert(0) += 1;
     }
 
     /// The count for `kind`.
     pub fn of(&self, kind: &str) -> usize {
-        KINDS
-            .iter()
-            .position(|k| *k == kind)
-            .map(|i| self.counts[i])
-            .unwrap_or(0)
+        self.counts.get(kind).copied().unwrap_or(0)
     }
 
-    /// `(kind, count)` pairs, including the zero counts, in [`KINDS`] order.
+    /// `(kind, count)` pairs in name order, zero counts omitted.
     pub fn pairs(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
-        KINDS.iter().copied().zip(self.counts.iter().copied())
+        self.counts.iter().map(|(kind, count)| (*kind, *count))
     }
 
     /// The total number of frames counted.
     pub fn total(&self) -> usize {
-        self.counts.iter().sum()
+        self.counts.values().sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hydra_protocol::frame::payload::{Link, MerchantStatus};
+    use hydra_protocol::frame::payload::Link;
     use hydra_protocol::{Run, Runs};
 
     fn text_frame(text: &str) -> Frame {
@@ -170,47 +187,52 @@ mod tests {
     }
 
     #[test]
-    fn every_variant_has_a_kind_word() {
-        assert_eq!(kind(&text_frame("hi")), "text");
-        assert_eq!(kind(&Frame::Prompt(">".into())), "prompt");
-        assert_eq!(kind(&Frame::Echo("hi".into())), "echo");
-        assert_eq!(kind(&Frame::Raw("hi".into())), "raw");
-        assert_eq!(
-            kind(&Frame::MerchantStatus(MerchantStatus::Start)),
-            "merchant"
-        );
+    fn every_variant_has_the_original_kind_word() {
+        assert_eq!(kind(&text_frame("hi")), "Text");
+        assert_eq!(kind(&Frame::Prompt(">".into())), "Prompt");
+        assert_eq!(kind(&Frame::Raw("hi".into())), "Raw");
         assert_eq!(
             kind(&Frame::Unknown {
-                tag: "room".into(),
-                raw: "<room/>".into(),
+                tag: "foo".into(),
+                raw: "<foo/>".into(),
                 text: String::new()
             }),
-            "tag"
+            "UnknownTag"
         );
         assert_eq!(
             kind(&Frame::Structural {
-                tag: "room".into(),
-                text: "a room".into()
+                tag: "b".into(),
+                text: "<b>".into()
             }),
-            "structural"
+            "Structural"
         );
-        assert_eq!(kind(&Frame::ClientText("look".into())), "client-text");
-        assert_eq!(kind(&Frame::ClientRegion), "client-region");
-        // KINDS is the closed set `kind` produces.
+        assert_eq!(kind(&Frame::ClientText("look".into())), "ClientCommand");
+        assert_eq!(kind(&Frame::ClientRegion), "ClientRegion");
+        assert_eq!(kind(&Frame::event("Component")), "Component");
+        assert_eq!(kind(&Frame::event("StreamPopForced")), "StreamPopForced");
+    }
+
+    #[test]
+    fn the_kind_list_is_sorted_and_covers_every_variant() {
+        assert!(KINDS.windows(2).all(|w| w[0] < w[1]), "KINDS is sorted");
+        assert_eq!(KINDS.len(), 54);
+        // Every kind the reconstructed variants can produce is listed.
         for frame in [
             text_frame("hi"),
             Frame::Prompt(">".into()),
             Frame::Echo("hi".into()),
             Frame::Raw("hi".into()),
-            Frame::MerchantStatus(MerchantStatus::Stop),
-            Frame::Structural {
-                tag: "room".into(),
+            Frame::MerchantStatus(hydra_protocol::MerchantStatus::Stop),
+            Frame::Unknown {
+                tag: "foo".into(),
+                raw: "<foo/>".into(),
                 text: String::new(),
             },
+            Frame::structural("b", "<b>"),
             Frame::ClientText("hi".into()),
             Frame::ClientRegion,
         ] {
-            assert!(KINDS.contains(&kind(&frame)));
+            assert!(KINDS.contains(&kind(&frame)), "{}", kind(&frame));
         }
     }
 
@@ -218,7 +240,7 @@ mod tests {
     fn text_frames_report_their_plain_text() {
         assert_eq!(
             frame_line(1, &text_frame("a blue gem glitters")),
-            "1\ttext\t-\ta blue gem glitters"
+            "1\tText\t-\ta blue gem glitters"
         );
     }
 
@@ -227,7 +249,7 @@ mod tests {
         let run = Run::with_link("a blue gem", Link::object("-1001", Some("gem")));
         let mut runs = Runs::new();
         runs.push(run);
-        assert_eq!(frame_line(7, &Frame::Text(runs)), "7\ttext\t-\ta blue gem");
+        assert_eq!(frame_line(7, &Frame::Text(runs)), "7\tText\t-\ta blue gem");
     }
 
     #[test]
@@ -237,7 +259,7 @@ mod tests {
             raw: "<questState id=\"7\">".into(),
             text: "ready".into(),
         };
-        assert_eq!(frame_line(2, &frame), "2\ttag\tquestState\tready");
+        assert_eq!(frame_line(2, &frame), "2\tUnknownTag\tquestState\tready");
     }
 
     #[test]
@@ -249,7 +271,7 @@ mod tests {
         assert_eq!(escape("Vaalor’s gate — ok"), "Vaalor’s gate — ok");
         assert_eq!(
             frame_line(1, &Frame::Raw("two\nlines".into())),
-            "1\traw\t-\ttwo\\nlines"
+            "1\tRaw\t-\ttwo\\nlines"
         );
     }
 
@@ -265,21 +287,25 @@ mod tests {
             None
         );
         assert_eq!(text_line(&Frame::Raw(String::new())), None);
+        assert_eq!(text_line(&Frame::event("Component")), None);
     }
 
     #[test]
-    fn counts_add_up_per_kind() {
+    fn counts_are_kept_per_kind_in_name_order_and_skip_zeros() {
         let mut counts = Counts::default();
         counts.add(&text_frame("one"));
         counts.add(&text_frame("two"));
         counts.add(&Frame::Prompt(">".into()));
-        assert_eq!(counts.of("text"), 2);
-        assert_eq!(counts.of("prompt"), 1);
-        assert_eq!(counts.of("raw"), 0);
-        assert_eq!(counts.total(), 3);
+        counts.add(&Frame::event("Component"));
+        assert_eq!(counts.of("Text"), 2);
+        assert_eq!(counts.of("Prompt"), 1);
+        assert_eq!(counts.of("Raw"), 0);
+        assert_eq!(counts.total(), 4);
         let pairs: Vec<_> = counts.pairs().collect();
-        assert_eq!(pairs[0], ("text", 2));
-        assert_eq!(pairs[1], ("prompt", 1));
-        assert_eq!(pairs.len(), KINDS.len());
+        assert_eq!(
+            pairs,
+            vec![("Component", 1), ("Prompt", 1), ("Text", 2)],
+            "the histogram sorts by kind name and prints no zero rows"
+        );
     }
 }

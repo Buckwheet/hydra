@@ -22,15 +22,24 @@
 //! name_id(conn, kind, name, …) -> i64   0x10168f25c   the `names` interning
 //! ```
 //!
-//! # Departure from the original (see `store.rs`)
+//! # Dependencies (Phase 1 reconnection)
 //!
-//! The original drives SQLite through `rusqlite`. There is no SQLite here and no
-//! network, so [`store::Connection`] is a `std`-only relational store: the
-//! recovered schema as typed row vectors, the recovered statements as typed
-//! operations, and the SQL text kept verbatim in [`schema`] and beside each
-//! operation. There is no SQL engine and no SQLite file format — a real
-//! `hydra.db` cannot be opened by this build, and [`store::Connection::commit`]
-//! writes a documented line format instead.
+//! The two crates the original linked are back at their workspace pins:
+//!
+//! * **`rusqlite` 0.37.0 (`bundled`)** — [`store::Connection`] is a real
+//!   `rusqlite::Connection` over a real `hydra.db`. [`migrate`] runs the three
+//!   recovered batches inside one transaction each and moves
+//!   `PRAGMA user_version` 0 → 3; the readers run the recovered `SELECT`s
+//!   through `prepare_cached` (rusqlite's `StatementCache`); the writer's four
+//!   `INSERT`s go through `execute` inside a `Transaction`.
+//! * **`tokio` 1.53.1 (`full`)** — [`writer::Writer`] owns a
+//!   `tokio::sync::mpsc::Sender<writer::Sent>` over a 1024-slot channel,
+//!   `try_send`s rows with `Writer::try_record`, answers flushes through a
+//!   `tokio::sync::oneshot`, and drives `writer::run_async` on the crate's
+//!   runtime; `record_async`/`flush_async` are the recovered `async fn`s, with
+//!   `record`/`flush` as blocking wrappers for synchronous siblings.
+//!
+//! `NOTES.md` §6 keeps the table of what used to stand in for both.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -43,6 +52,8 @@ pub mod schema;
 pub mod store;
 pub mod writer;
 
+mod runtime;
+
 pub use row::{Pulse, Reward, Row, Snapshot, SnapshotKind, Source, Stamp, StoreVisit, Who};
 pub use store::{Attack, Connection, Db, Hunt, Import, Name, Stored};
 
@@ -50,8 +61,9 @@ pub use store::{Attack, Connection, Db, Hunt, Import, Name, Stored};
 ///
 /// The original's errors are whatever `rusqlite` (and `std::io` for the writer
 /// thread) produced; the crate passes them to `Display` and prints the text.
-/// This type keeps the same three shapes plus the two the ledger itself adds
-/// (a closed writer and a refused statement) so callers can still match.
+/// This type keeps the same shapes so callers can still match; the `rusqlite`
+/// arms are filled by the [`From`] conversion below, so `?` on a
+/// `rusqlite::Result` lands here instead of unwrapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A `rusqlite::Error`'s `Display` text.
@@ -62,10 +74,36 @@ pub enum Error {
     Message(String),
     /// A write on a connection opened read-only (`SQLITE_READONLY`).
     ReadOnly,
-    /// A statement this build does not implement.
+    /// Kept for source compatibility: the pre-Phase-1 store refused statements
+    /// it did not recognise. There is a SQL engine now, so nothing produces
+    /// this — a bad statement is [`Error::Sqlite`].
     Unsupported(String),
-    /// A unique index refused the row.
+    /// A unique index (or another constraint) refused the row;
+    /// `SQLITE_CONSTRAINT`'s own message text.
     Constraint(String),
+}
+
+impl From<rusqlite::Error> for Error {
+    /// `rusqlite::Error` → this crate's error.
+    ///
+    /// The two arms that carry meaning for callers besides the text are
+    /// `SQLITE_READONLY` (→ [`Error::ReadOnly`]) and `SQLITE_CONSTRAINT`
+    /// (→ [`Error::Constraint`], so `note_import`'s documented refusal of a
+    /// duplicate stamp keeps reporting "UNIQUE constraint failed: …").
+    fn from(error: rusqlite::Error) -> Error {
+        match &error {
+            rusqlite::Error::SqliteFailure(code, message) => match code.code {
+                rusqlite::ErrorCode::ReadOnly => Error::ReadOnly,
+                rusqlite::ErrorCode::ConstraintViolation => Error::Constraint(
+                    message
+                        .clone()
+                        .unwrap_or_else(|| rusqlite::Error::to_string(&error)),
+                ),
+                _ => Error::Sqlite(error.to_string()),
+            },
+            _ => Error::Sqlite(error.to_string()),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -180,8 +218,9 @@ impl Ledger {
     /// and, if the spawn fails,
     /// `format!("ledger thread: {}", io_error)` (blob `0x103e6e5d5`).
     ///
-    /// This build uses `std::sync::mpsc::sync_channel(1024)` for the same
-    /// bounded queue and `std::thread::Builder` (not `spawn_unchecked`); see
+    /// The queue is a real `tokio::sync::mpsc::channel(1024)` again (Phase 1),
+    /// and the thread drives `writer::run_async` on this crate's tokio runtime;
+    /// `std::thread::Builder::spawn` replaces `spawn_unchecked`. See
     /// `writer.rs`.
     pub fn writer(&self) -> Result<writer::Writer> {
         writer::Writer::start(self.connect(false)?)
@@ -265,22 +304,25 @@ impl Ledger {
 ///    `the ledger is at schema {}, which this Hydra does not know: move {}
 ///    aside and import the recordings again` (both arguments `Display`);
 /// 3. when the version is `n < 3`, for each `i` in `n..3`: open a deferred
-///    transaction (`execute_batch` of the `BEGIN …` picked from the
-///    three-entry table), `execute_batch(MIGRATIONS[i])`, then
-///    `pragma_update(None, "user_version", i + 1)` and `COMMIT` — one
-///    transaction per migration, `i + 1` saturating (`csel` against
-///    `0xffff_ffff`);
+///    transaction (`BEGIN DEFERRED`, the first entry of the three-entry table),
+///    `execute_batch(MIGRATIONS[i])`, then `pragma_update(None,
+///    "user_version", i + 1)` and `COMMIT` — one transaction per migration,
+///    `i + 1` saturating (`csel` against `0xffff_ffff`);
 /// 4. `Ok(())`.
+///
+/// The transaction is a `rusqlite::Transaction` (`unchecked_transaction`,
+/// which issues exactly [`schema::BEGIN_DEFERRED`]), so a batch that fails
+/// rolls back instead of leaving the connection inside a transaction.
 ///
 /// `// UNKNOWN:` the `BEGIN` variant. The binary indexes the three-entry table
 /// at `0x1044428c0` with `ldrb w8, [x20, #0x68]` — one byte **past** the 0x68
 /// bytes of the connection value it was handed, i.e. the caller's `Result` tag
 /// byte in practice (`Ledger::open` writes the tag there and only calls
 /// `migrate` when it is 0). That makes it `BEGIN DEFERRED` in every recovered
-/// call path; this build always uses [`schema::BEGIN_DEFERRED`] and keeps the
-/// table for the record.
+/// call path; this build always uses the deferred form and keeps the three
+/// texts in [`schema`] for the record.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let version = conn.user_version();
+    let version = conn.try_user_version()?;
     if version > schema::SCHEMA_VERSION {
         return Err(Error::Message(format!(
             "the ledger is at schema {}, which this Hydra does not know: move {} aside and import the recordings again",
@@ -292,10 +334,10 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     for index in (version as usize)..schema::MIGRATIONS.len() {
         let next = (index as u64 + 1).min(u32::MAX as u64) as u32;
-        conn.execute_batch(schema::BEGIN_DEFERRED)?;
-        conn.execute_batch(schema::MIGRATIONS[index])?;
-        conn.set_user_version(next)?;
-        conn.execute_batch(schema::COMMIT)?;
+        let tx = conn.raw().unchecked_transaction()?;
+        tx.execute_batch(schema::MIGRATIONS[index])?;
+        tx.pragma_update(None, schema::USER_VERSION_NAME, next)?;
+        tx.commit()?;
     }
     conn.commit()
 }
@@ -326,14 +368,24 @@ pub fn name_id(
 /// (`0x1016946f8`): one 43-byte literal at `0x1039861b2`.
 pub const CLOSED_TEXT: &str = "the ledger is not taking rows, or lost some";
 
-/// Whether `path` is a ledger this build could have written.
+/// Whether `path` is a ledger database: a file with SQLite's header.
 ///
-/// Cheap and std-only: a ledger's file starts with the store header. A real
-/// SQLite `hydra.db` starts with `"SQLite format 3\0"` and is therefore
-/// *reported as foreign* rather than silently mis-parsed — see `NOTES.md`.
+/// The pre-Phase-1 store wrote a `hydra-ledger` line file and used this to
+/// refuse a real SQLite `hydra.db`. Now that the store *is* SQLite, the same
+/// question is answered by SQLite's 16-byte file header
+/// (`"SQLite format 3\0"`), read from the file and nothing else — cheap, and no
+/// connection or lock involved.
+///
+/// Note what this does *not* prove: every SQLite database answers `true`,
+/// whatever its schema or `user_version`. Whether it is a ledger this build
+/// can use is [`migrate`]'s question, and it refuses a `user_version` above
+/// [`schema::SCHEMA_VERSION`].
 pub fn is_this_builds_store(path: &Path) -> bool {
-    match std::fs::read(path) {
-        Ok(bytes) => bytes.starts_with(b"hydra-ledger"),
+    use std::io::Read;
+
+    let mut magic = [0u8; 16];
+    match std::fs::File::open(path) {
+        Ok(mut file) => file.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0",
         Err(_) => false,
     }
 }
@@ -402,8 +454,34 @@ mod tests {
     }
 
     #[test]
-    fn migrate_refuses_a_newer_schema_with_the_recovered_text() {
-        let dir = scratch("migrate-newer");
+    fn migrate_only_runs_the_steps_a_ledger_is_missing() {
+        let dir = scratch("migrate-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Ledger::new(&dir);
+        let mut conn = ledger.connect(false).unwrap();
+        // A ledger that stopped after the first batch: schema 1, no
+        // `login_rewards`, no `store_visits`.
+        conn.execute_batch(schema::MIGRATION_1).unwrap();
+        conn.set_user_version(1).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(conn.user_version(), 3);
+        for table in ["login_rewards", "store_visits"] {
+            let count: i64 = conn
+                .raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
+        // Batch 1 was not re-run: creating `pulses` twice would have failed.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_refuses_a_newer_schema_with_the_recovered_text() {        let dir = scratch("migrate-newer");
         std::fs::create_dir_all(&dir).unwrap();
         let ledger = Ledger::new(&dir);
         let mut conn = ledger.connect(false).unwrap();
@@ -438,8 +516,9 @@ mod tests {
     #[test]
     fn note_import_records_the_row_and_refuses_a_duplicate_stamp() {
         let dir = scratch("note-import");
-        std::fs::create_dir_all(&dir).unwrap();
-        let ledger = Ledger::new(&dir);
+        // The original writes into a ledger `Ledger::open` has already
+        // migrated; `connect` alone does not create the schema.
+        let ledger = Ledger::open(&dir).unwrap();
         let who = Who::new("prime", "Sindar");
         ledger
             .note_import(
@@ -486,8 +565,7 @@ mod tests {
     #[test]
     fn prune_pulses_drops_empty_rows_then_everything() {
         let dir = scratch("prune");
-        std::fs::create_dir_all(&dir).unwrap();
-        let ledger = Ledger::new(&dir);
+        let ledger = Ledger::open(&dir).unwrap();
         let who = Who::new("prime", "Sindar");
         {
             let conn = ledger.connect(false).unwrap();
@@ -527,8 +605,62 @@ mod tests {
         let ledger = Ledger::open(&dir).unwrap();
         assert!(ledger.path_in().exists());
         assert!(is_this_builds_store(&ledger.path_in()));
+        // A real SQLite database, not the pre-Phase-1 line file.
+        let header = std::fs::read(ledger.path_in()).unwrap();
+        assert_eq!(&header[..16], b"SQLite format 3\0");
         let conn = ledger.connect(true).unwrap();
         assert_eq!(conn.user_version(), schema::SCHEMA_VERSION);
+        // The recovered tables are really there.
+        let tables: i64 = conn
+            .raw()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                 ('pulses', 'snapshots', 'names', 'imports', 'login_rewards', 'store_visits')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 6);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_this_builds_store_answers_for_sqlite_files_only() {
+        let dir = scratch("magic");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing file.
+        assert!(!is_this_builds_store(&dir.join("nothing.db")));
+        // A foreign text file (the old line format, say).
+        let text = dir.join("text.db");
+        std::fs::write(&text, "hydra-ledger\t3\npulse\t1\n").unwrap();
+        assert!(!is_this_builds_store(&text));
+        // A real ledger.
+        let ledger = Ledger::open(dir.join("ledger")).unwrap();
+        assert!(is_this_builds_store(&ledger.path_in()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_schema_newer_than_this_build_is_refused_and_left_alone() {
+        let dir = scratch("newer-file");
+        let ledger = Ledger::open(&dir).unwrap();
+        {
+            let conn = ledger.writing().unwrap();
+            conn.set_user_version(4).unwrap();
+        }
+        // `Ledger::open` runs `migrate`, which refuses.
+        let error = Ledger::open(&dir).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the ledger is at schema 4, which this Hydra does not know: move {} aside and import the recordings again",
+                ledger.path_in().display()
+            )
+        );
+        // Nothing was touched on the way out: the version is still 4.
+        let conn = ledger.connect(true).unwrap();
+        assert_eq!(conn.user_version(), 4);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

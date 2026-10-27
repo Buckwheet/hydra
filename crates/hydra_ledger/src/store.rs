@@ -1,29 +1,39 @@
-//! The database seam — a `std`-only replacement for `rusqlite`.
+//! The database seam: a real [`rusqlite`] connection to `hydra.db`.
 //!
-//! **This module is a departure, not a recovery.** The original crate talks to
-//! SQLite through `rusqlite`; there is no SQLite and no `rusqlite` in this
-//! workspace, and no network to fetch one. So this module implements the
-//! *recovered relational schema* as typed `Vec`s of the recovered row types and
-//! offers the operations the crate performs, with the original SQL text kept
-//! verbatim as the doc-comment of each operation (and in [`crate::schema`]).
+//! **Reconnected in Phase 1.** The original crate talks to SQLite through
+//! `rusqlite`, and so does this one: [`Connection`] wraps a
+//! `rusqlite::Connection` opened with the recovered flags, migrates the
+//! recovered schema ([`crate::schema::MIGRATIONS`]) inside one transaction per
+//! step, and runs the recovered statements with `execute`, `execute_batch`,
+//! `query_row`, `query_map` and `prepare_cached` (rusqlite's `StatementCache`).
+//! The pre-Phase-1 `std` stand-in — typed row vectors plus a `hydra-ledger` line
+//! file, with statements dispatched by identity — is gone; `NOTES.md` §6 records
+//! what it was.
 //!
-//! What is deliberately **not** here:
+//! Two things are *not* recovered and are documented as such:
 //!
-//! * no SQL parser and no statement engine — statements are dispatched by
-//!   identity against the recovered literals ([`Connection::execute_batch`]),
-//!   and every query is a typed operation over the row vectors, exactly as the
-//!   crate's SQL says it should behave;
-//! * no SQLite file format. [`Connection::commit`] writes a small documented
-//!   line format instead (see [`Connection::save_to`]); a real `hydra.db` file
-//!   cannot be read or written by this build.
+//! * [`Db`] and [`Connection::db`] — a read-only **view** of the tables as row
+//!   vectors. The binary has no such type; it exists because the crate's own
+//!   tests express their expectations as `conn.db().pulses.len()`, and the
+//!   parent's rule is to keep the call shapes. It is loaded from SQLite on
+//!   every call (`SELECT … ORDER BY id`), so it can never be stale.
+//! * `Connection::open` creates the database's directory. SQLite itself does
+//!   not (`SQLITE_CANTOPEN`); `Ledger::open` did it for the original and doing
+//!   it here too keeps `Ledger::writing()` usable on a fresh directory, which is
+//!   what the writer tests rely on.
 //!
-//! Everything that *is* here was read out of the binary: the tables, the columns,
-//! the indexes, the ordering, the predicates, and the uniqueness rules.
+//! Everything else — the tables, the columns, the indexes, the ordering, the
+//! predicates, the uniqueness rules, the pragmas and the busy timeout — was
+//! read out of the binary; `NOTES.md` has the addresses.
 
 use std::cell::{Ref, RefCell};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crate::row::{Pulse, Reward, Row, Snapshot, Source, SnapshotKind, StoreVisit};
+use rusqlite::OpenFlags;
+
+use crate::row::{Pulse, Reward, Row, Snapshot, SnapshotKind, Source, StoreVisit};
+use crate::schema;
 use crate::{Error, Result};
 
 /// A row with its `INTEGER PRIMARY KEY AUTOINCREMENT` id.
@@ -42,9 +52,9 @@ impl<T> Stored<T> {
     }
 }
 
-/// One `hunts` row — only the four columns `Reader::hunt_overlapping` reads.
+/// One `hunts` row — the four columns `Reader::hunt_overlapping` reads.
 ///
-/// The original table is created by [`crate::schema::BASE_SCHEMA`] and written
+/// The original table is created by [`crate::schema::MIGRATION_1`] and written
 /// by `hydra_combat_log`; the ledger only queries it, through
 /// `SELECT h.id FROM hunts h …`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -59,8 +69,8 @@ pub struct Hunt {
     pub ended_at: Option<i64>,
 }
 
-/// One `attacks` row — only the two columns `Reader::hunt_overlapping` needs
-/// for its `COALESCE(h.ended_at, (SELECT MAX(occurred_at) FROM attacks WHERE
+/// One `attacks` row — the two columns `Reader::hunt_overlapping` needs for its
+/// `COALESCE(h.ended_at, (SELECT MAX(occurred_at) FROM attacks WHERE
 /// hunt_id = h.id), h.started_at)` fallback.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attack {
@@ -75,7 +85,7 @@ pub struct Attack {
 /// hunts, pulses`.
 ///
 /// Written by [`crate::Ledger::note_import`], read by
-/// [`crate::reader::Reader::imported`] and by the unique-index rule
+/// [`crate::reader::Reader::imported`] and constrained by the unique index
 /// `imports_session(instance, character, stamp)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Import {
@@ -114,13 +124,14 @@ pub struct Name {
     pub mnemonic: Option<String>,
 }
 
-/// The recovered relational store.
+/// The tables of a ledger, as row vectors — **a view, not the store**.
 ///
-/// Tables are named after the SQL and hold rows in insertion order, which is
-/// what `ORDER BY … id` and `MAX(id)` rely on.
+/// The binary has no such type: this is the shape the crate's tests were
+/// written against before the Phase-1 reconnection, kept so they (and any
+/// sibling that reads `conn.db()`) still compile. [`Connection::db`] fills it
+/// with `SELECT … ORDER BY id` on every call, so it always mirrors SQLite.
 #[derive(Debug, Default)]
 pub struct Db {
-    next_id: i64,
     /// `pulses`
     pub pulses: Vec<Stored<Pulse>>,
     /// `snapshots`
@@ -139,72 +150,87 @@ pub struct Db {
     pub attacks: Vec<Stored<Attack>>,
 }
 
-impl Db {
-    fn id(&mut self) -> i64 {
-        self.next_id += 1;
-        self.next_id
-    }
-}
-
-/// A `rusqlite::Connection` stand-in.
+/// A `rusqlite::Connection` with the ledger's recovered opening sequence.
 ///
-/// The original's `Connection` has interior mutability (`RefCell<InnerConnection>`)
-/// and every write in this crate goes through `&self`, so this one keeps its
-/// [`Db`] behind a `RefCell` too — the same (`&self`) call shapes, minus SQLite.
+/// The original's `Connection` is `rusqlite`'s; the read-only flag and the
+/// database path are kept alongside it because [`crate::migrate`] prints the
+/// path in its schema-version refusal and because the crate's API asks
+/// [`Connection::read_only`].
 #[derive(Debug)]
 pub struct Connection {
+    conn: rusqlite::Connection,
     path: Option<PathBuf>,
     read_only: bool,
-    user_version: RefCell<u32>,
-    db: RefCell<Db>,
+    view: RefCell<Db>,
 }
 
 impl Connection {
-    /// An in-memory connection. `read_only` mirrors the flags
-    /// [`crate::Ledger::connect`] passes to `InnerConnection::open_with_flags`.
+    /// An in-memory connection with the ledger's schema applied.
+    ///
+    /// `read_only` gates this crate's own mutators (`insert_*`, `delete_pulses`,
+    /// `set_user_version`, `intern_name`), exactly as before the reconnection;
+    /// SQLite cannot open an in-memory database read-only, so the flag is
+    /// enforced here rather than by `SQLITE_OPEN_READ_ONLY`.
     pub fn in_memory(read_only: bool) -> Connection {
-        Connection {
+        let conn = rusqlite::Connection::open_in_memory()
+            .expect("could not open an in-memory SQLite connection");
+        let mut connection = Connection {
+            conn,
             path: None,
-            read_only,
-            user_version: RefCell::new(0),
-            db: RefCell::new(Db::default()),
-        }
+            read_only: false,
+            view: RefCell::new(Db::default()),
+        };
+        crate::migrate(&mut connection).expect("could not apply the ledger schema in memory");
+        connection.read_only = read_only;
+        connection
     }
 
-    /// Open (and, when not read-only, create) the store at `path`.
+    /// Open (and, when not read-only, create) the ledger at `path`.
     ///
-    /// The original is `InnerConnection::open_with_flags(path, flags)` with
-    /// `0x8001` (read-only) or `0x8006` (read-write + create), then
-    /// `busy_timeout(5s)` and — for a writable connection — `PRAGMA
-    /// journal_mode = WAL` and `PRAGMA synchronous = NORMAL`. Here a writable
-    /// connection also makes sure the parent directory exists, and reads back
-    /// whatever a previous [`Connection::commit`] wrote.
+    /// The recovered body of `Ledger::connect` (`0x10168e614`), in order:
+    ///
+    /// 1. `InnerConnection::open_with_flags(path, flags)` with
+    ///    `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` (`0x8001`) for a
+    ///    read-only connection and `SQLITE_OPEN_READ_WRITE |
+    ///    SQLITE_OPEN_CREATE | SQLITE_OPEN_NO_MUTEX` (`0x8006`) otherwise;
+    /// 2. `busy_timeout(Duration::of_secs(5))` (`mov w1, #0x5; mov w2, #0x0`);
+    /// 3. only for a writable connection, `pragma_update(None, "journal_mode",
+    ///    "WAL")` and `pragma_update(None, "synchronous", "NORMAL")`.
     pub fn open(path: impl Into<PathBuf>, read_only: bool) -> Result<Connection> {
         let path = path.into();
         if !read_only {
+            // Not SQLite's behaviour: see the module docs.
             if let Some(dir) = path.parent() {
                 if !dir.as_os_str().is_empty() {
                     std::fs::create_dir_all(dir).map_err(|e| Error::Io(e.to_string()))?;
                 }
             }
         }
-        let (user_version, db) = if path.exists() {
-            decode(&std::fs::read_to_string(&path).map_err(|e| Error::Io(e.to_string()))?)?
-        } else if read_only {
-            // SQLITE_OPEN_READ_ONLY against a missing file is `SQLITE_CANTOPEN`.
-            return Err(Error::Sqlite(format!(
-                "unable to open database file: {}",
-                path.display()
-            )));
+        let flags = if read_only {
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
         } else {
-            (0, Db::default())
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
         };
+        let conn = rusqlite::Connection::open_with_flags(&path, flags)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        if !read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         Ok(Connection {
+            conn,
             path: Some(path),
             read_only,
-            user_version: RefCell::new(user_version),
-            db: RefCell::new(db),
+            view: RefCell::new(Db::default()),
         })
+    }
+
+    /// The `rusqlite::Connection` underneath — the handle the readers prepare
+    /// their statements on.
+    pub fn raw(&self) -> &rusqlite::Connection {
+        &self.conn
     }
 
     /// The database file, if this connection has one.
@@ -212,59 +238,56 @@ impl Connection {
         self.path.as_deref()
     }
 
-    /// Whether this connection is read-only (`SQLITE_OPEN_READ_ONLY`).
+    /// Whether this connection was opened read-only (`SQLITE_OPEN_READ_ONLY`).
     pub fn read_only(&self) -> bool {
         self.read_only
     }
 
-    /// The tables.
+    /// The tables, as a fresh view loaded from SQLite.
     pub fn db(&self) -> Ref<'_, Db> {
-        self.db.borrow()
+        let view = self.load_view().unwrap_or_default();
+        *self.view.borrow_mut() = view;
+        self.view.borrow()
     }
 
-    /// `PRAGMA user_version`.
+    /// `PRAGMA user_version` — 0 when the pragma cannot be read (a file that is
+    /// not a database, for instance). [`Connection::try_user_version`] is the
+    /// fallible form, which [`crate::migrate`] uses.
     pub fn user_version(&self) -> u32 {
-        *self.user_version.borrow()
+        self.try_user_version().unwrap_or(0)
+    }
+
+    /// `PRAGMA user_version` — `Connection::pragma_query_value` in
+    /// [`crate::migrate`].
+    pub fn try_user_version(&self) -> Result<u32> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, schema::USER_VERSION_NAME, |row| row.get(0))?)
     }
 
     /// `PRAGMA user_version = n` — `Connection::pragma_update(None,
     /// "user_version", n)` in [`crate::migrate`].
     pub fn set_user_version(&self, version: u32) -> Result<()> {
         self.writable()?;
-        *self.user_version.borrow_mut() = version;
-        self.autocommit()
+        self.conn
+            .pragma_update(None, schema::USER_VERSION_NAME, version)?;
+        Ok(())
     }
 
-    /// Dispatch one of the recovered statement batches.
+    /// `Connection::execute_batch` — the original hands SQL text straight to
+    /// SQLite, and so does this: the three recovered `BEGIN …` texts, the
+    /// migrations, `COMMIT`, or any other statement a caller wants to run.
     ///
-    /// **Departure:** the original hands the text to SQLite. This build only
-    /// recognises the statements the ledger itself issues and refuses anything
-    /// else, so a typo can never be silently "executed":
-    ///
-    /// * the three `BEGIN …` texts (recovered at `0x103985b5f`/`…b6d`/`…b7c`)
-    ///   and `COMMIT` — transaction bookkeeping;
-    /// * the three schema batches ([`crate::schema::MIGRATIONS`]) — the tables
-    ///   are statically typed here, so applying one only records the version;
-    /// * the two `DELETE FROM pulses` texts — see [`Connection::delete_pulses`].
+    /// Before the reconnection this method dispatched by identity and answered
+    /// `Error::Unsupported` for anything it did not recognise; that seam is
+    /// gone (there is a SQL engine now). A write on a read-only file
+    /// connection is refused by SQLite itself (`SQLITE_READONLY` →
+    /// [`Error::ReadOnly`]); for an in-memory connection —
+    /// [`Connection::in_memory`] — the read-only flag is this crate's, and the
+    /// typed mutators are what enforce it.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let sql = sql.trim();
-        match sql {
-            crate::schema::BEGIN_DEFERRED
-            | crate::schema::BEGIN_IMMEDIATE
-            | crate::schema::BEGIN_EXCLUSIVE => self.writable(),
-            "COMMIT" => {
-                self.writable()?;
-                self.commit()
-            }
-            other if other.starts_with("DELETE FROM pulses") => Err(Error::Unsupported(
-                "run Ledger::prune_pulses instead of the DELETE text".to_string(),
-            )),
-            other if crate::schema::MIGRATIONS.contains(&other) => {
-                // The schema is the type system here: nothing to create.
-                self.writable()
-            }
-            other => Err(Error::Unsupported(other.to_string())),
-        }
+        self.conn.execute_batch(sql)?;
+        Ok(())
     }
 
     /// Fail with `Error::ReadOnly` when this connection cannot write
@@ -277,42 +300,27 @@ impl Connection {
     }
 
     /// `INSERT INTO pulses (…) VALUES (?1 … ?18)` — the statement at
-    /// `0x103985cd9` (588 bytes), used by `writer::run`.
-    pub fn insert_pulse(&self, mut row: Pulse) -> Result<i64> {
+    /// `0x103985cd9` (303 bytes), used by `writer::run`. Returns the new row's
+    /// `id` (`Connection::last_insert_rowid`).
+    ///
+    /// The `exp`/`axp` clamp (`max(v, 0)`, `bic x10, x23, x23, asr #63`) is
+    /// applied here, as the recovered row mapper applies it.
+    pub fn insert_pulse(&self, row: Pulse) -> Result<i64> {
         self.writable()?;
-        let (exp, axp) = Pulse::absorbed(row.exp, row.axp);
-        row.exp = exp;
-        row.axp = axp;
-        let mut db = self.db.borrow_mut();
-        let id = db.id();
-        db.pulses.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        insert_pulse_on(&self.conn, &row)
     }
 
-    /// `INSERT INTO snapshots (…) VALUES (?1 … ?9)` — `0x103985f71`…, used by
-    /// `writer::run`.
+    /// `INSERT INTO snapshots (…) VALUES (?1 … ?9)` — `0x103986090` (157 bytes).
     pub fn insert_snapshot(&self, row: Snapshot) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let id = db.id();
-        db.snapshots.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        insert_snapshot_on(&self.conn, &row)
     }
 
-    /// `INSERT INTO store_visits (…) VALUES (?1 … ?7)` — `0x103985f02`…, used
-    /// by `writer::run`.
+    /// `INSERT INTO store_visits (…) VALUES (?1 … ?7)` — `0x103985e08`
+    /// (125 bytes).
     pub fn insert_store_visit(&self, row: StoreVisit) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let id = db.id();
-        db.store_visits.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        insert_store_visit_on(&self.conn, &row)
     }
 
     /// The `login_rewards` upsert, in full:
@@ -330,88 +338,49 @@ impl Connection {
     ///
     /// The `WHERE` on the `DO UPDATE` means an existing row is only overwritten
     /// when it has no reward text yet and the incoming row does; otherwise the
-    /// insert is a no-op. Returns the row id — the existing row's id when the
-    /// conflict was hit, the new id otherwise. (`Reader::has_reward_on` is how
-    /// the crate asks whether a day already has a row.)
+    /// upsert changes nothing. Returns the row's id — the existing row's id when
+    /// the conflict was hit (the upsert does not move it, so the id is read back
+    /// rather than taken from `last_insert_rowid`).
     pub fn insert_reward(&self, row: Reward) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let existing = db.rewards.iter().position(|stored| {
-            stored.row.instance == row.instance
-                && stored.row.character == row.character
-                && stored.row.day == row.day
-        });
-        let written = match existing {
-            Some(index) => {
-                let keeps_reward = db.rewards[index].row.reward.is_empty() && !row.reward.is_empty();
-                if keeps_reward {
-                    let id = db.rewards[index].id;
-                    db.rewards[index].row = row;
-                    id
-                } else {
-                    db.rewards[index].id
-                }
-            }
-            None => {
-                let id = db.id();
-                db.rewards.push(Stored::new(id, row));
-                id
-            }
-        };
-        drop(db);
-        self.autocommit()?;
-        Ok(written)
+        insert_reward_on(&self.conn, &row)
     }
 
-    /// `INSERT INTO imports (instance, character, stamp, path, size,
-    /// imported_at, first_at, last_at, hunts, pulses) VALUES (?1 … ?10)` —
-    /// `0x1039857a5`…, used by [`crate::Ledger::note_import`].
+    /// `INSERT INTO imports (…) VALUES (?1 … ?10)` — `0x1039857a5` (185 bytes),
+    /// used by [`crate::Ledger::note_import`].
     ///
     /// `imports_session` is `UNIQUE (instance, character, stamp)`, so a second
     /// note for the same import is a constraint violation
     /// ([`Error::Constraint`]) rather than a duplicate row.
     pub fn insert_import(&self, row: Import) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        if db.imports.iter().any(|stored| {
-            stored.row.instance == row.instance
-                && stored.row.character == row.character
-                && stored.row.stamp == row.stamp
-        }) {
-            return Err(Error::Constraint(
-                "UNIQUE constraint failed: imports.instance, imports.character, imports.stamp"
-                    .to_string(),
-            ));
-        }
-        let id = db.id();
-        db.imports.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        insert_import_on(&self.conn, &row)
     }
 
     /// A `hunts` row. Written by `hydra_combat_log` in the original; the ledger
     /// only reads it, so this exists for tests and for the reader's predicate.
     pub fn insert_hunt(&self, row: Hunt) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let id = db.id();
-        db.hunts.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        self.conn.execute(
+            "INSERT INTO hunts (instance, character, started_at, ended_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![row.instance, row.character, row.started_at, row.ended_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// An `attacks` row (again `hydra_combat_log`'s table; kept for
     /// [`crate::reader::Reader::hunt_overlapping`]'s `COALESCE`).
     pub fn insert_attack(&self, row: Attack) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let id = db.id();
-        db.attacks.push(Stored::new(id, row));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        // `attacks` has many NOT NULL columns; these are the ones the battle
+        // log's own writer fills with defaults.
+        self.conn.execute(
+            "INSERT INTO attacks (hunt_id, seq, occurred_at, name, target_kind) \
+             VALUES (?1, 0, ?2, '', 'creature')",
+            rusqlite::params![row.hunt_id, row.occurred_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// `DELETE FROM pulses WHERE instance = ?1 AND character = ?2 [AND
@@ -421,17 +390,12 @@ impl Connection {
     /// (`Connection::execute`'s count).
     pub fn delete_pulses(&self, instance: &str, character: &str, drop_all: bool) -> Result<usize> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        let before = db.pulses.len();
-        db.pulses.retain(|stored| {
-            let who = stored.row.instance == instance && stored.row.character == character;
-            let empty = stored.row.exp_gained == 0 && stored.row.axp_gained == 0;
-            !(who && (drop_all || empty))
-        });
-        let dropped = before - db.pulses.len();
-        drop(db);
-        self.autocommit()?;
-        Ok(dropped)
+        let sql = if drop_all {
+            schema::DELETE_ALL_PULSES
+        } else {
+            schema::DELETE_EMPTY_PULSES
+        };
+        Ok(self.conn.execute(sql, rusqlite::params![instance, character])?)
     }
 
     /// The interning behind [`crate::name_id`]: `INSERT OR IGNORE INTO names
@@ -450,472 +414,425 @@ impl Connection {
         mnemonic: Option<&str>,
     ) -> Result<i64> {
         self.writable()?;
-        let mut db = self.db.borrow_mut();
-        if let Some(stored) = db
-            .names
-            .iter()
-            .find(|stored| stored.row.kind == kind && stored.row.name == name)
-        {
-            return Ok(stored.id);
-        }
-        let id = db.id();
-        db.names.push(Stored::new(
-            id,
-            Name {
-                kind: kind.to_string(),
-                name: name.to_string(),
-                number,
-                mnemonic: mnemonic.map(|text| text.to_string()),
-            },
-        ));
-        drop(db);
-        self.autocommit()?;
-        Ok(id)
+        self.conn.execute(
+            schema::INSERT_NAME,
+            rusqlite::params![kind, name, number, mnemonic],
+        )?;
+        Ok(self.conn.query_row(
+            schema::SELECT_NAME_ID,
+            rusqlite::params![kind, name],
+            |row| row.get(0),
+        )?)
     }
 
     /// The id [`Connection::intern_name`] would return, without inserting.
     pub fn name_id_of(&self, kind: &str, name: &str) -> Option<i64> {
-        self.db
-            .borrow()
-            .names
-            .iter()
-            .find(|stored| stored.row.kind == kind && stored.row.name == name)
-            .map(|stored| stored.id)
+        self.conn
+            .query_row(schema::SELECT_NAME_ID, rusqlite::params![kind, name], |row| {
+                row.get(0)
+            })
+            .ok()
     }
 
-    /// Write the store now if this connection has a file.
+    /// The original's explicit `COMMIT`.
     ///
-    /// `rusqlite` runs every statement in SQLite's *auto-commit* mode, so a row
-    /// written by one connection is visible to the next one straight away. This
-    /// build copies that: every mutating operation persists when the connection
-    /// is file-backed, and [`Connection::commit`] is only the explicit end of a
-    /// transaction (which `migrate` and the writer's batch use).
-    fn autocommit(&self) -> Result<()> {
-        match (&self.path, self.read_only) {
-            (Some(path), false) => self.save_to(path),
-            _ => Ok(()),
-        }
-    }
-
-    /// Persist the store (the original's `COMMIT`).
-    ///
-    /// With no file this is a no-op; with a file it rewrites it in the line
-    /// format described on [`Connection::save_to`]. A read-only connection
-    /// never writes.
+    /// Every statement runs in SQLite's auto-commit mode, so there is nothing
+    /// left to do: `migrate` and the writer each end their work with a real
+    /// `Transaction::commit`, and this stays for the call sites that used it
+    /// (`Ledger::{open, prune_pulses, note_import}`).
     pub fn commit(&self) -> Result<()> {
-        if self.read_only {
-            return Ok(());
-        }
-        match self.path.clone() {
-            Some(path) => self.save_to(&path),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
-    /// Write the store to `path`.
-    ///
-    /// **Departure:** not SQLite's file format. One record per line, `\t`
-    /// separated, with `\\`, `\t`, `\n` and `\r` escaped inside strings and an
-    /// empty field for `NULL`. The first line is `hydra-ledger <version>`.
-    pub fn save_to(&self, path: &Path) -> Result<()> {
-        let text = encode(self.user_version(), &self.db.borrow());
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir).map_err(|e| Error::Io(e.to_string()))?;
-            }
+    /// Write a [`Row`] the way `writer::run` does, inside `conn` (a connection
+    /// or an open transaction — hence the parameter).
+    pub(crate) fn insert_row_on(&self, conn: &rusqlite::Connection, row: Row) -> Result<i64> {
+        match row {
+            Row::Pulse(pulse) => insert_pulse_on(conn, &pulse),
+            Row::Snapshot(snapshot) => insert_snapshot_on(conn, &snapshot),
+            Row::Reward(reward) => insert_reward_on(conn, &reward),
+            Row::StoreVisit(visit) => insert_store_visit_on(conn, &visit),
         }
-        std::fs::write(path, text).map_err(|e| Error::Io(e.to_string()))
     }
 
     /// Write a [`Row`] the way `writer::run` does.
     pub fn insert_row(&self, row: Row) -> Result<i64> {
-        match row {
-            Row::Pulse(pulse) => self.insert_pulse(pulse),
-            Row::Snapshot(snapshot) => self.insert_snapshot(snapshot),
-            Row::Reward(reward) => self.insert_reward(reward),
-            Row::StoreVisit(visit) => self.insert_store_visit(visit),
-        }
+        self.writable()?;
+        self.insert_row_on(&self.conn, row)
+    }
+
+    /// Load every table into a [`Db`] view.
+    fn load_view(&self) -> Result<Db> {
+        Ok(Db {
+            pulses: load_pulses(&self.conn)?,
+            snapshots: load_snapshots(&self.conn)?,
+            rewards: load_rewards(&self.conn)?,
+            store_visits: load_store_visits(&self.conn)?,
+            imports: load_imports(&self.conn)?,
+            names: load_names(&self.conn)?,
+            hunts: load_hunts(&self.conn)?,
+            attacks: load_attacks(&self.conn)?,
+        })
     }
 }
 
-// ---------------------------------------------------------------- line codec
+// ------------------------------------------------------------------ inserts
+//
+// Free functions so the writer can run them inside one `Transaction`: a
+// `rusqlite::Transaction` derefs to `Connection`, so `&*tx` is accepted here.
 
-const HEADER: &str = "hydra-ledger";
+fn insert_pulse_on(conn: &rusqlite::Connection, row: &Pulse) -> Result<i64> {
+    let (exp, axp) = Pulse::absorbed(row.exp, row.axp);
+    conn.execute(
+        schema::INSERT_PULSE,
+        rusqlite::params![
+            row.at,
+            row.game_time,
+            row.instance,
+            row.character,
+            exp,
+            axp,
+            row.exp_gained,
+            row.axp_gained,
+            row.fxp,
+            row.fxp_max,
+            row.until_next,
+            row.lumnis,
+            row.rpa,
+            row.fashlonae,
+            row.mind_percent,
+            row.mind_text,
+            row.source.name(),
+            row.instant,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
 
-fn esc(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(ch),
-        }
+fn insert_snapshot_on(conn: &rusqlite::Connection, row: &Snapshot) -> Result<i64> {
+    conn.execute(
+        schema::INSERT_SNAPSHOT,
+        rusqlite::params![
+            row.at,
+            row.game_time,
+            row.instance,
+            row.character,
+            row.kind.name(),
+            row.name,
+            row.value,
+            row.weekly,
+            row.total,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn insert_store_visit_on(conn: &rusqlite::Connection, row: &StoreVisit) -> Result<i64> {
+    conn.execute(
+        schema::INSERT_STORE_VISIT,
+        rusqlite::params![
+            row.at,
+            row.account,
+            row.game,
+            row.claimed as i64,
+            row.message,
+            row.balance,
+            row.next_at,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn insert_reward_on(conn: &rusqlite::Connection, row: &Reward) -> Result<i64> {
+    conn.execute(
+        schema::INSERT_REWARD,
+        rusqlite::params![
+            row.at,
+            row.game_time,
+            row.instance,
+            row.character,
+            row.day,
+            row.streak,
+            row.bridges,
+            row.reward,
+            row.thanks,
+            row.line,
+        ],
+    )?;
+    // The upsert may have kept the existing row, in which case
+    // `last_insert_rowid` still points at whatever was inserted last.
+    Ok(conn.query_row(
+        "SELECT id FROM login_rewards WHERE instance = ?1 AND character = ?2 AND day = ?3",
+        rusqlite::params![row.instance, row.character, row.day],
+        |row| row.get(0),
+    )?)
+}
+
+fn insert_import_on(conn: &rusqlite::Connection, row: &Import) -> Result<i64> {
+    // The recovered `Ledger::note_import` clamps the size with
+    // `cmp x22, #0x7fff…; csel`, i.e. at `i64::MAX`.
+    let size = row.size.min(i64::MAX as u64) as i64;
+    let hunts = row.hunts.min(i64::MAX as u64) as i64;
+    let pulses = row.pulses.min(i64::MAX as u64) as i64;
+    conn.execute(
+        schema::INSERT_IMPORT,
+        rusqlite::params![
+            row.instance,
+            row.character,
+            row.stamp,
+            row.path,
+            size,
+            row.imported_at,
+            row.first_at,
+            row.last_at,
+            hunts,
+            pulses,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+// -------------------------------------------------------------------- reads
+
+/// The `pulses` columns of a `SELECT`, in the recovered order.
+pub(crate) fn pulse_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pulse> {
+    let (exp, axp) = Pulse::absorbed(row.get(4)?, row.get(5)?);
+    Ok(Pulse {
+        at: row.get(0)?,
+        game_time: row.get(1)?,
+        instance: row.get(2)?,
+        character: row.get(3)?,
+        exp,
+        axp,
+        exp_gained: row.get(6)?,
+        axp_gained: row.get(7)?,
+        fxp: row.get(8)?,
+        fxp_max: row.get(9)?,
+        until_next: row.get(10)?,
+        lumnis: row.get(11)?,
+        rpa: row.get(12)?,
+        fashlonae: row.get(13)?,
+        mind_percent: row.get(14)?,
+        mind_text: row.get(15)?,
+        source: Source::parse(&row.get::<_, String>(16)?),
+        instant: row.get(17)?,
+    })
+}
+
+pub(crate) fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
+    Ok(Snapshot {
+        at: row.get(0)?,
+        game_time: row.get(1)?,
+        instance: row.get(2)?,
+        character: row.get(3)?,
+        kind: SnapshotKind::parse(&row.get::<_, String>(4)?),
+        name: row.get(5)?,
+        value: row.get(6)?,
+        weekly: row.get(7)?,
+        total: row.get(8)?,
+    })
+}
+
+pub(crate) fn reward_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reward> {
+    Ok(Reward {
+        at: row.get(0)?,
+        game_time: row.get(1)?,
+        instance: row.get(2)?,
+        character: row.get(3)?,
+        day: row.get(4)?,
+        streak: row.get(5)?,
+        bridges: row.get(6)?,
+        reward: row.get(7)?,
+        thanks: row.get(8)?,
+        line: row.get(9)?,
+    })
+}
+
+pub(crate) fn store_visit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreVisit> {
+    Ok(StoreVisit {
+        at: row.get(0)?,
+        account: row.get(1)?,
+        game: row.get(2)?,
+        claimed: row.get(3)?,
+        message: row.get(4)?,
+        balance: row.get(5)?,
+        next_at: row.get(6)?,
+    })
+}
+
+fn load_pulses(conn: &rusqlite::Connection) -> Result<Vec<Stored<Pulse>>> {
+    let sql = format!("SELECT {}, id FROM pulses ORDER BY id", schema::PULSE_COLUMNS);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(row.get(18)?, pulse_from_row(row)?));
     }
-    out
+    Ok(out)
 }
 
-fn unesc(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
+fn load_snapshots(conn: &rusqlite::Connection) -> Result<Vec<Stored<Snapshot>>> {
+    let sql = format!(
+        "SELECT {}, id FROM snapshots ORDER BY id",
+        schema::SNAPSHOT_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(row.get(9)?, snapshot_from_row(row)?));
     }
-    out
+    Ok(out)
 }
 
-fn num(value: i64) -> String {
-    value.to_string()
-}
-
-fn num_in(field: &str) -> Option<i64> {
-    field.parse().ok()
-}
-
-fn opt_num(value: Option<i64>) -> String {
-    value.map(num).unwrap_or_default()
-}
-
-fn opt_u32(value: Option<u32>) -> String {
-    value.map(|n| n.to_string()).unwrap_or_default()
-}
-
-fn opt_u32_in(field: &str) -> Option<u32> {
-    field.parse().ok()
-}
-
-fn opt_text(value: &Option<String>) -> String {
-    value.as_deref().map(esc).unwrap_or_default()
-}
-
-fn opt_text_in(field: &str) -> Option<String> {
-    if field.is_empty() {
-        None
-    } else {
-        Some(unesc(field))
+fn load_rewards(conn: &rusqlite::Connection) -> Result<Vec<Stored<Reward>>> {
+    let sql = format!(
+        "SELECT {}, id FROM login_rewards ORDER BY id",
+        schema::REWARD_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(row.get(10)?, reward_from_row(row)?));
     }
+    Ok(out)
 }
 
-fn encode(version: u32, db: &Db) -> String {
-    let mut out = format!("{HEADER}\t{version}\n");
-    for stored in &db.pulses {
-        let p = &stored.row;
-        out.push_str(&format!(
-            "pulse\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            num(p.at),
-            opt_u32(p.game_time),
-            esc(&p.instance),
-            esc(&p.character),
-            num(p.exp),
-            num(p.axp),
-            num(p.exp_gained),
-            num(p.axp_gained),
-            opt_u32(p.fxp),
-            opt_u32(p.fxp_max),
-            opt_u32(p.until_next),
-            opt_u32(p.lumnis),
-            opt_text(&p.rpa),
-            opt_u32(p.fashlonae),
-            opt_u32(p.mind_percent),
-            opt_text(&p.mind_text),
-            esc(p.source.name()),
-            num(p.instant),
+fn load_store_visits(conn: &rusqlite::Connection) -> Result<Vec<Stored<StoreVisit>>> {
+    let sql = format!(
+        "SELECT {}, id FROM store_visits ORDER BY id",
+        schema::STORE_VISIT_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(row.get(7)?, store_visit_from_row(row)?));
+    }
+    Ok(out)
+}
+
+fn load_imports(conn: &rusqlite::Connection) -> Result<Vec<Stored<Import>>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, instance, character, stamp, path, size, imported_at, first_at, last_at, \
+         hunts, pulses FROM imports ORDER BY id",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(
+            row.get(0)?,
+            Import {
+                instance: row.get(1)?,
+                character: row.get(2)?,
+                stamp: row.get(3)?,
+                path: row.get(4)?,
+                size: row.get(5)?,
+                imported_at: row.get(6)?,
+                first_at: row.get(7)?,
+                last_at: row.get(8)?,
+                hunts: row.get(9)?,
+                pulses: row.get(10)?,
+            },
         ));
     }
-    for stored in &db.snapshots {
-        let s = &stored.row;
-        out.push_str(&format!(
-            "snapshot\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            num(s.at),
-            opt_u32(s.game_time),
-            esc(&s.instance),
-            esc(&s.character),
-            esc(s.kind.name()),
-            opt_text(&s.name),
-            opt_num(s.value),
-            opt_num(s.weekly),
-            opt_num(s.total),
-        ));
-    }
-    for stored in &db.rewards {
-        let r = &stored.row;
-        out.push_str(&format!(
-            "reward\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            num(r.at),
-            opt_u32(r.game_time),
-            esc(&r.instance),
-            esc(&r.character),
-            esc(&r.day),
-            opt_num(r.streak),
-            opt_num(r.bridges),
-            esc(&r.reward),
-            esc(&r.thanks),
-            esc(&r.line),
-        ));
-    }
-    for stored in &db.store_visits {
-        let v = &stored.row;
-        out.push_str(&format!(
-            "visit\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            num(v.at),
-            esc(&v.account),
-            esc(&v.game),
-            if v.claimed { "1" } else { "0" },
-            esc(&v.message),
-            esc(&v.balance),
-            opt_num(v.next_at),
-        ));
-    }
-    for stored in &db.imports {
-        let i = &stored.row;
-        out.push_str(&format!(
-            "import\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            esc(&i.instance),
-            esc(&i.character),
-            esc(&i.stamp),
-            esc(&i.path),
-            num(i.size as i64),
-            num(i.imported_at),
-            opt_num(i.first_at),
-            opt_num(i.last_at),
-            num(i.hunts as i64),
-            num(i.pulses as i64),
-        ));
-    }
-    for stored in &db.names {
-        let n = &stored.row;
-        out.push_str(&format!(
-            "name\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            esc(&n.kind),
-            esc(&n.name),
-            opt_num(n.number),
-            opt_text(&n.mnemonic),
-        ));
-    }
-    for stored in &db.hunts {
-        let h = &stored.row;
-        out.push_str(&format!(
-            "hunt\t{}\t{}\t{}\t{}\t{}\n",
-            stored.id,
-            esc(&h.instance),
-            esc(&h.character),
-            num(h.started_at),
-            opt_num(h.ended_at),
-        ));
-    }
-    for stored in &db.attacks {
-        let a = &stored.row;
-        out.push_str(&format!(
-            "attack\t{}\t{}\t{}\n",
-            stored.id,
-            num(a.hunt_id),
-            num(a.occurred_at),
-        ));
-    }
-    out
+    Ok(out)
 }
 
-fn decode(text: &str) -> Result<(u32, Db)> {
-    let mut db = Db::default();
-    let mut version = 0u32;
-    let mut first = true;
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if first {
-            first = false;
-            if fields.first() != Some(&"hydra-ledger") {
-                return Err(Error::Unsupported(format!(
-                    "not a hydra-ledger store: {line:?}"
-                )));
-            }
-            version = fields.get(1).and_then(|f| f.parse().ok()).unwrap_or(0);
-            continue;
-        }
-        let mut it = fields.iter().copied();
-        let Some(tag) = it.next() else { continue };
-        let mut next = |what: &str| -> Result<String> {
-            it.next()
-                .map(|field| field.to_string())
-                .ok_or_else(|| Error::Unsupported(format!("{tag}: missing {what}")))
-        };
-        match tag {
-            "pulse" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Pulse {
-                    at: next("at")?.parse().unwrap_or(0),
-                    game_time: opt_u32_in(&next("game_time")?),
-                    instance: unesc(&next("instance")?),
-                    character: unesc(&next("character")?),
-                    exp: next("exp")?.parse().unwrap_or(0),
-                    axp: next("axp")?.parse().unwrap_or(0),
-                    exp_gained: next("exp_gained")?.parse().unwrap_or(0),
-                    axp_gained: next("axp_gained")?.parse().unwrap_or(0),
-                    fxp: opt_u32_in(&next("fxp")?),
-                    fxp_max: opt_u32_in(&next("fxp_max")?),
-                    until_next: opt_u32_in(&next("until_next")?),
-                    lumnis: opt_u32_in(&next("lumnis")?),
-                    rpa: opt_text_in(&next("rpa")?),
-                    fashlonae: opt_u32_in(&next("fashlonae")?),
-                    mind_percent: opt_u32_in(&next("mind_percent")?),
-                    mind_text: opt_text_in(&next("mind_text")?),
-                    source: Source::parse(&unesc(&next("source")?)),
-                    instant: next("instant")?.parse().unwrap_or(0),
-                };
-                db.next_id = db.next_id.max(id);
-                db.pulses.push(Stored::new(id, row));
-            }
-            "snapshot" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Snapshot {
-                    at: next("at")?.parse().unwrap_or(0),
-                    game_time: opt_u32_in(&next("game_time")?),
-                    instance: unesc(&next("instance")?),
-                    character: unesc(&next("character")?),
-                    kind: SnapshotKind::parse(&unesc(&next("kind")?)),
-                    name: opt_text_in(&next("name")?),
-                    value: num_in(&next("value")?),
-                    weekly: num_in(&next("weekly")?),
-                    total: num_in(&next("total")?),
-                };
-                db.next_id = db.next_id.max(id);
-                db.snapshots.push(Stored::new(id, row));
-            }
-            "reward" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Reward {
-                    at: next("at")?.parse().unwrap_or(0),
-                    game_time: opt_u32_in(&next("game_time")?),
-                    instance: unesc(&next("instance")?),
-                    character: unesc(&next("character")?),
-                    day: unesc(&next("day")?),
-                    streak: num_in(&next("streak")?),
-                    bridges: num_in(&next("bridges")?),
-                    reward: unesc(&next("reward")?),
-                    thanks: unesc(&next("thanks")?),
-                    line: unesc(&next("line")?),
-                };
-                db.next_id = db.next_id.max(id);
-                db.rewards.push(Stored::new(id, row));
-            }
-            "visit" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = StoreVisit {
-                    at: next("at")?.parse().unwrap_or(0),
-                    account: unesc(&next("account")?),
-                    game: unesc(&next("game")?),
-                    claimed: next("claimed")? == "1",
-                    message: unesc(&next("message")?),
-                    balance: unesc(&next("balance")?),
-                    next_at: num_in(&next("next_at")?),
-                };
-                db.next_id = db.next_id.max(id);
-                db.store_visits.push(Stored::new(id, row));
-            }
-            "import" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Import {
-                    instance: unesc(&next("instance")?),
-                    character: unesc(&next("character")?),
-                    stamp: unesc(&next("stamp")?),
-                    path: unesc(&next("path")?),
-                    size: next("size")?.parse().unwrap_or(0),
-                    imported_at: next("imported_at")?.parse().unwrap_or(0),
-                    first_at: num_in(&next("first_at")?),
-                    last_at: num_in(&next("last_at")?),
-                    hunts: next("hunts")?.parse().unwrap_or(0),
-                    pulses: next("pulses")?.parse().unwrap_or(0),
-                };
-                db.next_id = db.next_id.max(id);
-                db.imports.push(Stored::new(id, row));
-            }
-            "name" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Name {
-                    kind: unesc(&next("kind")?),
-                    name: unesc(&next("name")?),
-                    number: num_in(&next("number")?),
-                    mnemonic: opt_text_in(&next("mnemonic")?),
-                };
-                db.next_id = db.next_id.max(id);
-                db.names.push(Stored::new(id, row));
-            }
-            "hunt" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Hunt {
-                    instance: unesc(&next("instance")?),
-                    character: unesc(&next("character")?),
-                    started_at: next("started_at")?.parse().unwrap_or(0),
-                    ended_at: num_in(&next("ended_at")?),
-                };
-                db.next_id = db.next_id.max(id);
-                db.hunts.push(Stored::new(id, row));
-            }
-            "attack" => {
-                let id: i64 = next("id")?.parse().unwrap_or(0);
-                let row = Attack {
-                    hunt_id: next("hunt_id")?.parse().unwrap_or(0),
-                    occurred_at: next("occurred_at")?.parse().unwrap_or(0),
-                };
-                db.next_id = db.next_id.max(id);
-                db.attacks.push(Stored::new(id, row));
-            }
-            other => {
-                return Err(Error::Unsupported(format!("unknown record {other:?}")));
-            }
-        }
+fn load_names(conn: &rusqlite::Connection) -> Result<Vec<Stored<Name>>> {
+    let mut stmt = conn
+        .prepare("SELECT id, kind, name, number, mnemonic FROM names ORDER BY id")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(
+            row.get(0)?,
+            Name {
+                kind: row.get(1)?,
+                name: row.get(2)?,
+                number: row.get(3)?,
+                mnemonic: row.get(4)?,
+            },
+        ));
     }
-    Ok((version, db))
+    Ok(out)
+}
+
+fn load_hunts(conn: &rusqlite::Connection) -> Result<Vec<Stored<Hunt>>> {
+    let mut stmt = conn
+        .prepare("SELECT id, instance, character, started_at, ended_at FROM hunts ORDER BY id")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(
+            row.get(0)?,
+            Hunt {
+                instance: row.get(1)?,
+                character: row.get(2)?,
+                started_at: row.get(3)?,
+                ended_at: row.get(4)?,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+fn load_attacks(conn: &rusqlite::Connection) -> Result<Vec<Stored<Attack>>> {
+    let mut stmt = conn.prepare("SELECT id, hunt_id, occurred_at FROM attacks ORDER BY id")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(Stored::new(
+            row.get(0)?,
+            Attack {
+                hunt_id: row.get(1)?,
+                occurred_at: row.get(2)?,
+            },
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra-ledger-store-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     fn pulse(at: i64, exp_gained: i64) -> Pulse {
         Pulse {
             instance: "prime".to_string(),
             character: "Sindar".to_string(),
             at,
+            exp: 1_000,
+            axp: 5,
             exp_gained,
             rpa: Some("1.25x".to_string()),
             mind_text: Some("clear".to_string()),
+            game_time: Some(1_417),
+            source: Source::Bounty,
             ..Pulse::default()
         }
     }
 
     #[test]
-    fn escaping_round_trips_every_awkward_byte() {
-        let text = "a\tb\nc\\d\re";
-        assert_eq!(unesc(&esc(text)), text);
-        assert_eq!(esc("plain"), "plain");
-    }
-
-    #[test]
-    fn a_store_round_trips_through_the_file_format() {
-        let dir = std::env::temp_dir().join(format!("hydra-ledger-store-{}", std::process::id()));
+    fn a_real_sqlite_file_round_trips_every_table() {
+        let dir = scratch("round-trip");
         let path = dir.join("hydra.db");
-        let _ = std::fs::remove_file(&path);
         {
-            let conn = Connection::open(&path, false).unwrap();
-            conn.set_user_version(3).unwrap();
+            let mut conn = Connection::open(&path, false).unwrap();
+            assert_eq!(conn.user_version(), 0);
+            crate::migrate(&mut conn).unwrap();
+            assert_eq!(conn.user_version(), 3);
             conn.insert_pulse(pulse(10, 100)).unwrap();
             conn.insert_pulse(pulse(20, -5)).unwrap();
             conn.insert_snapshot(Snapshot {
@@ -949,14 +866,16 @@ mod tests {
             .unwrap();
             conn.intern_name("gear", "a sword", Some(7), Some("sword"))
                 .unwrap();
-            conn.commit().unwrap();
         }
+        // A second, read-only connection sees all of it: this is the SQLite
+        // file, not a cache.
         let conn = Connection::open(&path, true).unwrap();
         assert_eq!(conn.user_version(), 3);
         let db = conn.db();
         assert_eq!(db.pulses.len(), 2);
         assert_eq!(db.pulses[0].row.at, 10);
         assert_eq!(db.pulses[0].row.rpa.as_deref(), Some("1.25x"));
+        assert_eq!(db.pulses[0].row.exp, 1_000);
         assert_eq!(db.pulses[1].row.exp_gained, -5);
         assert_eq!(db.pulses[1].id, 2);
         assert_eq!(db.snapshots[0].row.kind, SnapshotKind::Suffused);
@@ -967,28 +886,209 @@ mod tests {
         assert_eq!(db.rewards[0].row.reward, "a trinket");
         assert_eq!(db.store_visits[0].row.next_at, Some(86_400));
         assert_eq!(db.names[0].row.mnemonic.as_deref(), Some("sword"));
+        drop(db);
         // A read-only connection refuses to write (`SQLITE_READONLY`).
         assert_eq!(conn.insert_pulse(pulse(99, 1)), Err(Error::ReadOnly));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nullable_columns_come_back_as_none_and_exp_is_clamped() {
+        let dir = scratch("nullable");
+        let mut which = Connection::open(dir.join("hydra.db"), false).unwrap();
+        crate::migrate(&mut which).unwrap();
+        // Every optional column left at `None` …
+        which
+            .insert_pulse(Pulse {
+                instance: "prime".to_string(),
+                character: "Sindar".to_string(),
+                at: 10,
+                exp: -1,
+                axp: -2,
+                ..Pulse::default()
+            })
+            .unwrap();
+        // … and a fully populated one.
+        which
+            .insert_pulse(Pulse {
+                instance: "prime".to_string(),
+                character: "Sindar".to_string(),
+                at: 20,
+                game_time: Some(1_417),
+                exp: 5_000_000,
+                axp: 12,
+                exp_gained: 1_200,
+                axp_gained: 3,
+                fxp: Some(10),
+                fxp_max: Some(99),
+                until_next: Some(250_000),
+                lumnis: Some(2),
+                rpa: Some("1.25x".to_string()),
+                fashlonae: Some(1),
+                mind_percent: Some(97),
+                mind_text: Some("must rest".to_string()),
+                source: Source::Instant,
+                instant: 4_242,
+            })
+            .unwrap();
+        let db = which.db();
+        let bare = &db.pulses[0].row;
+        assert_eq!(bare.game_time, None);
+        assert_eq!(bare.fxp, None);
+        assert_eq!(bare.rpa, None);
+        assert_eq!(bare.mind_text, None);
+        // `max(v, 0)` — the recovered `bic x10, x23, x23, asr #63`.
+        assert_eq!((bare.exp, bare.axp), (0, 0));
+        let full = &db.pulses[1].row;
+        assert_eq!(full.game_time, Some(1_417));
+        assert_eq!(full.until_next, Some(250_000));
+        assert_eq!(full.lumnis, Some(2));
+        assert_eq!(full.fashlonae, Some(1));
+        assert_eq!(full.mind_percent, Some(97));
+        assert_eq!(full.mind_text.as_deref(), Some("must rest"));
+        assert_eq!(full.source, Source::Instant);
+        assert_eq!(full.instant, 4_242);
+        // The NULLs really are NULL in SQLite, not empty strings.
+        let nulls: i64 = which
+            .raw()
+            .query_row(
+                "SELECT COUNT(*) FROM pulses WHERE at = 10 AND game_time IS NULL \
+                 AND fxp IS NULL AND rpa IS NULL AND mind_text IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writable_connection_is_wal_and_normal_with_a_five_second_busy_timeout() {
+        let dir = scratch("pragmas");
+        let conn = Connection::open(dir.join("hydra.db"), false).unwrap();
+        let journal_mode: String = conn
+            .raw()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .raw()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = conn
+            .raw()
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        // NORMAL is 1 (OFF 0, FULL 2, EXTRA 3).
+        assert_eq!(synchronous, 1);
+        assert_eq!(busy_timeout, 5_000);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_missing_database_is_an_error_for_a_read_only_connection() {
-        let path = std::env::temp_dir().join("hydra-ledger-does-not-exist.db");
+        let path = std::env::temp_dir().join(format!(
+            "hydra-ledger-does-not-exist-{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         assert!(Connection::open(&path, true).is_err());
     }
 
     #[test]
-    fn execute_batch_only_knows_the_recovered_statements() {
+    fn a_file_that_is_not_a_database_is_refused_not_mis_parsed() {
+        let dir = scratch("foreign");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hydra.db");
+        // The pre-Phase-1 line format: a real SQLite build must not read it.
+        std::fs::write(&path, "hydra-ledger\t3\npulse\t1\t10\n").unwrap();
+        assert!(!crate::is_this_builds_store(&path));
+        // A writable connection sets `journal_mode`, which makes SQLite read
+        // the header, so opening refuses a file that is not a database.
+        let error = Connection::open(&path, false).unwrap_err();
+        assert!(error.to_string().contains("file is not a database"), "{error}");
+        // A read-only connection opens lazily; the version read is where
+        // SQLite notices, and `migrate` reports the same.
+        let mut conn = Connection::open(&path, true).unwrap();
+        assert!(conn.try_user_version().is_err());
+        assert_eq!(conn.user_version(), 0);
+        assert!(crate::migrate(&mut conn).is_err());
+        // An empty file *is* a database SQLite will initialise.
+        std::fs::write(&path, b"").unwrap();
+        let mut conn = Connection::open(&path, false).unwrap();
+        crate::migrate(&mut conn).unwrap();
+        assert_eq!(conn.user_version(), 3);
+        assert!(crate::is_this_builds_store(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_batch_runs_the_recovered_texts_and_any_other_sql() {
         let conn = Connection::in_memory(false);
-        assert_eq!(conn.execute_batch(crate::schema::BEGIN_DEFERRED), Ok(()));
-        assert_eq!(conn.execute_batch("COMMIT"), Ok(()));
-        assert_eq!(conn.execute_batch(crate::schema::MIGRATIONS[0]), Ok(()));
+        // A fresh in-memory connection already carries the schema, so applying
+        // the batches again is a constraint error — from SQLite, not from a
+        // dispatch table.
+        assert!(conn.execute_batch(schema::MIGRATIONS[0]).is_err());
+        // Transactions and arbitrary SQL are real now.
+        assert_eq!(conn.execute_batch(schema::BEGIN_DEFERRED), Ok(()));
+        assert_eq!(
+            conn.execute_batch(
+                "CREATE TABLE scratch (id INTEGER PRIMARY KEY, note TEXT);
+                 INSERT INTO scratch (note) VALUES ('hello');"
+            ),
+            Ok(())
+        );
+        assert_eq!(conn.execute_batch(schema::COMMIT), Ok(()));
+        let note: String = conn
+            .raw()
+            .query_row("SELECT note FROM scratch", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(note, "hello");
+        // A syntax error is a `rusqlite` error, reported as `Error::Sqlite`.
         assert!(matches!(
-            conn.execute_batch("SELECT 1"),
-            Err(Error::Unsupported(_))
+            conn.execute_batch("SELECT FROM"),
+            Err(Error::Sqlite(_))
         ));
+    }
+
+    #[test]
+    fn the_views_and_joined_tables_of_the_base_schema_exist() {
+        let conn = Connection::in_memory(false);
+        let mut stmt = conn
+            .raw()
+            .prepare("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')")
+            .unwrap();
+        let names: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for wanted in ["pulses", "snapshots", "names", "imports", "login_rewards", "store_visits"] {
+            assert!(
+                names.iter().any(|(name, kind)| name == wanted && kind == "table"),
+                "missing table {wanted}"
+            );
+        }
+        for view in ["flares", "hunt_gemstones"] {
+            assert!(
+                names.iter().any(|(name, kind)| name == view && kind == "view"),
+                "missing view {view}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pulse_view_and_the_recovered_select_agree_on_the_columns() {
+        // `load_pulses` appends `id` after the recovered column list, so the
+        // mapper's indices and the view's are the same ones.
+        assert_eq!(schema::PULSE_COLUMNS.split(", ").count(), 18);
+        let conn = Connection::in_memory(false);
+        conn.insert_pulse(pulse(10, 100)).unwrap();
+        let db = conn.db();
+        assert_eq!(db.pulses[0].id, 1);
+        assert_eq!(db.pulses[0].row.at, 10);
+        drop(db);
     }
 }

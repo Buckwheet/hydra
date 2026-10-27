@@ -2,3 +2,12 @@
 name = "hydra_ledger"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Phase 1 reconnection: the original ledger is a `rusqlite` database plus a
+# `tokio` writer, and both are back.  Versions and features come from the
+# workspace pins: `rusqlite` 0.37.0 with `bundled` (SQLite is compiled from the
+# amalgamation that ships in `libsqlite3-sys`, so the build needs no system
+# libsqlite3 and no network), `tokio` 1.53.1 with all features.
+rusqlite = { workspace = true }
+tokio = { workspace = true }

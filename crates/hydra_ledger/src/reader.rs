@@ -2,15 +2,22 @@
 //!
 //! [`Reader`] is a one-field wrapper around a read-only connection
 //! (`Ledger::reader` at `0x10168e934` is `connect(true)` plus a move), and every
-//! method below is one of the crate's recovered `SELECT`s. The SQL text of each
-//! query lives in [`crate::schema`]; the query itself is a typed operation over
-//! [`crate::store::Db`]'s row vectors, so the predicate/ordering/limit is the one
-//! the SQL states (see `NOTES.md` §3 for the per-query table).
+//! method below is one of the crate's recovered `SELECT`s, run through
+//! `rusqlite` (**reconnected in Phase 1**): the text comes from
+//! [`crate::schema`], the statement goes through `StatementCache::get`
+//! (`Connection::prepare_cached` — the cache the binary indexes at `+0x20` in
+//! the connection), and the rows are mapped with `query_map`/`query_row`.
+//!
+//! The predicate, ordering and limit of each query are the ones the SQL states,
+//! so SQLite does the work. `NOTES.md` §3 has the per-query table and §7 the
+//! evidence conflicts (`pulses_between` is a `COUNT(*)`, `last_pulses` is
+//! newest-first, `latest_rewards` binds nothing).
 
 use crate::row::{Pulse, Reward, Snapshot, SnapshotKind, StoreVisit, Who};
-#[allow(unused_imports)] // the doc links below resolve through this import
 use crate::schema;
-use crate::store::{Connection, Stored};
+use crate::store::{
+    pulse_from_row, reward_from_row, snapshot_from_row, store_visit_from_row, Connection,
+};
 use crate::Result;
 
 /// The read handle.
@@ -47,24 +54,14 @@ impl Reader {
     ///                  UNION SELECT instance, character FROM hunts ORDER BY 1, 2
     /// ```
     pub fn characters(&self) -> Result<Vec<Who>> {
-        let db = self.conn.db();
-        let mut out: Vec<Who> = Vec::new();
-        for stored in &db.pulses {
-            out.push(Who::new(
-                stored.row.instance.clone(),
-                stored.row.character.clone(),
-            ));
-        }
-        for stored in &db.hunts {
-            out.push(Who::new(
-                stored.row.instance.clone(),
-                stored.row.character.clone(),
-            ));
-        }
-        // `UNION` is distinct, then `ORDER BY 1, 2`.
-        out.sort();
-        out.dedup();
-        Ok(out)
+        let mut stmt = self.conn.raw().prepare_cached(schema::CHARACTERS)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Who::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::last_pulses(&self, who, limit) -> Result<Vec<Pulse>>` — **full**.
@@ -77,15 +74,17 @@ impl Reader {
     /// The rows come back **newest first**: `ORDER BY at DESC, id DESC LIMIT ?3`
     /// is the recovered text, and the mapper is `reader::pulse`.
     pub fn last_pulses(&self, who: &Who, limit: u64) -> Result<Vec<Pulse>> {
-        let limit = limit.min(i64::MAX as u64) as usize;
-        let db = self.conn.db();
-        let mut rows: Vec<&Stored<Pulse>> = db.pulses.iter().filter(|s| is_who(&s.row, who)).collect();
-        rows.sort_by(|a, b| b.row.at.cmp(&a.row.at).then(b.id.cmp(&a.id)));
-        Ok(rows
-            .into_iter()
-            .take(limit)
-            .map(|stored| stored.row.clone())
-            .collect())
+        let sql = schema::columns(schema::LAST_PULSES, schema::PULSE_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                who.instance,
+                who.character,
+                limit.min(i64::MAX as u64) as i64
+            ],
+            pulse_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::rewards(&self, who, limit) -> Result<Vec<Reward>>` — **full**.
@@ -94,16 +93,17 @@ impl Reader {
     /// `0x103e6e553`), three binds like [`Reader::last_pulses`] and the same
     /// saturation.
     pub fn rewards(&self, who: &Who, limit: u64) -> Result<Vec<Reward>> {
-        let limit = limit.min(i64::MAX as u64) as usize;
-        let db = self.conn.db();
-        let mut rows: Vec<&Stored<Reward>> =
-            db.rewards.iter().filter(|s| is_who(&s.row, who)).collect();
-        rows.sort_by(|a, b| b.row.at.cmp(&a.row.at).then(b.id.cmp(&a.id)));
-        Ok(rows
-            .into_iter()
-            .take(limit)
-            .map(|stored| stored.row.clone())
-            .collect())
+        let sql = schema::columns(schema::REWARDS, schema::REWARD_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                who.instance,
+                who.character,
+                limit.min(i64::MAX as u64) as i64
+            ],
+            reward_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::has_reward_on(&self, who, day) -> Result<i64>` — **full**.
@@ -112,13 +112,11 @@ impl Reader {
     /// `mov w3, #0x56`), three binds (`mov w2, #0x3`) → `query_row` →
     /// `Result<i64>` (the two-word `niche + i64` result).
     pub fn has_reward_on(&self, who: &Who, day: &str) -> Result<i64> {
-        let db = self.conn.db();
-        let count = db
-            .rewards
-            .iter()
-            .filter(|s| is_who(&s.row, who) && s.row.day == day)
-            .count();
-        Ok(count as i64)
+        let mut stmt = self.conn.raw().prepare_cached(schema::HAS_REWARD_ON)?;
+        Ok(stmt.query_row(
+            rusqlite::params![who.instance, who.character, day],
+            |row| row.get(0),
+        )?)
     }
 
     /// `Reader::latest_rewards(&self) -> Result<Vec<Reward>>` — **full**.
@@ -133,29 +131,10 @@ impl Reader {
     ///  ORDER BY instance, character
     /// ```
     pub fn latest_rewards(&self) -> Result<Vec<Reward>> {
-        let db = self.conn.db();
-        let mut latest: Vec<&Stored<Reward>> = Vec::new();
-        for stored in &db.rewards {
-            let key = (&stored.row.instance, &stored.row.character);
-            match latest
-                .iter_mut()
-                .find(|other| (&other.row.instance, &other.row.character) == key)
-            {
-                Some(slot) => {
-                    if stored.id > slot.id {
-                        *slot = stored;
-                    }
-                }
-                None => latest.push(stored),
-            }
-        }
-        latest.sort_by(|a, b| {
-            a.row
-                .instance
-                .cmp(&b.row.instance)
-                .then(a.row.character.cmp(&b.row.character))
-        });
-        Ok(latest.into_iter().map(|stored| stored.row.clone()).collect())
+        let sql = schema::columns(schema::LATEST_REWARDS, schema::REWARD_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map([], reward_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::has_pulse(&self, who, at, exp) -> Result<i64>` — **full**.
@@ -163,13 +142,11 @@ impl Reader {
     /// `@0x10168cc58` (340 bytes), [`schema::HAS_PULSE`] (91 bytes,
     /// `mov w3, #0x5b`), four binds (`mov w2, #0x4`) → `Result<i64>`.
     pub fn has_pulse(&self, who: &Who, at: i64, exp: i64) -> Result<i64> {
-        let db = self.conn.db();
-        let count = db
-            .pulses
-            .iter()
-            .filter(|s| is_who(&s.row, who) && s.row.at == at && s.row.exp == exp)
-            .count();
-        Ok(count as i64)
+        let mut stmt = self.conn.raw().prepare_cached(schema::HAS_PULSE)?;
+        Ok(stmt.query_row(
+            rusqlite::params![who.instance, who.character, at, exp],
+            |row| row.get(0),
+        )?)
     }
 
     /// `Reader::hunt_overlapping(&self, who, from, to) -> Result<Option<i64>>` —
@@ -196,43 +173,19 @@ impl Reader {
     /// end, so the predicate is "started at or before the window's end, and
     /// ended (or last attacked, or started) at or after the window's start".
     pub fn hunt_overlapping(&self, who: &Who, from: i64, to: i64) -> Result<Option<i64>> {
-        let db = self.conn.db();
-        let mut best: Option<i64> = None;
-        for stored in &db.hunts {
-            let hunt = &stored.row;
-            if hunt.instance != who.instance || hunt.character != who.character {
-                continue;
-            }
-            if hunt.started_at > to {
-                continue;
-            }
-            let ended = hunt
-                .ended_at
-                .or_else(|| {
-                    db.attacks
-                        .iter()
-                        .filter(|attack| attack.row.hunt_id == stored.id)
-                        .map(|attack| attack.row.occurred_at)
-                        .max()
-                })
-                .unwrap_or(hunt.started_at);
-            if ended < from {
-                continue;
-            }
-            // `ORDER BY h.id LIMIT 1`
-            if best.map(|id| stored.id < id).unwrap_or(true) {
-                best = Some(stored.id);
-            }
-        }
-        Ok(best)
+        let mut stmt = self.conn.raw().prepare_cached(schema::HUNT_OVERLAPPING)?;
+        let mut rows = stmt.query_map(
+            rusqlite::params![who.instance, who.character, from, to],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(rows.next().transpose()?)
     }
 
     /// `Reader::latest_snapshots(&self, who) -> Result<Vec<Snapshot>>` —
     /// **full**.
     ///
     /// `@0x10168c174` (572 bytes), [`schema::LATEST_SNAPSHOTS`] (format blob
-    /// `0x103983283`…), two binds (`bind_parameter_count == 1` bind site per
-    /// parameter: `&who.instance`, `&who.character`).
+    /// `0x103983283`), two binds (`&who.instance`, `&who.character`).
     ///
     /// ```sql
     /// SELECT … FROM snapshots
@@ -242,83 +195,41 @@ impl Reader {
     ///  ORDER BY kind, name
     /// ```
     ///
-    /// `GROUP BY kind, name` groups `NULL` names together, which is why the
-    /// sort puts `None` first.
+    /// `GROUP BY kind, name` groups `NULL` names together, and SQLite sorts
+    /// `NULL` before any text, which is why the sort puts `None` first.
     pub fn latest_snapshots(&self, who: &Who) -> Result<Vec<Snapshot>> {
-        let db = self.conn.db();
-        let mut latest: Vec<&Stored<Snapshot>> = Vec::new();
-        for stored in &db.snapshots {
-            if !is_who(&stored.row, who) {
-                continue;
-            }
-            let key = (stored.row.kind, &stored.row.name);
-            match latest
-                .iter_mut()
-                .find(|other| (other.row.kind, &other.row.name) == key)
-            {
-                Some(slot) => {
-                    if stored.id > slot.id {
-                        *slot = stored;
-                    }
-                }
-                None => latest.push(stored),
-            }
-        }
-        latest.sort_by(|a, b| {
-            a.row
-                .kind
-                .cmp(&b.row.kind)
-                .then(a.row.name.cmp(&b.row.name))
-        });
-        Ok(latest.into_iter().map(|stored| stored.row.clone()).collect())
+        let sql = schema::columns(schema::LATEST_SNAPSHOTS, schema::SNAPSHOT_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![who.instance, who.character],
+            snapshot_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::latest_store_claims(&self) -> Result<Vec<StoreVisit>>` —
     /// **full**.
     ///
-    /// `@0x10168c3b0` (256 bytes), [`schema::LATEST_STORE_CLAIMS`] (214 bytes),
+    /// `@0x10168c3b0` (256 bytes), [`schema::LATEST_STORE_CLAIMS`] (241 bytes),
     /// no binds. Store visits belong to an **account**, not a character, which
     /// is why there is no `Who` here.
     pub fn latest_store_claims(&self) -> Result<Vec<StoreVisit>> {
-        self.latest_store_visits_where(true)
+        self.store_visits(schema::LATEST_STORE_CLAIMS)
     }
 
     /// `Reader::latest_store_visits(&self) -> Result<Vec<StoreVisit>>` —
     /// **full**.
     ///
-    /// `@0x10168c4b0` (256 bytes), [`schema::LATEST_STORE_VISITS`] (180 bytes),
+    /// `@0x10168c4b0` (256 bytes), [`schema::LATEST_STORE_VISITS`] (197 bytes),
     /// no binds — the same query without the `claimed = 1` filter.
     pub fn latest_store_visits(&self) -> Result<Vec<StoreVisit>> {
-        self.latest_store_visits_where(false)
+        self.store_visits(schema::LATEST_STORE_VISITS)
     }
 
-    fn latest_store_visits_where(&self, claimed_only: bool) -> Result<Vec<StoreVisit>> {
-        let db = self.conn.db();
-        let mut latest: Vec<&Stored<StoreVisit>> = Vec::new();
-        for stored in &db.store_visits {
-            if claimed_only && !stored.row.claimed {
-                continue;
-            }
-            let key = (&stored.row.account, &stored.row.game);
-            match latest
-                .iter_mut()
-                .find(|other| (&other.row.account, &other.row.game) == key)
-            {
-                Some(slot) => {
-                    if stored.id > slot.id {
-                        *slot = stored;
-                    }
-                }
-                None => latest.push(stored),
-            }
-        }
-        latest.sort_by(|a, b| {
-            a.row
-                .account
-                .cmp(&b.row.account)
-                .then(a.row.game.cmp(&b.row.game))
-        });
-        Ok(latest.into_iter().map(|stored| stored.row.clone()).collect())
+    fn store_visits(&self, sql: &str) -> Result<Vec<StoreVisit>> {
+        let mut stmt = self.conn.raw().prepare_cached(sql)?;
+        let rows = stmt.query_map([], store_visit_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::pulses(&self, who, from, to) -> Result<Vec<Pulse>>` — **full**.
@@ -330,17 +241,13 @@ impl Reader {
     /// This is the half-open window: `at >= ?3 AND at < ?4`, oldest first
     /// (`ORDER BY at, id`). [`Reader::pulses_between`] is the *closed* count.
     pub fn pulses(&self, who: &Who, from: i64, to: i64) -> Result<Vec<Pulse>> {
-        let db = self.conn.db();
-        let mut rows: Vec<&Stored<Pulse>> = db
-            .pulses
-            .iter()
-            .filter(|s| is_who(&s.row, who) && s.row.at >= from && s.row.at < to)
-            .collect();
-        rows.sort_by(|a, b| a.row.at.cmp(&b.row.at).then(a.id.cmp(&b.id)));
-        Ok(rows
-            .into_iter()
-            .map(|stored| stored.row.clone())
-            .collect())
+        let sql = schema::columns(schema::PULSES, schema::PULSE_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![who.instance, who.character, from, to],
+            pulse_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// `Reader::pulses_between(&self, who, from, to) -> Result<i64>` — **full**.
@@ -350,15 +257,13 @@ impl Reader {
     ///
     /// Despite the name this is `SELECT COUNT(*)`, not a row query: the row
     /// query is [`Reader::pulses`]. The window is **closed** here
-    /// (`at BETWEEN ?3 AND ?4`). `NOTES.md` §3.6 records this.
+    /// (`at BETWEEN ?3 AND ?4`). `NOTES.md` §7.1 records this.
     pub fn pulses_between(&self, who: &Who, from: i64, to: i64) -> Result<i64> {
-        let db = self.conn.db();
-        let count = db
-            .pulses
-            .iter()
-            .filter(|s| is_who(&s.row, who) && s.row.at >= from && s.row.at <= to)
-            .count();
-        Ok(count as i64)
+        let mut stmt = self.conn.raw().prepare_cached(schema::PULSES_BETWEEN)?;
+        Ok(stmt.query_row(
+            rusqlite::params![who.instance, who.character, from, to],
+            |row| row.get(0),
+        )?)
     }
 
     /// `Reader::imported(&self, who, stamp) -> Result<i64>` — **full**.
@@ -366,13 +271,11 @@ impl Reader {
     /// `@0x10168cb1c` (316 bytes), [`schema::IMPORTED`] (82 bytes,
     /// `mov w3, #0x52`), three binds (`mov w2, #0x3`) → `Result<i64>`.
     pub fn imported(&self, who: &Who, stamp: &str) -> Result<i64> {
-        let db = self.conn.db();
-        let count = db
-            .imports
-            .iter()
-            .filter(|s| is_who(&s.row, who) && s.row.stamp == stamp)
-            .count();
-        Ok(count as i64)
+        let mut stmt = self.conn.raw().prepare_cached(schema::IMPORTED)?;
+        Ok(stmt.query_row(
+            rusqlite::params![who.instance, who.character, stamp],
+            |row| row.get(0),
+        )?)
     }
 
     /// `Reader::snapshots(&self, who, kind, from, to) -> Result<Vec<Snapshot>>`
@@ -380,7 +283,7 @@ impl Reader {
     ///
     /// `@0x10168cdac` (5,420 bytes — the size is the `Format::format` call plus
     /// five `bind_parameter` chains, not extra logic), [`schema::SNAPSHOTS`]
-    /// (format blob `0x10398356f`), five binds:
+    /// (format blob `0x1039835ca`), five binds:
     ///
     /// ```text
     /// ?1 &who.instance      ?2 &who.character
@@ -397,57 +300,13 @@ impl Reader {
         from: i64,
         to: i64,
     ) -> Result<Vec<Snapshot>> {
-        let db = self.conn.db();
-        let mut rows: Vec<&Stored<Snapshot>> = db
-            .snapshots
-            .iter()
-            .filter(|s| {
-                is_who(&s.row, who)
-                    && s.row.kind == kind
-                    && s.row.at >= from
-                    && s.row.at < to
-            })
-            .collect();
-        rows.sort_by(|a, b| a.row.at.cmp(&b.row.at).then(a.id.cmp(&b.id)));
-        Ok(rows
-            .into_iter()
-            .map(|stored| stored.row.clone())
-            .collect())
-    }
-}
-
-/// The `instance = ?1 AND character = ?2` predicate every per-character query
-/// binds.
-fn is_who<T: HasWho>(row: &T, who: &Who) -> bool {
-    let (instance, character) = row.who();
-    instance == who.instance && character == who.character
-}
-
-trait HasWho {
-    fn who(&self) -> (&str, &str);
-}
-
-impl HasWho for Pulse {
-    fn who(&self) -> (&str, &str) {
-        (&self.instance, &self.character)
-    }
-}
-
-impl HasWho for Reward {
-    fn who(&self) -> (&str, &str) {
-        (&self.instance, &self.character)
-    }
-}
-
-impl HasWho for Snapshot {
-    fn who(&self) -> (&str, &str) {
-        (&self.instance, &self.character)
-    }
-}
-
-impl HasWho for crate::store::Import {
-    fn who(&self) -> (&str, &str) {
-        (&self.instance, &self.character)
+        let sql = schema::columns(schema::SNAPSHOTS, schema::SNAPSHOT_COLUMNS);
+        let mut stmt = self.conn.raw().prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![who.instance, who.character, kind.name(), from, to],
+            snapshot_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
 
@@ -455,7 +314,7 @@ impl HasWho for crate::store::Import {
 mod tests {
     use super::*;
     use crate::row::Source;
-    use crate::store::{Connection, Hunt};
+    use crate::store::{Connection, Hunt, Import};
 
     const PRIME: &str = "prime";
     const SINDAR: &str = "Sindar";
@@ -748,11 +607,11 @@ mod tests {
     #[test]
     fn imported_counts_the_stamp() {
         let conn = Connection::in_memory(false);
-        conn.insert_import(crate::store::Import {
+        conn.insert_import(Import {
             instance: PRIME.to_string(),
             character: SINDAR.to_string(),
             stamp: "2026-07-20T13:05:52".to_string(),
-            ..crate::store::Import::default()
+            ..Import::default()
         })
         .unwrap();
         let reader = Reader::new(conn);
@@ -797,6 +656,56 @@ mod tests {
         assert_eq!(row.mind_text.as_deref(), Some("must rest"));
         assert_eq!(row.mind_percent, Some(97));
         assert_eq!(row.source, Source::Bounty);
+    }
+
+    /// The recovered readers against a real `hydra.db` file: a writable
+    /// connection writes, a separate read-only one reads it back.
+    #[test]
+    fn the_readers_see_what_another_connection_committed() {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra-ledger-reader-file-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = crate::Ledger::open(&dir).unwrap();
+        {
+            let conn = ledger.writing().unwrap();
+            for at in [100, 200, 300] {
+                conn.insert_pulse(pulse(at)).unwrap();
+            }
+            conn.insert_snapshot(Snapshot {
+                instance: PRIME.to_string(),
+                character: SINDAR.to_string(),
+                kind: SnapshotKind::Favor,
+                at: 50,
+                value: Some(42),
+                ..Snapshot::default()
+            })
+            .unwrap();
+        }
+        let reader = ledger.reader().unwrap();
+        assert_eq!(
+            reader
+                .pulses(&who(), 0, i64::MAX)
+                .unwrap()
+                .iter()
+                .map(|p| p.at)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+        assert_eq!(reader.has_pulse(&who(), 200, 1_200).unwrap(), 1);
+        assert_eq!(reader.pulses_between(&who(), 100, 300).unwrap(), 3);
+        assert_eq!(
+            reader
+                .snapshots(&who(), SnapshotKind::Favor, 0, i64::MAX)
+                .unwrap()[0]
+                .value,
+            Some(42)
+        );
+        assert_eq!(reader.characters().unwrap(), vec![who()]);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn reader_from(conn: Connection) -> Reader {

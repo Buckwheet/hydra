@@ -9,8 +9,9 @@
 //! its column list as an argument keeps the original's `SELECT {}` shape — see
 //! [`columns`].
 //!
-//! The schema is also the *only* description of the rows: this crate's store is
-//! typed, so these strings document it rather than drive it (see `store.rs`).
+//! The schema is also the *only* description of the rows: the store runs these
+//! statements through `rusqlite` (Phase 1), so the text below is what SQLite
+//! executes rather than documentation of a stand-in.
 
 /// `PRAGMA user_version` — `0x103985c1b`, 19 bytes; read first by
 /// [`crate::migrate`].
@@ -382,6 +383,11 @@ pub const LATEST_STORE_VISITS: &str = "SELECT at, account, game, claimed, messag
      WHERE id IN (SELECT MAX(id) FROM store_visits GROUP BY account, game)\n             \
      ORDER BY account, game";
 
+/// The `store_visits` column list, in the order [`LATEST_STORE_CLAIMS`] and
+/// [`LATEST_STORE_VISITS`] write it. Quoted here once so the store's view and
+/// the two readers cannot drift apart.
+pub const STORE_VISIT_COLUMNS: &str = "at, account, game, claimed, message, balance, next_at";
+
 /// `Reader::pulses` template — format blob `0x103e6e4d2`.
 pub const PULSES: &str = "SELECT {} FROM pulses\n             \
      WHERE instance = ?1 AND character = ?2 AND at >= ?3 AND at < ?4\n             \
@@ -535,6 +541,18 @@ mod tests {
             columns("SELECT {} FROM pulses", PULSE_COLUMNS),
             format!("SELECT {PULSE_COLUMNS} FROM pulses")
         );
+    }
+
+    #[test]
+    fn the_store_visit_column_list_is_the_one_the_two_readers_select() {
+        assert_eq!(STORE_VISIT_COLUMNS.split(", ").count(), 7);
+        assert!(LATEST_STORE_CLAIMS.contains(STORE_VISIT_COLUMNS));
+        assert!(LATEST_STORE_VISITS.contains(STORE_VISIT_COLUMNS));
+        assert_eq!(STORE_VISIT_COLUMNS.len(), 53);
+        // Each column is created by migration 3.
+        for column in STORE_VISIT_COLUMNS.split(", ") {
+            assert!(MIGRATION_3.contains(column.trim()), "{column} is not created");
+        }
     }
 
     #[test]

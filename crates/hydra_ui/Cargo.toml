@@ -7,3 +7,5 @@ edition = "2021"
 hydra_protocol = { path = "../hydra_protocol" }
 hydra_model = { path = "../hydra_model" }
 gs_base = { path = "../gs_base" }
+egui = { workspace = true }
+epaint = { workspace = true }

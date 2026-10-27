@@ -14,3 +14,5 @@ edition = "2021"
 [dependencies]
 gs_base = { path = "../gs_base" }
 gs_puppet = { path = "../gs_puppet" }
+egui = { workspace = true }
+epaint = { workspace = true }

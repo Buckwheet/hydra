@@ -7,3 +7,5 @@ edition = "2021"
 hydra_protocol = { path = "../hydra_protocol" }
 hydra_model = { path = "../hydra_model" }
 hydra_session = { path = "../hydra_session" }
+egui = { workspace = true }
+epaint = { workspace = true }

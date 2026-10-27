@@ -38,3 +38,7 @@ memmap2 = "=0.9.11"
 semver = "=1.0.28"
 winit = "=0.30.13"
 wgpu = "=29.0.4"
+egui = { git = "https://github.com/emilk/egui", rev = "3da022d98072fb631443a72f49973cfb6c93f865", default-features = true }
+eframe = { git = "https://github.com/emilk/egui", rev = "3da022d98072fb631443a72f49973cfb6c93f865", default-features = false, features = ["default_fonts", "wgpu"] }
+egui-wgpu = { git = "https://github.com/emilk/egui", rev = "3da022d98072fb631443a72f49973cfb6c93f865" }
+epaint = { git = "https://github.com/emilk/egui", rev = "3da022d98072fb631443a72f49973cfb6c93f865" }

@@ -51,6 +51,15 @@
 //! `Arc<Mutex<EventLog>>` that subscribers read with a cursor, which is the
 //! same "each subscriber sees every event once" contract), no `oneshot`, no
 //! `CancellationToken` (a plain `AtomicBool`).
+//!
+//! **Phase 1** reconnected what fits behind the existing facade:
+//!
+//! * `stopping`/`stop` are a real `tokio_util::sync::CancellationToken`
+//!   ([`SessionHandle::stop_token`] hands out a clone the relay can await);
+//! * every emitted event also goes onto a real `tokio::sync::broadcast`
+//!   channel ([`SessionHandle::watch`]), which is what `say`/`say_unlogged`
+//!   drive in the binary; the cursor-based [`Listener`] stays because its
+//!   synchronous `try_recv`/`drain` API is what the sibling crates use.
 
 use crate::alias::Aliases;
 use crate::claimant::Desk;
@@ -64,6 +73,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// How many events the shared log keeps for late subscribers.
 pub const EVENT_BACKLOG: usize = 1024;
@@ -183,6 +194,8 @@ pub type Taker = Sender<String>;
 #[derive(Debug)]
 pub struct Inner {
     events: Arc<Mutex<EventLog>>,
+    /// the recovered `broadcast::Sender<Event>` (**ESTABLISHED** at `+0x08`)
+    broadcast: broadcast::Sender<Event>,
     generation: GenerationCell,
     desk: Mutex<Option<Desk>>,
     lich_view: AtomicBool,
@@ -192,7 +205,8 @@ pub struct Inner {
     log: Mutex<Vec<String>>,
     typed_log: Mutex<Vec<String>>,
     taker: Mutex<Option<Taker>>,
-    stopping: AtomicBool,
+    /// the recovered `CancellationToken`: `stopping` reads it, `stop` trips it
+    stop: CancellationToken,
     keep_log: AtomicBool,
     lich: Mutex<crate::lich::Slot>,
 }
@@ -209,9 +223,13 @@ impl SessionHandle {
     /// **ESTABLISHED** shape (`0x101a3bc9c`): allocates the generation cell,
     /// the settings, the player log and the broadcast channel.
     pub fn new(desk: Desk) -> Self {
+        // The recovered session is `broadcast::channel(...)`; the capacity is
+        // the same 1024-event backlog the cursor log keeps.
+        let (broadcast, _) = broadcast::channel(EVENT_BACKLOG);
         SessionHandle {
             inner: Arc::new(Inner {
                 events: Arc::new(Mutex::new(EventLog::default())),
+                broadcast,
                 generation: GenerationCell::new(),
                 desk: Mutex::new(Some(desk)),
                 lich_view: AtomicBool::new(false),
@@ -221,7 +239,7 @@ impl SessionHandle {
                 log: Mutex::new(Vec::new()),
                 typed_log: Mutex::new(Vec::new()),
                 taker: Mutex::new(None),
-                stopping: AtomicBool::new(false),
+                stop: CancellationToken::new(),
                 keep_log: AtomicBool::new(true),
                 lich: Mutex::new(crate::lich::Slot::new()),
             }),
@@ -423,15 +441,43 @@ impl SessionHandle {
 
     /// Is the session shutting down?
     ///
-    /// **ESTABLISHED** shape (`0x101a3d44c`).
+    /// **ESTABLISHED** shape (`0x101a3d44c`).  **Phase 1**: reads the real
+    /// `CancellationToken` (the original's `cancel_token.is_cancelled()`).
     pub fn stopping(&self) -> bool {
-        self.inner.stopping.load(Ordering::Relaxed)
+        self.inner.stop.is_cancelled()
     }
 
     /// Start shutting down.
+    ///
+    /// **Phase 1**: trips the `CancellationToken`, which wakes every
+    /// [`SessionHandle::stop_token`] waiter, then announces `Event::Over`.
     pub fn stop(&self, reason: &str) {
-        self.inner.stopping.store(true, Ordering::Relaxed);
+        self.inner.stop.cancel();
         self.emit(Event::Over(reason.to_string()));
+    }
+
+    /// A clone of the session's cancellation token.
+    ///
+    /// **ESTABLISHED**: the original shares one `CancellationToken` between
+    /// the session, the relay and the player log; a clone can be awaited with
+    /// `token.cancelled()` or passed to a child task.
+    pub fn stop_token(&self) -> CancellationToken {
+        self.inner.stop.clone()
+    }
+
+    /// A subscription to the session's event channel.
+    ///
+    /// **ESTABLISHED**: `say`/`say_unlogged` push onto a
+    /// `tokio::sync::broadcast` channel; this is the receiving end of it, for
+    /// callers that run under tokio.  [`SessionHandle::subscribe`] is the
+    /// synchronous, backlog-replaying equivalent.
+    pub fn watch(&self) -> broadcast::Receiver<Event> {
+        self.inner.broadcast.subscribe()
+    }
+
+    /// The broadcasting end itself, for handing to another task.
+    pub fn broadcaster(&self) -> broadcast::Sender<Event> {
+        self.inner.broadcast.clone()
     }
 
     /// A command in the chain was not run.
@@ -556,12 +602,21 @@ impl SessionHandle {
     }
 
     /// Put an event on the session's channel.
+    ///
+    /// **ESTABLISHED**: the recovered `say` sends on the session's broadcast
+    /// channel and drops the `SendError` when nobody is listening.  Phase 1
+    /// does exactly that on the real `tokio::sync::broadcast` channel, and
+    /// keeps pushing into the cursor log so the synchronous [`Listener`] still
+    /// sees every event once.
     pub fn emit(&self, event: Event) {
         self.inner
             .events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(event);
+            .push(event.clone());
+        // `send` only fails when there is no receiver at all, which is not an
+        // error the session cares about.
+        let _ = self.inner.broadcast.send(event);
     }
 }
 
@@ -722,5 +777,54 @@ mod tests {
         s.stop("the player left");
         assert!(s.stopping());
         assert_eq!(l.try_recv(), Some(Event::Over("the player left".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_stop_token_cancels_every_waiter() {
+        let s = handle();
+        let token = s.stop_token();
+        assert!(!token.is_cancelled());
+        // A clone shares the tripping: `cancelled()` wakes when `stop` runs.
+        let waiter = token.clone();
+        let waiting = tokio::spawn(async move {
+            waiter.cancelled().await;
+            true
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        s.stop("bye");
+        assert!(token.is_cancelled());
+        assert!(waiting.await.unwrap());
+        // Trip it twice: `CancellationToken::cancel` is idempotent.
+        s.stop("again");
+        assert!(s.stopping());
+    }
+
+    #[tokio::test]
+    async fn every_said_event_reaches_the_broadcast_channel() {
+        let s = handle();
+        let mut rx = s.watch();
+        s.say_line(LEVEL_INFO, "hello");
+        s.stop("done");
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Event::Said(crate::notice::Notice::line(LEVEL_INFO, "hello"))
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Event::Over("done".to_string())
+        );
+        // The synchronous listener sees the same two events, so the two views
+        // agree.
+        let mut l = s.subscribe();
+        s.say_line(LEVEL_INFO, "later");
+        assert_eq!(
+            l.try_recv(),
+            Some(Event::Said(crate::notice::Notice::line(LEVEL_INFO, "later")))
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Event::Said(crate::notice::Notice::line(LEVEL_INFO, "later"))
+        );
     }
 }

@@ -42,10 +42,21 @@
 //! a "cleared, never run" variant with discriminant 6, `close_window` proves a
 //! "closed" answer carrying an optional frame, and `answer_all` proves an
 //! "answered" variant carrying a frame.  We model exactly those three.
+//!
+//! **Phase 1**: the binary's `Envelope`/`Owed` carry a
+//! `tokio::sync::oneshot::Sender<Outcome>` (`drop_in_place<Envelope>` drops one
+//! at `+0x18`).  [`Envelope::oneshot`] / [`Owed::oneshot`] now hold exactly
+//! that, and [`CommandQueue::open_window_async`] /
+//! [`CommandQueue::written_at_once_async`] / [`Envelope::with_oneshot`] are the
+//! tokio-flavoured constructors.  The synchronous `std::sync::mpsc` reply stays:
+//! its `Receiver` is the shape every existing caller and test uses, and
+//! `oneshot::Sender` is not `Clone`, which the `Envelope`/`Owed` derives need.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 /// The tag of a window that is still open (**ESTABLISHED**: `0x3b9aca00`).
 pub const WINDOW_OPEN: u32 = 1_000_000_000;
@@ -79,6 +90,47 @@ pub enum Outcome {
 /// The channel a caller uses to learn a command's outcome.
 pub type Reply = Sender<Outcome>;
 
+/// The tokio side of a reply: a `oneshot::Sender<Outcome>` behind an `Arc`.
+///
+/// **ESTABLISHED**: the binary's `Envelope` drops a
+/// `Option<oneshot::Sender<Outcome>>` at `+0x18`.  The sender is shared (and
+/// taken when it fires) so that [`Envelope`] and [`Owed`] keep their `Clone`
+/// and `Debug` derives; a `oneshot::Sender` is neither.
+#[derive(Debug, Clone, Default)]
+pub struct Oneshot(Arc<Mutex<Option<oneshot::Sender<Outcome>>>>);
+
+impl Oneshot {
+    /// A ticket for `tx`.
+    pub fn new(tx: oneshot::Sender<Outcome>) -> Self {
+        Oneshot(Arc::new(Mutex::new(Some(tx))))
+    }
+
+    /// Send the outcome.  `false` when the ticket was already used or the
+    /// waiting side was dropped.
+    pub fn send(&self, outcome: Outcome) -> bool {
+        let taken = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match taken {
+            Some(tx) => tx.send(outcome).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Is a caller still waiting for this outcome?
+    pub fn is_waiting(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed())
+    }
+}
+
+impl From<oneshot::Sender<Outcome>> for Oneshot {
+    fn from(tx: oneshot::Sender<Outcome>) -> Self {
+        Oneshot::new(tx)
+    }
+}
+
 /// A command that is waiting to be written.
 #[derive(Debug, Clone, Default)]
 pub struct Envelope {
@@ -88,6 +140,8 @@ pub struct Envelope {
     pub reply: Option<Reply>,
     /// a number the caller can use to match the envelope up again
     pub number: u64,
+    /// the tokio `oneshot` ticket, if the caller asked on that side
+    pub oneshot: Option<Oneshot>,
 }
 
 impl Envelope {
@@ -97,6 +151,7 @@ impl Envelope {
             line: line.into(),
             reply: None,
             number: 0,
+            oneshot: None,
         }
     }
 
@@ -106,6 +161,17 @@ impl Envelope {
             line: line.into(),
             reply: Some(reply),
             number: 0,
+            oneshot: None,
+        }
+    }
+
+    /// A line whose outcome the caller wants as a tokio `oneshot`.
+    pub fn with_oneshot(line: impl Into<String>, ticket: oneshot::Sender<Outcome>) -> Self {
+        Envelope {
+            line: line.into(),
+            reply: None,
+            number: 0,
+            oneshot: Some(Oneshot::new(ticket)),
         }
     }
 
@@ -129,17 +195,42 @@ pub struct Owed {
     pub tag: u32,
     /// the caller's cookie
     pub key: u32,
+    /// the tokio `oneshot` ticket, if the window was opened on that side
+    pub oneshot: Option<Oneshot>,
 }
 
 impl Owed {
     fn open(reply: Option<Reply>, key: u32, at: Instant) -> Self {
+        Owed::open_with(reply, None, key, at)
+    }
+
+    fn open_with(reply: Option<Reply>, oneshot: Option<Oneshot>, key: u32, at: Instant) -> Self {
         Owed {
             reply,
             answer: None,
             at,
             tag: WINDOW_OPEN,
             key,
+            oneshot,
         }
+    }
+
+    /// Send the outcome to every ticket this entry holds, once.
+    fn answer_with(&mut self, outcome: Outcome) -> bool {
+        let mut sent = false;
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(outcome.clone());
+            sent = true;
+        }
+        if let Some(ticket) = self.oneshot.take() {
+            sent |= ticket.send(outcome);
+        }
+        sent
+    }
+
+    /// Is a tokio caller still waiting on this entry?
+    pub fn async_waiting(&self) -> bool {
+        self.oneshot.as_ref().is_some_and(Oneshot::is_waiting)
     }
 
     /// Has this entry been answered?
@@ -211,6 +302,9 @@ impl CommandQueue {
             if let Some(reply) = envelope.reply {
                 let _ = reply.send(Outcome::Cleared);
             }
+            if let Some(ticket) = envelope.oneshot {
+                ticket.send(Outcome::Cleared);
+            }
         }
         n
     }
@@ -243,6 +337,25 @@ impl CommandQueue {
         self.open_window(key)
     }
 
+    /// Open a window whose answer arrives on a tokio `oneshot` channel.
+    ///
+    /// **ESTABLISHED**: this is the sender type the binary's `Owed` holds.
+    pub fn open_window_async(&mut self, key: u32) -> oneshot::Receiver<Outcome> {
+        let (tx, rx) = oneshot::channel();
+        self.owed.push_back(Owed::open_with(
+            None,
+            Some(Oneshot::new(tx)),
+            key,
+            Instant::now(),
+        ));
+        rx
+    }
+
+    /// The same, for a command that was written in one go.
+    pub fn written_at_once_async(&mut self, key: u32) -> oneshot::Receiver<Outcome> {
+        self.open_window_async(key)
+    }
+
     /// Answer the oldest open window.
     ///
     /// **ESTABLISHED** (`0x101a0c1a4`): drops a stale front entry, then sends
@@ -256,9 +369,7 @@ impl CommandQueue {
         let outcome = Outcome::Answered(answer.clone());
         front.tag = WINDOW_TAKEN;
         front.answer = Some(answer);
-        if let Some(reply) = front.reply.take() {
-            let _ = reply.send(outcome.clone());
-        }
+        front.answer_with(outcome.clone());
         Some(outcome)
     }
 
@@ -279,9 +390,7 @@ impl CommandQueue {
         let entry = &mut self.owed[index];
         entry.tag = WINDOW_TAKEN;
         entry.answer = Some(answer.clone());
-        if let Some(reply) = entry.reply.take() {
-            let _ = reply.send(Outcome::Answered(answer));
-        }
+        entry.answer_with(Outcome::Answered(answer));
         true
     }
 
@@ -298,9 +407,7 @@ impl CommandQueue {
             }
             entry.tag = WINDOW_TAKEN;
             entry.answer = Some(answer.clone());
-            if let Some(reply) = entry.reply.take() {
-                let _ = reply.send(Outcome::Answered(answer.clone()));
-            }
+            entry.answer_with(Outcome::Answered(answer.clone()));
             answered += 1;
         }
         answered
@@ -321,7 +428,12 @@ impl CommandQueue {
     pub fn take_next(&mut self, key: u32) -> Option<Envelope> {
         self.drop_stale();
         let envelope = self.waiting.pop_front()?;
-        self.owed.push_back(Owed::open(envelope.reply.clone(), key, Instant::now()));
+        self.owed.push_back(Owed::open_with(
+            envelope.reply.clone(),
+            envelope.oneshot.clone(),
+            key,
+            Instant::now(),
+        ));
         Some(envelope)
     }
 
@@ -449,5 +561,59 @@ mod tests {
         q.answer_all(&vec!["a".to_string()]);
         assert_eq!(q.forget_answered(), 1);
         assert_eq!(q.owed(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_can_be_answered_on_a_tokio_oneshot() {
+        let mut q = CommandQueue::new();
+        let rx = q.open_window_async(7);
+        assert_eq!(q.owed(), 1);
+        assert!(q.owed_entries().next().unwrap().async_waiting());
+        let answer = vec!["You see a cart.".to_string()];
+        assert_eq!(
+            q.close_window(answer.clone()).unwrap(),
+            Outcome::Answered(answer.clone())
+        );
+        assert_eq!(rx.await.unwrap(), Outcome::Answered(answer));
+        // the ticket is spent now, and nothing is left open to answer
+        assert!(!q.owed_entries().next().unwrap().async_waiting());
+        assert!(!q.offer(vec!["x".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn a_tokio_caller_hears_about_cleared_and_answered_all() {
+        let mut q = CommandQueue::new();
+        let (tx, rx) = oneshot::channel();
+        q.admit(Envelope::with_oneshot("go north", tx));
+        assert_eq!(q.clear_waiting(), 1);
+        assert_eq!(rx.await.unwrap(), Outcome::Cleared);
+
+        // `take_next` moves the ticket onto the owed entry, and `answer_all`
+        // answers it there.
+        let (tx2, rx2) = oneshot::channel();
+        q.admit(Envelope::with_oneshot("look", tx2));
+        let taken = q.take_next(3).unwrap();
+        assert_eq!(taken.line, "look");
+        let answer = vec!["a cart".to_string()];
+        assert_eq!(q.answer_all(&answer), 1);
+        assert_eq!(rx2.await.unwrap(), Outcome::Answered(answer));
+    }
+
+    #[tokio::test]
+    async fn the_two_kinds_of_ticket_are_independent() {
+        // The synchronous and the tokio replies are separate tickets, so the
+        // same answer fires whichever of them an entry holds.
+        let mut q = CommandQueue::new();
+        let (std_tx, std_rx) = channel();
+        let (async_tx, async_rx) = oneshot::channel();
+        q.admit(Envelope::with_reply("one", std_tx));
+        q.admit(Envelope::with_oneshot("two", async_tx));
+        // both commands are written, so both tickets are owed an answer
+        q.take_next(0).unwrap();
+        q.take_next(0).unwrap();
+        let answer = vec!["done".to_string()];
+        assert_eq!(q.answer_all(&answer), 2);
+        assert_eq!(std_rx.try_recv().unwrap(), Outcome::Answered(answer.clone()));
+        assert_eq!(async_rx.await.unwrap(), Outcome::Answered(answer));
     }
 }

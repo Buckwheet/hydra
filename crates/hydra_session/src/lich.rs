@@ -77,6 +77,15 @@
 //! **std-only departures**: `tokio::sync::mpsc::{Sender,Receiver}` →
 //! `std::sync::mpsc`; `Arc<Mutex<…>>` stays.
 //!
+//! **Phase 1**: the door now carries the real `tokio::sync::mpsc` channels too.
+//! [`Tap`] can hold either a `std::sync::mpsc::Sender` (the synchronous
+//! [`LichDoor::claim`], unchanged) or a `tokio::sync::mpsc::Sender` (the new
+//! [`LichDoor::claim_async`], with the recovered capacities [`LINES`] and
+//! [`TYPED`]); [`Tap::send`] prefers the tokio end when both are installed, and
+//! a full or closed tokio channel trips the same "fell behind" flag a failed
+//! `mpsc` send does.  The synchronous `Claim` is kept because that is the shape
+//! `hydra_lich`'s relay and this crate's tests use.
+//!
 //! The token and password handshake live in `hydra_lich` (`new_token` produces
 //! the 64-character token; `--pipe` makes Lich listen on `127.0.0.1:<port>`);
 //! this crate only carries the door.  See `NOTES.md` §"Lich door contract".
@@ -89,6 +98,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tokio::sync::mpsc as tokio_mpsc;
 
 /// How many lines the door buffers coming *from* Lich
 /// (**ESTABLISHED**: `Semaphore::new(0x1000)` in `LichDoor::claim`).
@@ -143,6 +153,12 @@ impl Wire {
 pub struct Tap {
     /// where lines go
     pub tx: Sender<String>,
+    /// the tokio end, when the relay was claimed with
+    /// [`LichDoor::claim_async`]; it wins over `tx` when it is installed
+    pub tx_async: Option<tokio_mpsc::Sender<String>>,
+    /// the receiver that keeps `tx` alive on a tokio tap (so the `std` end is
+    /// a working channel rather than a dead one)
+    pub keep: Option<Receiver<String>>,
     /// the "fell behind" flag for this tap
     pub wire: Wire,
     /// whether this tap takes the player's typing
@@ -156,6 +172,26 @@ impl Tap {
     pub fn new(tx: Sender<String>) -> Self {
         Tap {
             tx,
+            tx_async: None,
+            keep: None,
+            wire: Wire::new(),
+            typing: false,
+            waiting: false,
+        }
+    }
+
+    /// A tap that sends on a tokio channel.
+    ///
+    /// **ESTABLISHED** channel capacities: [`LINES`] for what Lich sends back
+    /// and [`TYPED`] for what the player types.  A `std` sender is still
+    /// created (and its receiver kept by the slot) so the `tx` field stays a
+    /// real channel; `tx_async` is what `send` uses.
+    pub fn async_(tx: tokio_mpsc::Sender<String>) -> Self {
+        let (plain, rx) = channel();
+        Tap {
+            tx: plain,
+            tx_async: Some(tx),
+            keep: Some(rx),
             wire: Wire::new(),
             typing: false,
             waiting: false,
@@ -174,8 +210,19 @@ impl Tap {
         self
     }
 
-    /// Send one line; `false` when the other end is gone.
+    /// Send one line; `false` when the other end is gone or full.
+    ///
+    /// **ESTABLISHED** (`0x101a88070`): the original does `try_acquire(1)` on
+    /// the channel's semaphore and then sends, so a full channel counts as a
+    /// failed send; a tokio `try_send` is the same test.
     pub fn send(&self, line: &str) -> bool {
+        if let Some(tx) = &self.tx_async {
+            if tx.try_send(line.to_string()).is_err() {
+                self.wire.begin();
+                return false;
+            }
+            return true;
+        }
         if self.tx.send(line.to_string()).is_err() {
             self.wire.begin();
             return false;
@@ -197,6 +244,8 @@ pub struct SlotState {
     pub pending: Vec<String>,
     /// where the relay pushes the lines Lich sends back
     pub lines: Option<Receiver<String>>,
+    /// the same, for a relay claimed with [`LichDoor::claim_async`]
+    pub lines_async: Option<tokio_mpsc::Receiver<String>>,
 }
 
 /// The current Lich slot for a session.
@@ -327,9 +376,22 @@ impl Slot {
     }
 
     /// Take the next line the relay pushed, if there is one.
+    ///
+    /// Both ends are tried: the synchronous channel [`LichDoor::claim`] installs
+    /// and the tokio channel [`LichDoor::claim_async`] installs.
     pub fn take_line(&self) -> Option<String> {
-        let state = self.state();
-        state.lines.as_ref()?.try_recv().ok()
+        let mut state = self.state();
+        if let Some(rx) = state.lines.as_ref() {
+            if let Ok(line) = rx.try_recv() {
+                return Some(line);
+            }
+        }
+        if let Some(rx) = state.lines_async.as_mut() {
+            if let Ok(line) = rx.try_recv() {
+                return Some(line);
+            }
+        }
+        None
     }
 
     /// The typed lines that could not be handed over.
@@ -394,6 +456,18 @@ pub struct Claim {
     pub wire: Wire,
 }
 
+/// What [`LichDoor::claim_async`] hands back: the same two ends, on tokio
+/// channels with the recovered capacities ([`LINES`] and [`TYPED`]).
+#[derive(Debug)]
+pub struct AsyncClaim {
+    /// lines Lich sent back (push these; the door parses them)
+    pub lines: tokio_mpsc::Sender<String>,
+    /// typed lines for Lich (take these and write them to the child's stdin)
+    pub typed: tokio_mpsc::Receiver<String>,
+    /// the "fell behind" flag for the mirrored stream
+    pub wire: Wire,
+}
+
 /// The door the Lich relay talks to.
 ///
 /// **ESTABLISHED**: every method forwards to the session handle (the binary
@@ -437,6 +511,33 @@ impl LichDoor {
         }
         drop(slot);
         Claim {
+            lines: line_tx,
+            typed: typed_rx,
+            wire,
+        }
+    }
+
+    /// Open the relay on tokio channels.
+    ///
+    /// **ESTABLISHED** (`0x101a88960`): the same two channels with the same
+    /// capacities, but the real `tokio::sync::mpsc` types the binary used, so a
+    /// relay task can `recv().await` on the typed end and `send(..).await` on
+    /// the line end.
+    pub fn claim_async(&self) -> AsyncClaim {
+        let (line_tx, line_rx) = tokio_mpsc::channel::<String>(LINES);
+        let (typed_tx, typed_rx) = tokio_mpsc::channel::<String>(TYPED);
+        let mut slot = self.session.slot();
+        slot.close();
+        slot.set_wire(Tap::async_(typed_tx.clone()).waiting_for());
+        slot.set_hand(Tap::async_(typed_tx).taking_typing());
+        let wire = slot.wire_flag().unwrap_or_default();
+        {
+            let mut state = slot.state();
+            state.lines_async = Some(line_rx);
+            state.session_over = false;
+        }
+        drop(slot);
+        AsyncClaim {
             lines: line_tx,
             typed: typed_rx,
             wire,
@@ -788,5 +889,46 @@ mod tests {
         accept_keyed(&mut wire, token).unwrap();
         assert_eq!(wire.into_inner(), format!("{token}\n").into_bytes());
         assert_eq!(ACCEPT_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn the_async_claim_carries_typed_lines_on_a_tokio_channel() {
+        let s = session();
+        let door = s.lich_door();
+        let mut claim = door.claim_async();
+        assert!(s.lich_running());
+        assert!(s.lich_takes_typing());
+        assert!(!door.session_over());
+        // typed lines arrive on the tokio receiver, in order
+        assert!(s.to_lich("hello"));
+        assert!(s.to_lich("again"));
+        assert_eq!(claim.typed.recv().await.unwrap(), "hello");
+        assert_eq!(claim.typed.recv().await.unwrap(), "again");
+        // lines Lich sends back are seen by the door
+        claim.lines.send("back".to_string()).await.unwrap();
+        assert_eq!(door.poll().as_deref(), Some("back"));
+        assert_eq!(door.poll(), None);
+        assert!(!door.fell_behind());
+        // the tokio channels have the recovered capacities
+        assert_eq!(claim.lines.max_capacity(), LINES);
+        assert_eq!(claim.typed.max_capacity(), TYPED);
+    }
+
+    #[tokio::test]
+    async fn a_full_tokio_channel_trips_the_fell_behind_flag() {
+        let s = session();
+        let door = s.lich_door();
+        let claim = door.claim_async();
+        // The typed channel holds TYPED lines; one more is refused, which is
+        // the recovered `try_acquire` failure.
+        let mut sent = 0;
+        while s.to_lich("line") {
+            sent += 1;
+            assert!(sent <= TYPED, "the channel took more than its capacity");
+        }
+        assert_eq!(sent, TYPED, "the typed channel holds exactly TYPED lines");
+        // Dropping the reader makes every later hand fail too.
+        drop(claim);
+        assert!(!s.to_lich("after"));
     }
 }

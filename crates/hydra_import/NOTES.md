@@ -22,6 +22,36 @@ Legend:
 
 ---
 
+## 0. Phase 1: dependency reconnection — this crate is a **no-op** for it
+
+`hydra_import` has no std stand-in to replace, and no registry dependency to
+reconnect.  That is a checked finding, not a copy of §3: the call graph of all
+six recovered functions was re-read out of the binary for this phase
+(`recon.py disas 'hydra_import::<fn>$'`, every `bl` target listed).  Each target
+is
+
+* `core`/`alloc`/`std` — `str::trim_matches`, `str::pattern::StrSearcher::new`,
+  `str::converts::from_utf8`, `str::split_once`, `slice::memchr::
+  {memchr_aligned,memrchr}`, `slice::sort::{driftsort_main,insert_tail,
+  sort4_stable,median3_rec}`, `fs::read_dir`, `DirEntry::path`, `Path::{is_dir,
+  extension,file_stem,to_path_buf,components}`, `path::compare_components`,
+  `raw_vec::{grow_one,try_allocate_in,handle_error}`, `__rust_alloc`,
+  `__rust_alloc_zeroed`, `__rust_dealloc`, `panic*`/`slice_error_fail`,
+* one of this crate's own six symbols, or
+* `hydra_net::gemstone::endpoint::instance` (`0x101c44af8`) — the original's
+  only sibling call.
+
+No `tokio`, `serde`, `regex`, `jiff`, `reqwest`, `tracing` or `anyhow` symbol is
+reachable, so no `x = { workspace = true }` line was added: `Cargo.toml` still
+names `hydra_net` as the crate's only dependency, and pulling a pinned crate in
+here would invent a dependency the original never had.  `crate_versions.txt`
+lists no entry for this crate either (it lists registry crates only).
+
+What this phase *did* fix is the one functional gap noted in §4 — the sibling
+endpoint table — plus the coverage listed in §6.
+
+---
+
 ## 1. Function table
 
 | function | address | size | recovered signature |
@@ -81,6 +111,32 @@ returning the **second** `&str` of a static 0x20-byte record
 `0x1044a8680`/`0x1044a86a0`/`0x1044a86c0` are `("GS3","Prime")`,
 `("GSF","Shattered")`, `("GST","Test")`, so the original returned the *display
 name*, not the code.
+
+**Phase 1 re-verification** (same binary, `recon.py bytes 0x1044a8680 96` and
+`recon.py str`):
+
+* the three records hold `ptr/len` pairs `0x103bf962d/3`, `0x103bf9630/5`;
+  `0x103bf9635/3`, `0x103bf9638/9`; `0x103bf9641/3`, `0x10213f868/4`, which
+  read back as `"GS3" "Prime" "GSF" "Shattered" "GST"` (one contiguous run
+  `GS3PrimeGSFShatteredGST` at `0x103bf962d`) and `"Test"` at `0x10213f868` —
+  the three rows above are exact, stride `0x20`, and nothing else is in the
+  table;
+* the three compares are the only ones in the function, each guarded by
+  `cmp x1, #0x3` and the `sub w, w, #0x41 / cmp #0x1a / csel w8, #0x20, wzr, lo`
+  lowercasing idiom, and the fall-through is `mov x0, #0x0` (`0x101c44c7c`),
+  i.e. `None`.  There is **no `GS4` row**: the original spelled `GS4`
+  recordings through the `<app game="GS4">` path of `instance_of`, not through
+  this table.
+
+**Conflict with the sibling crate (unresolved by design).**  The workspace's
+`crates/hydra_net/src/gemstone/endpoint.rs` reconstructs `instance` differently:
+it returns `Option<&'static Endpoint>` from a *host/port* table and matches the
+`game` field, so it answers for `GS4`/`GS3` and returns `None` for `GST`/`GSF`.
+That cannot produce the display names and is not what `0x101c44af8` does.
+`hydra_net` belongs to another phase and was **not** edited here; instead
+`instance_of` applies the three recovered rows itself (`display_name`, private,
+ESTABLISHED) and consults the sibling only for a code the table did not name —
+see §4 row 1 for the one resulting superset (`GS4`).
 
 ### 1.2 `attribute_of` — pull one attribute out of one element (ESTABLISHED)
 
@@ -301,13 +357,18 @@ calls `hydra_net::gemstone::endpoint::instance`, exactly as the original did
 (`std::path`, `std::fs`, `Vec`, `String`); the original used no async, no `serde`
 and no regex in these six functions.
 
+Phase 1 verified this from the call graph instead of trusting the note: every
+`bl` target of the six functions is `core`/`alloc`/`std`, one of the crate's own
+symbols, or that one sibling call — no registry crate is reachable (§0).  So the
+dependency set is unchanged and **no** `x = { workspace = true }` line was added.
+
 ---
 
 ## 4. Departures
 
 | original | here |
 | --- | --- |
-| `endpoint::instance(&str) -> Option<&'static str>` returning the *display name* (`"Prime"`, `"Shattered"`, `"Test"`) | the workspace's recovered `hydra_net::gemstone::endpoint::instance` returns `Option<&'static Endpoint>` (host/port/game) and only knows `GS4`/`GS3`.  `instance_of` still calls it, then maps the code through the three recovered `(code, name)` rows and falls back to `endpoint.game`.  Consequence: `instance="GS3"` → `"Prime"` (same as the original), `instance="GST"` → `None` (the original returned `"Test"`) because the sibling table lacks it. |
+| `endpoint::instance(&str) -> Option<&'static str>` returning the *display name* for exactly `gs3`/`gsf`/`gst` and `None` for anything else | **only the fallback is a departure now.**  `instance_of` applies the three recovered rows itself (`display_name`, ESTABLISHED, §1.1) and returns `"Prime"`/`"Shattered"`/`"Test"` exactly as the original did — this was the Phase 1 fix, `GST` no longer answers `None`.  For a code the table did not name it still calls the sibling `hydra_net::gemstone::endpoint::instance`, whose `game` is returned verbatim: `instance="GS4"` → `Some("GS4")` where the original answered `None` (the original spelled GS4 recordings through the `<app game="GS4">` path).  That superset is kept because the sibling table is the only recovered source for GS4, and it disappears if that table is ever corrected to the binary's shape; `hydra_net` was not edited here. |
 | `name_of` slices `&stem[dash-19..dash]` unconditionally and panics via `core::str::slice_error_fail` on a non-char-boundary | `str::get` returns `None` instead — same result for every name whose bytes are ASCII at those offsets, no panic |
 | `Attribute`/`Session` type and field names, `name_of`'s return type | UNKNOWN; `Session { name, stamp, files, prefix }` and the tuple `(name, prefix, stamp)` are descriptive |
 
@@ -331,19 +392,42 @@ and no regex in these six functions.
   (only the four stubs plus their two helpers were requested).  Their literals
   are listed in §2 for context.
 
+### 5.1 Cross-crate conflict, left open in Phase 1
+
+Both this crate and `hydra_net` reconstruct the same symbol,
+`hydra_net::gemstone::endpoint::instance` (`0x101c44af8`), and disagree:
+`hydra_net/src/gemstone/endpoint.rs` matches a host/port table and returns
+`Endpoint { host, port, game }` for `GS4`/`GS3`, while the disassembly in §1.1
+shows three `&str` rows (`GS3`/`GSF`/`GST` → `Prime`/`Shattered`/`Test`) and
+`None` otherwise.  This phase was told to leave `hydra_net` untouched, and
+`hydra_import`'s behaviour no longer depends on the sibling for those three
+codes.  Whoever next owns `hydra_net` should re-read `0x101c44af8` and, if they
+agree with §1.1, restore the display-name signature; `hydra_import`'s
+`display_name` helper (and the `GS4` superset in §4) can then be deleted.
+`hydra_net`'s host/port knowledge is real, it just belongs to
+`endpoint::other_spelling` (`0x101c447b4`), not to `instance`.
+
 ---
 
 ## 6. Tests
 
-`cargo test -p hydra_import` runs 21 unit tests, all asserting recovered values:
+`cargo test --offline -p hydra_import` runs 25 unit tests, all asserting
+recovered values:
 
 * `attribute_of`: first `<app …>` wins and stops at the closing quote; missing
   tag / attribute / `>` / closing quote / empty text all give `None` (6 cases in
-  2 tests).
+  2 tests); any character after the attribute name is the quote — `|`, `*` and
+  a two-byte `§` all delimit a value (added in Phase 1, ESTABLISHED from the
+  UTF-8 decode at `0x100263c28..0x100263c8c`).
 * `instance_of`: `<app game="GS4" …>` → `"GS4"`; `game=""` falls through to
   `<settingsInfo instance="GS3">` → `"Prime"`; `" gs3 "` trims and resolves;
-  unknown code, unknown tag and plain text → `None`; `GST`/`GSF` documented as
-  the sibling-table departure.
+  unknown code, unknown tag and plain text → `None`.
+* `instance_of` table (Phase 1): all three recovered rows resolve, case-folded
+  and padded (`GS3`/`gs3`/`" gs3\t"` → `"Prime"`, `GSF`/`gsf` → `"Shattered"`,
+  `GST`/`" GST "`/`gst` → `"Test"`); `display_name` is checked to know only the
+  three *whole* three-byte codes (`""`, `GS`, `GS4`, `GSTX`, `GS3 `, ` GSF`,
+  `gs4`, `Test` → `None`, so trimming stays `instance_of`'s job); and the one
+  superset is locked in — `instance="GS4"` → `Some("GS4")` (§4 row 1).
 * `name_of`: full split (`Vaalor_GS4-2024-03-10_10-04-59-000.bytes` →
   `("GS4", Some("Vaalor"), "2024-03-10_10-04-59")`); no `_` in the prefix;
   2-digit / 4-digit / alphabetic counters rejected; missing or misplaced `_` in

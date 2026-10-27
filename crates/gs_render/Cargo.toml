@@ -2,3 +2,14 @@
 name = "gs_render"
 version = "0.0.0"
 edition = "2021"
+
+# `gs_base` is already recovered on main and provides the two leaf helpers this
+# crate demonstrably calls from the binary:
+#   * `gs_base::body::part_label`   (`bl` at 0x1008f4610, 0x1008fe3f8, ...)
+#   * `gs_base::status::Statuses`   (`has_name` / `resolved`, bl at 0x1008f41b4 ...)
+#
+# `gs_puppet` is deliberately *not* a dependency: its recovered `SplatParams`
+# does not exist on main yet, so a path dependency would break this crate's
+# gate.  See `NOTES.md` section "Integration gap" for the seam that replaces it.
+[dependencies]
+gs_base = { path = "../gs_base" }

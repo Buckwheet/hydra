@@ -15,8 +15,10 @@ this file that is not about the recovered binary.
 The original linked `tokio`, `tokio-rustls`, `rustls`, `reqwest`,
 `tokio-tungstenite`, `jiff`, `regex`, `base64` and `url`.  Of those, `tokio`,
 `tokio-tungstenite`, `reqwest`, `jiff`, `regex` and `base64` are reconnected here
-at the workspace-pinned versions (see §3); `tokio-rustls`/`rustls`, `url` and
-`tracing` are *not* workspace pins, so their stand-ins stay and are documented.
+at the workspace-pinned versions (see §3); `rustls` itself is used directly by
+the Phase 6 eaccess login (synchronously, see §6) at the already-fetched
+`=0.23.46`, while `tokio-rustls`, `url` and `tracing` are *not* workspace pins,
+so their stand-ins stay and are documented.
 
 Legend:
 
@@ -405,15 +407,16 @@ workspace's `hyper-util` pin.
 
 | original | here | why |
 | --- | --- | --- |
-| `tokio-rustls` + `rustls` | `LiveSource::peer_certificate_der` carries the DER the TLS layer handed over; no TLS client is built here | not in the workspace pins, and the registry has no `tokio-rustls` at all.  `gemstone::shim::shim_over` therefore takes an already-established stream, which is exactly the seam the original's `ws_to_io` sat on |
+| `tokio-rustls` (async TLS) | `LiveSource::peer_certificate_der` carries the DER the TLS layer handed over; the Phase 6 eaccess client uses **synchronous** `rustls` directly (§6), not `tokio-rustls` | `tokio-rustls` is not in the workspace pins or the offline registry.  `gemstone::shim::shim_over` therefore takes an already-established stream, which is exactly the seam the original's `ws_to_io` sat on |
 | `url` | string splitting (`shim_host`, `next_hop`, the scrape helpers) | not in the workspace pins.  `reqwest` re-exports `url::Url`, but using it would be using the unpinned crate through a side door |
 | `tracing` | the recovered literal text, returned instead of logged | not in the workspace pins; no sibling crate logs yet |
 | `futures-util` (`StreamExt`/`SinkExt`) | not used: `shim_over`/`shim_plain` return the `WebSocketStream` and leave the frame pump to the caller | not in the workspace pins, and it is the one thing needed to drive frames.  **Integration risk**: whoever writes the relay needs it pinned (or a `send`/`recv` helper added once it is) |
 | `jiff::SignedDuration` in `sink::config::stamp_ago` | the arrangement is text, built from the recovered format strings | `jiff` is pinned now, so this can be converted; it was left alone because the exact arrangement is UNKNOWN (§5) and converting it would encode a guess |
 | `socket2`-style TCP keepalive (`live`) | `TCP_NODELAY` only, and the keepalive warning text stays a documented helper | `std` has no keepalive knob, and `socket2` is not a workspace pin |
 
-No sibling Hydra crate is a dependency: nothing here needs `hydra_protocol` or
-`gs_base`, so there is no cycle.
+No sibling Hydra crate is a normal dependency: nothing here needs
+`hydra_protocol` or `gs_base`, so there is no cycle.  `hydra_mocks` is a
+dev-dependency only (the Phase 6 loopback login tests).
 
 ---
 

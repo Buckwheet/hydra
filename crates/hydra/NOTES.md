@@ -217,8 +217,9 @@ From `main`, `gui::run` is reached two ways: no arguments at all
 * The unit test `the_gui_subcommand_builds_the_recovered_hub_window` asserts the
   built plan (`"Hydra"`, 660 × 520, `Renderer::Wgpu`, 256 × 256 RGBA icon)
   **without** launching: `gui_launch` is split out of `gui` for exactly that.
-  `serve` and `play`/`login` remain unwired (they need the connection, not the
-  window).
+  `serve` remains Lich-only and `play`/`login` are wired through the Phase 6
+  login, but none of them is the window's session plumbing yet (that needs the
+  connection and the board's `Sessions`, not the window).
 
 ### 5.3 `hydra::instance::claim` (`0x1001142d4`) — the single-instance protocol
 
@@ -313,19 +314,22 @@ commands themselves live in `hydra_session::lich_command` (see
 | `start(&plan)` | `hydra_lich::relay::start_keyed_minted(&Launch::new(ruby, folder/lich.rbw))`: bind loopback, spawn `ruby -e … -e … <folder>/lich.rbw --pipe --stormfront --sentinel -g 127.0.0.1:<port>`, write the two-line stdin handshake, accept the keyed connection (`docs/LICH_WIRE.md` §1-2). Its failure paths kill and reap the child, so a refused start leaves no orphan. |
 | `announce(&plan, out)` | the two recovered start lines, on stdout: `Lich is at <dir>, for every character.` then `Lich is starting, from <dir>\lich.rbw.` — the message keeps the literal backslash of the Windows reference build while the path spawned is `<dir>/lich.rbw` on this platform (`lich_command::script_path`). |
 | `relay(&mut keyed, out, session)` | print Lich's stdout lines through `hydra_lich::wire::LichOut` (so the 0x1F chunk byte is stripped) until `Relay::pump` reports the child gone, or until the session stops (`SessionHandle::stopping`, the recovered cancellation token), which kills and reaps Lich first. Returns Lich's exit status. |
-| `off_message(label)` | what `play`/`serve` say when `.lich` is off — this phase has no game connection, so it says so instead of doing nothing. |
+| `relay_game(&mut keyed, &mut game, out, session)` | Phase 6's two-way relay: Lich's stdout through `LichOut`, game lines to Lich's accepted socket, Lich's `<c>`/bare frames back to the game, until the child or the game ends. Used by `play`; `serve` still calls the Lich-only `relay`. |
+| `off_message(label)` | what `play`/`serve` say when `.lich` is off. The sentence is the Phase 3 text and still says "no game connection": that is exactly true of `serve`, and is kept verbatim for `play` rather than paraphrasing a recovered string. |
 | `character_of(tokens)` | the character a `play`/`serve` command line names: the first word that is neither an option nor an option's value (`VALUE_OPTIONS` is `--account`/`--game`/`--in`/`--web`; `--detach` takes none). |
 
-`main`'s `run` sends `Command::Play` and `Command::Serve` through
+`main`'s `run` sends `Command::Play` through `login::play` (Phase 6: settings
+gating, login, Lich start, announce, `relay_game`) and `Command::Serve` through
 `lich_side(label, character, settings)` (the settings are an argument, so the
 unit tests drive every branch without the filesystem): off → `off_message` on
 stderr, exit 1; a refusal → that sentence on stderr, exit 1; otherwise start,
-announce, relay, exit 0. `Command::Login`, the bare hub, `import` and
-`lookout seed` are unchanged and still report what they need.
+announce, relay, exit 0. `Command::Login` is `login::login`; the bare hub,
+`import` and `lookout seed` are unchanged and still report what they need.
 
-**Not wired, deliberately:** nothing is ever written to the accepted socket and
-Lich's own `<c>`/bare command lines are never read back, because there is no
-game to relay them to. `--detach`/`--web`/`--in` for `serve` are still ignored.
+**Not wired, deliberately:** `serve` never writes to the accepted socket and
+never reads Lich's `<c>`/bare command lines back, because it has no game
+connection to relay them to (`play` does both through `relay_game`).
+`--detach`/`--web`/`--in` for `serve` are still ignored.
 
 ## 7. `hydra replay` — the report
 

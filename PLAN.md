@@ -1,8 +1,10 @@
 # Hydra reconstruction: plan
 
-State (2026-10-27): all 25 crates recovered from the binary symbols/disassembly as std-only code (2111 tests green).
-Not yet a real app: tokio/serde/egui/wgpu replaced by std stand-ins or no-op seams; keyed-accept handshake guessed.
-Local research only. Reference data: ~/Code/hydra-inspect/{hydra, symbols_demangled.txt, crate_versions.txt}.
+State (2026-10-27, after Phase 6): the crates are reconnected to the real dependencies (tokio/serde/egui/wgpu,
+plus rustls for the login), the Lich keyed accept is the observed one, and `hydra login`/`play` run against local
+mock eaccess/game servers (`cargo test --workspace --offline`: 2755 tests green). Still not tested against a real
+account or game server; `serve` is Lich-only. Local research only.
+Reference data: ~/Code/hydra-inspect/{hydra, symbols_demangled.txt, crate_versions.txt}.
 
 ## Phase 1: reconnect the real dependencies (DeepSeek loop, off-peak)
 Goal: replace each std stand-in with the crate the original used, at the version recorded in crate_versions.txt.

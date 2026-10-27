@@ -14,7 +14,9 @@ is the ground truth (one live capture of Hydra v0.1.0-beta.7 driving Lich
 5.22.0), and §2/§3.2/§3.3 here record what it resolved and what it left open.
 The wire constants, the two-line stdin handshake, the **server-side** keyed
 accept, the `<c>`/bare command framing and the 0x1F stdout chunk prefix live in
-`crate::wire`; `relay::start_keyed` runs the whole sequence.
+`crate::wire`; `relay::start_keyed` runs the whole sequence.  The handshake is
+proved end to end on loopback by the synthetic `fake_lich` helper (§5.1), with
+no Ruby and no captured game text.
 
 Legend:
 * **ESTABLISHED** — directly visible in the disassembly/strings.
@@ -583,4 +585,69 @@ Checked against the current snapshot (`crates/hydra_session/src/lich.rs`,
   text): good handshake streams both ways, and a wrong token or a wrong
   client line is refused with the child killed and reaped (checked with
   `kill -0`).
+
+### 5.1 The `fake_lich` helper and the loopback integration tests
+
+`crates/hydra_lich/tests/bin/fake_lich.rs` is a **synthetic** Lich stand-in,
+declared as a real bin target (`[[bin]] name = "fake_lich"`) so that
+`crates/hydra_lich/tests/loopback.rs` reaches it through
+`env!("CARGO_BIN_EXE_fake_lich")`.  It is invented end to end: no Ruby, no Lich
+install, no game connection and **no captured game text** — every line it
+sends is synthetic.  It also does not link this crate: the wire literals are
+re-stated, so a bug in `hydra_lich` cannot make the fake agree with itself.
+
+CLI contract (exactly what `relay::build_command` produces):
+
+    fake_lich -e <ruby prelude> -e '$0 = ARGV.shift; load $0' <lich.rbw> \
+              --pipe --stormfront --sentinel -g 127.0.0.1:<port> [extra...]
+
+* both `-e <code>` pairs are skipped (flag *and* value), as are the `lich.rbw`
+  path and the `--pipe/--stormfront/--sentinel` flags;
+* `-g 127.0.0.1:<port>` (or `-g<value>`) is parsed; only loopback hosts are
+  accepted, so the helper never talks off-box;
+* exit `0` when the socket closes, `1` when it cannot be reached/written, `2`
+  when argv has no usable `-g` or stdin has no handshake.
+
+Environment seams (negative tests only):
+
+| variable | effect |
+| --- | --- |
+| `FAKE_LICH_TOKEN` | send this token on the socket instead of the one read from stdin |
+| `FAKE_LICH_CLIENT` | send this client-identification line instead of the stdin one |
+| `FAKE_LICH_PID_FILE` | write its pid there first thing, so a test can assert the child was reaped |
+
+Behaviour, which is the Lich half of `docs/LICH_WIRE.md`: read the two stdin
+handshake lines, connect to `-g`, send `<token>\n<client line>\n` and then one
+synthetic Lich-originated `<c>exp\n`; forward further stdin lines to the socket
+as *bare* lines (`look\n`); echo every socket line to stdout as front-end
+output prefixed with 0x1F and ended `\r\n`, while its own banner stays
+unprefixed; exit as soon as the socket closes, so no test waits on a parked
+child.
+
+`cargo test -p hydra_lich --test loopback` runs four loopback scenarios, each
+with a synthetic `lich.rbw` in a temp folder (removed on drop) and bounded
+waits throughout:
+
+1. **good handshake** — `start_keyed` accepts (which by itself proves both
+   channels: the fake redeems the token/client line it read on *stdin*);
+   `send_game` reaches Lich and comes back on the relay's stdout as the same
+   text with no 0x1F byte, after the fake's unprefixed banner; the socket then
+   yields `LichFrame::Command("exp")` for the `<c>` command and
+   `LichFrame::Bare("look")` for a typed-through line.
+2. **refused handshakes** — `FAKE_LICH_TOKEN` -> `PermissionDenied`,
+   `FAKE_LICH_CLIENT` -> `InvalidData`; both return well under the 60-second
+   accept deadline, never leak the token, and leave no child behind
+   (`kill -0` on the `FAKE_LICH_PID_FILE` pid).
+3. **typed `look`** — written through `KeyedRelay.relay.send("look")`, it
+   arrives on the socket as `LichFrame::Bare("look")`, after the fake's own
+   `<c>exp`.
+4. **0x1F chunks** — the fake prefixes its echoes with 0x1F: the relay's line
+   receiver yields the text without the byte, and `read_lich_out` over the same
+   child classifies the banner as `LichOut::Own` and the echo as
+   `LichOut::Game`, i.e. the prefix was really on the wire and was stripped.
+
+Only loopback sockets and short timeouts are involved, so the suite needs no
+network, no Ruby and no privileges; the child is always reaped (either by the
+failed handshake, by `Relay::drop`, or by the test's own `wait_for_exit`).
+
 

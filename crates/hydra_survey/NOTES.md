@@ -5,9 +5,16 @@ Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hy
 `todo!()` stubs over three files; this build has none
 (`grep -Rn 'todo!\|unimplemented!' crates/hydra_survey/src` is empty) and
 
-* `cargo check -p hydra_survey` — clean, no warnings
-* `cargo test -p hydra_survey` — **36 tests pass**
+* `cargo check --offline -p hydra_survey` — clean, no warnings
+* `cargo test --offline -p hydra_survey` — **50 tests pass**
 * `cargo check --workspace` — clean (no other crate was touched)
+
+**Phase 1 is done for this crate:** `serde` 1.0.229 and `serde_json` 1.0.151 are
+real dependencies again (workspace pins, `--offline`), the log schema is the
+derived one the binary carries, and the hand-written `json` reader is gone. See
+["Phase 1 reconnection"](#phase-1-reconnection) for what came back, what changed
+and the two places where the recovered *API* and the recovered *schema* had to
+be reconciled explicitly.
 
 ---
 
@@ -183,10 +190,21 @@ offsets ⇒ 0x30 bytes). *Not* `to`/`rt`: those strings exist for `EdgeRecord`.
 
 ### `VerbRecord`, `EdgeRecord`, `EventRecord`
 
-* `VerbRecord` (0x48 bytes as far as the drop shows): `String@+0x00` (`sid`),
-  `String@+0x18` (`verb`), `Vec<String>@+0x30` (`lines`); `rt`, `cast_rt` and
-  `prompt_closed` own no allocation. **UNKNOWN:** their exact primitives — read
-  as `f64`, `f64`, `bool` here (the only evidence is "drop-free, ≥8 bits").
+* `VerbRecord` — 96 bytes: `String@+0x00` (`sid`), `String@+0x18` (`verb`),
+  `Vec<String>@+0x30` (`lines`), then the two roundtimes as 8-byte slots at
+  `+0x48` (`rt`) and `+0x50` (`cast_rt`) and `prompt_closed` as the byte at
+  `+0x58` — the visitor's epilogue copies the whole record with
+  `ldp q0,q1,[x24]` / `ldp q0,q1,[x24,#0x20]` / `ldp q2,q3,[x24,#0x40]` and
+  stores the tail with `stp d8, d9, [x24, #0x48]` and `strb w8, [x24, #0x58]`
+  (`0x1013bc604`, `0x1013bc608`). The field arms call
+  `deserialize_string` ×4, `deserialize_seq` ×2 (`lines`) and — decisive for
+  the tail — `Option::<T>::deserialize` twice (`0x1013cc7d4`) plus
+  `bool::deserialize` once (`0x1013c9acc`). Which of the four string arms is
+  `sid`, which `verb` and which an `Option`'s inner `visit_some` cannot be told
+  apart in the inlined body; that the two roundtimes are optional can.
+  **UNKNOWN:** the element type of the two `Option`s (a float, judging by the
+  8-byte slots; our public fields are `f64`). See [`log::VerbRecord`] and
+  "Phase 1 reconnection".
 * `EdgeRecord` (fits in `Body`'s 0x80-byte payload): two `String`s
   (`from@+0x00`, `cmd@+0x18`), a `Vec<String>` (`lines@+0x30`), two
   `Option<String>` (`to@+0x48`, `dir@+0x60`) and the drop-free `rt`/`result`.
@@ -215,8 +233,8 @@ and the tag-0 branch of `Graph::from_records` reads a pointer at record
 | item | addr | status | notes |
 |---|---|---|---|
 | `read` | `0x1013c2878` | **full** | `fn read(&str) -> Result<Vec<Record>, String>`. `OpenOptions::_open` → on error `format!("{}: {}", path, error)` (`0x103e697be` holds the pieces `0xC0 0x02 ": " 0xC0`) → `rust_alloc(8192)` for a `BufReader` → `Lines::next` (`0x1013cc6e8`) and `SpecFromIterNested::from_iter` (`0x1013b4324`) into a `Vec<Record>`; only the open failure writes the `Err` discriminant, so line and parse errors are dropped. |
-| `parse` (added) | — | **new** | The original's per-line step was `serde_json::from_str` (`serde_json::de::from_trait::<Record>` at `0x1013c6f50`), inlined into `read`. Exposed for tests and for callers that keep their own I/O. |
-| `json` module (added) | — | **new** | Hand-rolled replacement for `serde_json`; see "Departures". |
+| `parse` (added) | — | **new** | The original's per-line step was `serde_json::from_str` (`serde_json::de::from_trait::<Record>` at `0x1013c6f50`), inlined into `read`. Exposed for tests and for callers that keep their own I/O. Since Phase 1 it *is* that call; failures are serde's message (`… at line 1 column N`). |
+| `json` module (added) | — | **new** | Was the hand-rolled replacement for `serde_json`; since Phase 1 a thin alias over it (`pub use serde_json::{Error, Map, Number, Value}` + `parse`). See "Departures". |
 
 ### `graph`
 
@@ -256,19 +274,18 @@ Callers: the only code in the binary that uses this crate is
 
 ## Departures from the original
 
-1. **`serde`/`serde_json` replaced by `std`.** The original derived `Deserialize`
-   over the nine types; this build has [`json`] (a ~450-line reader) and
-   hand-written field readers in [`log`] that use the *recovered* names, order
-   and types. Consequences worth knowing:
-   * unknown keys are ignored (as serde's default);
-   * a missing required field reports `missing field \`x\``, a wrong variant
-     reports `unknown variant \`x\`, expected one of …`;
-   * numbers are accepted where a `String` field expects text (the log writes
-     some ids bare) — serde would have rejected those;
-   * `Option<T>` fields accept `null` *and* absence.
-2. **No `serde_json::Error`.** `read` returns `Result<Vec<Record>, String>` (the
-   stub's caller shape) and drops per-line failures, exactly as the binary does;
-   the only error path is the file open.
+1. ~~**`serde`/`serde_json` replaced by `std`.**~~ **Reconnected in Phase 1** —
+   see the next section. The hand-written `json` reader and the hand-written
+   field readers in [`log`] are gone; the nine types derive `Deserialize` over
+   the recovered names, order and types again. Two of the lenient behaviours it
+   had were *the reconstruction's*, not the original's, and went with it
+   (numbers accepted where a `String` is expected; a missing `result` meaning
+   `arrived`) — both are recorded in "Phase 1 reconnection".
+2. **No `serde_json::Error` in the public API.** `read` still returns
+   `Result<Vec<Record>, String>` (the stub's caller shape) and still drops
+   per-line failures, exactly as the binary does; the only error path in `read`
+   is the file open, and [`log::parse`] renders serde's error with
+   `to_string()`.
 3. **`probes::Answer`** is named here; the binary only carries the discriminants
    and the `hydra_gui` comparisons.
 4. **`step::Step`** is named here; the binary only carries the three `i32`s.
@@ -278,7 +295,147 @@ Callers: the only code in the binary that uses this crate is
    `hydra_model` in this workspace returns `Option<Movement>` instead, so the
    gate is re-implemented from the compass words. See `// UNKNOWN:` at
    `graph::reads_as_movement`.
-6. No new dependencies were added; `Cargo.toml` is unchanged.
+6. ~~No new dependencies were added; `Cargo.toml` is unchanged.~~ `serde` and
+   `serde_json` are workspace pins again (Phase 1).
+7. **`Serialize` is derived, though the binary has none.** The nine types carry
+   `Deserialize` only in the binary; `Serialize` is added here so the schema can
+   be round-trip-tested and so a writer can be built on it. It changes no
+   recovered behaviour.
+8. **`Known`/`Seen` field names are ours.** `drop_in_place` gives the shapes,
+   not the names (`Seen::marks`, `flags`, `lines`, `last`).
+
+---
+
+## Phase 1 reconnection
+
+Both dependencies are workspace pins, declared as `x = { workspace = true }` in
+this crate's `Cargo.toml` and used through `cargo --offline`. `hydra_survey` has
+no siblings yet — nothing else in the workspace depends on it
+(`hydra_gui::surveyor`, the only caller in the binary, is not reconstructed) — so
+the compatibility surface is this crate's own public API.
+
+| real crate (pin) | replaced | where |
+|---|---|---|
+| `serde` **1.0.229** (feature `derive`) | the hand-written field readers in `src/log.rs` | `#[derive(Deserialize)]` on `Record`, `Body`, `RoomRecord`, `Via`, `VerbRecord`, `EdgeRecord`, `EventRecord`, `EdgeResult`, `Happening` |
+| `serde_json` **1.0.151** | `src/json.rs`'s ~380-line reader | `log::parse` (`serde_json::from_str`, the recovered `de::from_trait`), `crate::json` (the alias over `serde_json`) |
+
+`cargo` added exactly four lines to the root `Cargo.lock` (the `serde` /
+`serde_json` edges of the `hydra_survey` package); no version moved.
+
+### The schema that came back
+
+Everything below is asserted by a test in `src/log.rs`:
+
+* `Record` — `t`, `run`, `char`, `server` (`String`, required) and
+  `#[serde(flatten)] body: Body`. The body's keys live in the *same* object, so
+  `serde_json` hands the unknown ones to `Content` and `Body` reads its tag back
+  out of it — the `Content` arm at `0x1013c30c0`.
+* `Body` — `#[serde(tag = "kind", rename_all = "lowercase")]` with
+  `Room(Box<RoomRecord>)`, `Verb(VerbRecord)`, `Edge(EdgeRecord)`,
+  `Event(EventRecord)`: the `TaggedContentVisitor::new("kind", …)` shape at
+  `0x1013c2674`, tags `room`/`verb`/`edge`/`event` in `VARIANTS` order.
+* `RoomRecord` — the 17 `FIELDS` at `0x1044337e8`, in that order and with the
+  per-arm types: `sid`/`title`/`desc`/`paths` are `String` (**`paths` is the
+  room's text, not a list**), `uid`/`climate`/`terrain`/`overhead`/`sensed_exit`/
+  `location` are `Option<String>`, `compass`/`exits`/`animals`/`tracked` are
+  `Vec<String>`, `roommeta` is `BTreeMap<String, String>`, `via` is `Option<Via>`
+  and `pos` is `Option<(i32, i32, i32)>`. The serialized default record pins all
+  seventeen names and their order in one string literal.
+* `Via` — `from`, `cmd` (two `String`s, `0x1013bc8f0`).
+* `VerbRecord` — `sid`, `verb`, `lines`, `rt`, `cast_rt`, `prompt_closed`.
+* `EdgeRecord` — `from`, `cmd`, `to`, `rt`, `dir`, `result`, `lines`, with
+  `result: EdgeResult` and `rt: Option<String>` (the roundtime as printed).
+* `EventRecord` — `sid`, `what: Happening`.
+* `EdgeResult` (`arrived`/`failed`/`stayed`) and `Happening`
+  (`died`/`healed`/`resumed`/`stopped`) — unit enums, `rename_all =
+  "lowercase"`, read as the bare variant string (`"result":"arrived"`), which is
+  what `ContentDeserializer::deserialize_enum` (`0x1013b6b34`) expects.
+
+`Serialize` is derived too. The binary has **no** `Serialize` side for these
+types (only `__Visitor::expecting`/`__FieldVisitor` symbols and the
+`Content`-based deserialisers exist), so serialization is an addition, not a
+recovery; it exists so the round trip can be tested and so a writer has a
+schema to target.
+
+### Behaviour that changed
+
+1. **Error wording is serde's**, position suffix included. `log::parse` renders
+   `serde_json::Error` with `to_string()`, so a missing room `sid` is
+   `missing field \`sid\` at line 1 column 155` (was `missing field \`sid\``),
+   an unknown `kind` is
+   ``unknown variant `roomy`, expected one of `room`, `verb`, `edge`, `event` at
+   line 1 column 69``. The *set* of messages is the same one the hand reader
+   aimed at, because `serde`'s defaults are what it was imitating. `read` still
+   drops every line it cannot parse, so only the exact text a caller sees
+   changed.
+2. **A bare number is no longer accepted where a `String` is expected.** The old
+   reader took `{"sid":1710}` because "the log writes some ids bare". The
+   recovered arms call `deserialize_string` (`0x1013b7ae0` for `sid`, and
+   `deserialize_option` over a string for the optional ones), so the original
+   rejected it: `invalid type: integer \`1710\`, expected a string`. No
+   `deserialize_with` shim was added for this — the evidence points the other
+   way — and the test `a_bare_number_is_not_a_string` pins the strictness.
+   If Phase 3's captured logs turn out to carry bare ids, this is the one place
+   to revisit (a `string-or-number` helper would be added *there*, and
+   documented as a deliberate divergence from the recovered schema).
+3. **`roommeta` values must be strings.** The old reader also took numbers,
+   bools and `null` and stringified them; the arm is `deserialize_map` with a
+   `String` on both sides (`0x1013b8038`).
+4. **Every non-`Option` field is required.** The old reader defaulted a missing
+   `result` to `arrived` and a missing `Vec`/map to empty; the recovered arms
+   deserialise an enum (`0x1013b6b34`), a sequence (`0x1013b68d4`) and a map
+   (`0x1013b8038`), so an absent key is ``missing field `result` `` now — same
+   for `sid`, `verb`, `what`, `title`, `desc`, `paths`, `from`, `cmd`, `lines`,
+   `compass`, `exits`, `animals`, `tracked`, `roommeta` and the four header
+   fields.
+5. **`Option<_>` fields still take `null` *and* absence** — `serde`'s
+   `missing_field` helper turns an absent `Option` into `None` — asserted for
+   `uid`, `via`, `pos`, `climate`, `terrain`, `overhead`, `sensed_exit`,
+   `location`, `to`, `rt`, `dir`.
+6. **The two verb roundtimes keep the old tolerance, deliberately.** The
+   `VerbRecord` visitor deserialises `rt` and `cast_rt` through
+   `Option::<T>::deserialize` (`0x1013cc7d4`, twice), i.e. the original accepted
+   an absent or `null` roundtime, but this crate's public fields are `f64`.
+   `log::roundtime` (a `deserialize_with`) folds "absent" and `null` into `0.0`,
+   which is what the `std` stand-in did; a non-number is still an error.
+   `prompt_closed` carries `#[serde(default)]` (absent → `false`) as an
+   **explicit divergence** from the recovered schema: the `bool::deserialize`
+   arm (`0x1013c9acc`) says the original required the key, but the recovered
+   type of that slot is `bool` with no evidenced default, this crate's field has
+   always been `bool`, and `log::read` drops a whole line it cannot parse — so a
+   missing flag would lose a record instead of defaulting a flag. Both shims are
+   tested in `a_verb_roundtime_may_be_written_or_left_out`.
+7. **`crate::json` changed shape.** It is now
+   `pub use serde_json::{Error, Map, Number, Value}` plus
+   `parse(&str) -> Result<Value, Error>` and nothing else. Three parts of the old
+   module could not be preserved and are documented breaks — nobody outside the
+   crate used any of them:
+   * `Value::kind()` and `wrong_type()` — serde produces the messages itself;
+   * the `String` error type of `json::parse` — now `serde_json::Error`;
+   * `Value::as_object()` / `Value::get()` now hand back `serde_json::Map` and
+     keep the *document's* order no longer: the old `Value::Object` was a
+     `Vec<(String, Value)>` in source order, `serde_json::Value` sorts object
+     keys (`BTreeMap`, no `preserve_order` feature, which the pin does not
+     enable). A log line is one object and nothing in the crate reads it as
+     JSON any more (`log::parse` goes through the derived schema), so the order
+     is not observable here — but a caller that wanted document order would
+     notice.
+     `Value`'s `as_str`, `as_array`, `get` and `Display` are otherwise
+     `serde_json`'s own and unchanged.
+
+### What remains a departure
+
+* `probes::Answer`, `Step`, `Known::{seen,exits,via,pos,tried}` and
+  `Seen::{marks,flags,lines,last}` are named here (items 3, 4 and 8 above).
+* `movement::classify` is still re-implemented from compass words (item 5).
+* `Serialize` is derived where the original had none (item 7).
+* `VerbRecord`'s `rt`/`cast_rt`/`prompt_closed` accept an absent key (item 6) —
+  a deliberate divergence, not a recovery.
+* `log::parse` and the `json` module are our additions to the crate's API.
+* Fields whose *types* were only ever inferred (`VerbRecord`'s tail) carry
+  `// UNKNOWN:` at the declaration.
+* Nothing is left of the `std` stand-ins: no hand-written parser, no
+  hand-written field reader.
 
 ---
 

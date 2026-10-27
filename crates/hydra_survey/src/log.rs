@@ -17,20 +17,27 @@
 //! | [`Happening`] | `VARIANTS` at `0x104433708` — `died`, `healed`, `resumed`, `stopped` (`visit_enum` at `0x1013c2c94`) |
 //! | [`EdgeResult`] | `VARIANTS` at `0x1044337b8` — `arrived`, `failed`, `stayed` (`visit_enum` at `0x1013c2e54`) |
 //!
+//! **Phase 1:** the derives are `serde`'s again (`serde` 1.0.229 /
+//! `serde_json` 1.0.151, both workspace pins), and [`parse`] is
+//! `serde_json::from_str` — the recovered `serde_json::de::from_trait::<Record>`
+//! at `0x1013c6f50`. `Serialize` is derived as well: the original had no
+//! `Serialize` side, so it is *added* rather than recovered, and nothing in the
+//! crate depends on it beyond the round-trip tests.
+//!
 //! Fields whose *shape* is recovered but whose element/primitive type is only
 //! known by size are marked `// UNKNOWN:` where they are declared.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 
-use crate::json::{self, Value};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// How a survey walk arrived at something: the room it came `from` and the
 /// command that moved it.
 ///
 /// The two field names are read out of `ContentDeserializer::deserialize_struct`
 /// at `0x1013bc8f0`, whose key comparisons are `from` (tag 0) and `cmd` (tag 1).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Via {
     pub from: String,
     pub cmd: String,
@@ -41,7 +48,7 @@ pub struct Via {
 /// Field order is the `FIELDS` array order at `0x1044337e8`:
 /// `sid uid title desc paths compass exits roommeta via pos climate terrain
 /// animals overhead sensed_exit tracked location`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RoomRecord {
     pub sid: String,
     pub uid: Option<String>,
@@ -73,22 +80,53 @@ pub struct RoomRecord {
 ///
 /// Only `sid`, `verb` and `lines` are drop-visible (two `String`s and a
 /// `Vec<String>` in `drop_in_place<VerbRecord>` at `0x1013bf558`); the three
-/// trailing fields own no allocation.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// trailing fields own no allocation: `rt` at `+0x48`, `cast_rt` at `+0x50` and
+/// `prompt_closed` as the byte at `+0x58` (the `visit_map`/`visit_seq` epilogue
+/// stores them as `stp d8, d9, [x24, #0x48]` and `strb w8, [x24, #0x58]`, for a
+/// 96-byte record).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct VerbRecord {
     pub sid: String,
     pub verb: String,
     pub lines: Vec<String>,
-    // UNKNOWN: `rt`/`cast_rt` are numbers (roundtime, cast roundtime) and
-    // `prompt_closed` is a flag; the binary only shows that none of the three
-    // owns an allocation. Read as `f64`/`bool` here.
+    // UNKNOWN: the recovered 8-byte slot holds a roundtime, but the field is
+    // deserialised through `Option::<T>::deserialize` (`0x1013cc7d4`, twice in
+    // the `VerbRecord` visitor), so the original accepted an absent or null
+    // roundtime. Kept as the `f64` this crate has always exposed, with
+    // [`roundtime`] folding "absent" and `null` into `0.0`; see `NOTES.md`.
+    #[serde(default, deserialize_with = "roundtime")]
     pub rt: f64,
+    #[serde(default, deserialize_with = "roundtime")]
     pub cast_rt: f64,
+    // UNKNOWN: a `bool::deserialize` (`0x1013c9acc`) arm proves the flag and
+    // suggests the original required it. `#[serde(default)]` is a deliberate
+    // divergence: the recovered slot is a plain `bool` with no evidenced
+    // default, this crate's field has always been `bool`, and `log::read` drops
+    // a whole line it cannot parse — a missing flag would lose a record rather
+    // than default a flag. Recorded in `NOTES.md`.
+    #[serde(default)]
     pub prompt_closed: bool,
 }
 
+/// Read a roundtime: a number, or `null`, or a missing key (`0.0`).
+///
+/// The binary deserialises both roundtime slots through `Option::<T>` (see
+/// [`VerbRecord`]), i.e. the log may leave them out or write `null`. This
+/// crate's public field is a plain `f64`, so the two absent forms fold to `0.0`
+/// — the behaviour the `std` stand-in had. An explicit compatibility choice,
+/// recorded in `NOTES.md`.
+fn roundtime<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0))
+}
+
 /// How an attempted move ended (`VARIANTS` at `0x1044337b8`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgeResult {
     #[default]
     Arrived,
@@ -104,23 +142,15 @@ impl EdgeResult {
             EdgeResult::Stayed => "stayed",
         }
     }
-
-    fn parse(text: &str) -> Option<EdgeResult> {
-        match text {
-            "arrived" => Some(EdgeResult::Arrived),
-            "failed" => Some(EdgeResult::Failed),
-            "stayed" => Some(EdgeResult::Stayed),
-            _ => None,
-        }
-    }
 }
 
 /// One attempt to leave a room (`FIELDS` at `0x104433748`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EdgeRecord {
     pub from: String,
     pub cmd: String,
     pub to: Option<String>,
+    /// The round time as the game printed it (`Option<String>`, not a number).
     pub rt: Option<String>,
     pub dir: Option<String>,
     pub result: EdgeResult,
@@ -128,7 +158,10 @@ pub struct EdgeRecord {
 }
 
 /// Something that happened to the character (`VARIANTS` at `0x104433708`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Happening {
     #[default]
     Died,
@@ -146,20 +179,10 @@ impl Happening {
             Happening::Stopped => "stopped",
         }
     }
-
-    fn parse(text: &str) -> Option<Happening> {
-        match text {
-            "died" => Some(Happening::Died),
-            "healed" => Some(Happening::Healed),
-            "resumed" => Some(Happening::Resumed),
-            "stopped" => Some(Happening::Stopped),
-            _ => None,
-        }
-    }
 }
 
 /// An event the log recorded.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EventRecord {
     pub sid: String,
     pub what: Happening,
@@ -171,7 +194,8 @@ pub struct EventRecord {
 /// The room variant is boxed because the binary allocates a 424-byte
 /// `RoomRecord` in `Box<RoomRecord>::deserialize` (`0x1013cc85c`); the other
 /// three are inline.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Body {
     Room(Box<RoomRecord>),
     Verb(VerbRecord),
@@ -202,12 +226,13 @@ impl Body {
 /// Every line carries the same four header fields (`t`, `run`, `char`,
 /// `server` — `Record::__FieldVisitor::visit_str` at `0x1013c2ff0`) and then the
 /// `kind`-tagged body's own keys, flattened into the same object.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Record {
     pub t: String,
     pub run: String,
     pub char: String,
     pub server: String,
+    #[serde(flatten)]
     pub body: Body,
 }
 
@@ -236,255 +261,13 @@ pub fn read(path: &str) -> Result<Vec<Record>, String> {
 }
 
 /// Parse one log line into a [`Record`].
+///
+/// The original inlined `serde_json::from_str::<Record>` into [`read`]
+/// (`serde_json::de::from_trait::<Record>` at `0x1013c6f50`); it is exposed
+/// here for tests and for callers that keep their own I/O. Failures come back
+/// as serde's own message, position suffix and all.
 pub fn parse(line: &str) -> Result<Record, String> {
-    let value = json::parse(line)?;
-    let entries = value
-        .as_object()
-        .ok_or_else(|| json::wrong_type(&value, "struct Record"))?;
-
-    let record = Record {
-        t: string(entries, "t")?,
-        run: string(entries, "run")?,
-        char: string(entries, "char")?,
-        server: string(entries, "server")?,
-        body: body(entries)?,
-    };
-    Ok(record)
-}
-
-/// The body of a record: the `kind` tag plus that variant's own keys, which
-/// live in the *same* object (the original flattens an internally tagged enum).
-fn body(entries: &[(String, Value)]) -> Result<Body, String> {
-    let kind = member(entries, "kind").ok_or_else(|| "missing field `kind`".to_owned())?;
-    let kind = kind
-        .as_str()
-        .ok_or_else(|| json::wrong_type(kind, "a string"))?;
-    let body = match kind {
-        "room" => Body::Room(Box::new(room_record(entries)?)),
-        "verb" => Body::Verb(verb_record(entries)?),
-        "edge" => Body::Edge(edge_record(entries)?),
-        "event" => Body::Event(event_record(entries)?),
-        other => {
-            return Err(format!(
-                "unknown variant `{}`, expected one of `room`, `verb`, `edge`, `event`",
-                other
-            ))
-        }
-    };
-    Ok(body)
-}
-
-fn room_record(entries: &[(String, Value)]) -> Result<RoomRecord, String> {
-    let room = RoomRecord {
-        sid: string(entries, "sid")?,
-        uid: opt_string(entries, "uid")?,
-        title: string(entries, "title")?,
-        desc: string(entries, "desc")?,
-        paths: string(entries, "paths")?,
-        compass: strings(entries, "compass")?,
-        exits: strings(entries, "exits")?,
-        roommeta: string_map(entries, "roommeta")?,
-        via: opt_via(entries, "via")?,
-        pos: opt_triple(entries, "pos")?,
-        climate: opt_string(entries, "climate")?,
-        terrain: opt_string(entries, "terrain")?,
-        animals: strings(entries, "animals")?,
-        overhead: opt_string(entries, "overhead")?,
-        sensed_exit: opt_string(entries, "sensed_exit")?,
-        tracked: strings(entries, "tracked")?,
-        location: opt_string(entries, "location")?,
-    };
-    Ok(room)
-}
-
-fn verb_record(entries: &[(String, Value)]) -> Result<VerbRecord, String> {
-    let verb = VerbRecord {
-        sid: string(entries, "sid")?,
-        verb: string(entries, "verb")?,
-        lines: strings(entries, "lines")?,
-        rt: number(entries, "rt")?.unwrap_or(0.0),
-        cast_rt: number(entries, "cast_rt")?.unwrap_or(0.0),
-        prompt_closed: boolean(entries, "prompt_closed")?.unwrap_or(false),
-    };
-    Ok(verb)
-}
-
-fn edge_record(entries: &[(String, Value)]) -> Result<EdgeRecord, String> {
-    let result = match opt_string(entries, "result")? {
-        None => EdgeResult::default(),
-        Some(text) => EdgeResult::parse(&text).ok_or_else(|| {
-            format!(
-                "unknown variant `{}`, expected one of `arrived`, `failed`, `stayed`",
-                text
-            )
-        })?,
-    };
-    let edge = EdgeRecord {
-        from: string(entries, "from")?,
-        cmd: string(entries, "cmd")?,
-        to: opt_string(entries, "to")?,
-        rt: opt_string(entries, "rt")?,
-        dir: opt_string(entries, "dir")?,
-        result,
-        lines: strings(entries, "lines")?,
-    };
-    Ok(edge)
-}
-
-fn event_record(entries: &[(String, Value)]) -> Result<EventRecord, String> {
-    let what = member(entries, "what").ok_or_else(|| "missing field `what`".to_owned())?;
-    let what = what
-        .as_str()
-        .ok_or_else(|| json::wrong_type(what, "a string"))?;
-    let what = Happening::parse(what).ok_or_else(|| {
-        format!(
-            "unknown variant `{}`, expected one of `died`, `healed`, `resumed`, `stopped`",
-            what
-        )
-    })?;
-    let event = EventRecord {
-        sid: string(entries, "sid")?,
-        what,
-    };
-    Ok(event)
-}
-
-fn opt_via(entries: &[(String, Value)], name: &str) -> Result<Option<Via>, String> {
-    let Some(value) = member(entries, name) else {
-        return Ok(None);
-    };
-    if matches!(value, Value::Null) {
-        return Ok(None);
-    }
-    let inner = value
-        .as_object()
-        .ok_or_else(|| json::wrong_type(value, "struct Via"))?;
-    Ok(Some(Via {
-        from: string(inner, "from")?,
-        cmd: string(inner, "cmd")?,
-    }))
-}
-
-fn member<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
-    entries
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-}
-
-fn string(entries: &[(String, Value)], name: &str) -> Result<String, String> {
-    let value = member(entries, name)
-        .ok_or_else(|| format!("missing field `{}`", name))?;
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        // `serde` would reject these, but ids are written bare sometimes.
-        Value::Number(text) => Ok(text.clone()),
-        other => Err(format!(
-            "field `{}`: {}",
-            name,
-            json::wrong_type(other, "a string")
-        )),
-    }
-}
-
-fn opt_string(entries: &[(String, Value)], name: &str) -> Result<Option<String>, String> {
-    match member(entries, name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(Value::Number(text)) => Ok(Some(text.clone())),
-        Some(other) => Err(json::wrong_type(other, "a string")),
-    }
-}
-
-fn strings(entries: &[(String, Value)], name: &str) -> Result<Vec<String>, String> {
-    let Some(value) = member(entries, name) else {
-        return Ok(Vec::new());
-    };
-    let items = value.as_array().ok_or_else(|| {
-        format!(
-            "invalid type for `{}`: {}, expected a sequence",
-            name,
-            value.kind()
-        )
-    })?;
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            Value::String(text) => out.push(text.clone()),
-            Value::Number(text) => out.push(text.clone()),
-            other => return Err(json::wrong_type(other, "a string")),
-        }
-    }
-    Ok(out)
-}
-
-fn number(entries: &[(String, Value)], name: &str) -> Result<Option<f64>, String> {
-    match member(entries, name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(text)) => text
-            .parse::<f64>()
-            .map(Some)
-            .map_err(|_| format!("invalid number for `{}`", name)),
-        Some(other) => Err(json::wrong_type(other, "a number")),
-    }
-}
-
-fn boolean(entries: &[(String, Value)], name: &str) -> Result<Option<bool>, String> {
-    match member(entries, name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Bool(flag)) => Ok(Some(*flag)),
-        Some(other) => Err(json::wrong_type(other, "a boolean")),
-    }
-}
-
-fn string_map(entries: &[(String, Value)], name: &str) -> Result<BTreeMap<String, String>, String> {
-    let Some(value) = member(entries, name) else {
-        return Ok(BTreeMap::new());
-    };
-    let inner = value
-        .as_object()
-        .ok_or_else(|| json::wrong_type(value, "a map"))?;
-    let mut out = BTreeMap::new();
-    for (key, item) in inner {
-        let text = match item {
-            Value::String(text) => text.clone(),
-            Value::Number(text) => text.clone(),
-            Value::Bool(flag) => flag.to_string(),
-            Value::Null => String::new(),
-            other => return Err(json::wrong_type(other, "a string")),
-        };
-        out.insert(key.clone(), text);
-    }
-    Ok(out)
-}
-
-fn opt_triple(entries: &[(String, Value)], name: &str) -> Result<Option<(i32, i32, i32)>, String> {
-    let Some(value) = member(entries, name) else {
-        return Ok(None);
-    };
-    if matches!(value, Value::Null) {
-        return Ok(None);
-    }
-    let items = value
-        .as_array()
-        .ok_or_else(|| json::wrong_type(value, "a tuple of length 3"))?;
-    if items.len() != 3 {
-        return Err(format!(
-            "invalid length {}, expected a tuple of length 3",
-            items.len()
-        ));
-    }
-    let mut parts = [0i32; 3];
-    for (slot, item) in parts.iter_mut().zip(items) {
-        let text = match item {
-            Value::Number(text) => text,
-            other => return Err(json::wrong_type(other, "an integer")),
-        };
-        *slot = text
-            .parse::<i32>()
-            .map_err(|_| format!("invalid integer `{}`", text))?;
-    }
-    Ok(Some((parts[0], parts[1], parts[2])))
+    serde_json::from_str::<Record>(line).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -517,7 +300,10 @@ mod tests {
         assert_eq!(room.compass, ["n", "ne", "e"]);
         assert_eq!(room.exits, ["north", "northeast", "east"]);
         assert_eq!(room.roommeta.get("object").map(String::as_str), Some("0"));
-        assert_eq!(room.roommeta.get("special").map(String::as_str), Some("none"));
+        assert_eq!(
+            room.roommeta.get("special").map(String::as_str),
+            Some("none")
+        );
         assert_eq!(
             room.via,
             Some(Via {
@@ -568,6 +354,11 @@ mod tests {
         let broken = EDGE.replace("\"arrived\"", "\"wandered\"");
         let error = parse(&broken).unwrap_err();
         assert!(error.contains("unknown variant `wandered`"), "{}", error);
+        assert!(
+            error.contains("expected one of `arrived`, `failed`, `stayed`"),
+            "{}",
+            error
+        );
     }
 
     #[test]
@@ -623,9 +414,15 @@ mod tests {
     #[test]
     fn required_fields_are_reported() {
         let line = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{},"animals":[],"tracked":[]}"#;
-        assert_eq!(parse(line).unwrap_err(), "missing field `sid`");
+        assert_eq!(
+            parse(line).unwrap_err(),
+            "missing field `sid` at line 1 column 155"
+        );
         let no_kind = r#"{"t":"1","run":"r","char":"c","server":"s"}"#;
-        assert_eq!(parse(no_kind).unwrap_err(), "missing field `kind`");
+        assert_eq!(
+            parse(no_kind).unwrap_err(),
+            "missing field `kind` at line 1 column 43"
+        );
     }
 
     #[test]
@@ -654,5 +451,298 @@ mod tests {
             "{}",
             error
         );
+    }
+
+    // ---- Phase 1: the recovered schema, through `serde` and not the hand
+    // ---- reader. Every test below goes through `serde_json` directly.
+
+    #[test]
+    fn serde_reads_one_line_of_each_kind() {
+        let room: Record = serde_json::from_str(ROOM).unwrap();
+        assert!(matches!(room.body, Body::Room(_)));
+        let edge: Record = serde_json::from_str(EDGE).unwrap();
+        assert!(matches!(edge.body, Body::Edge(_)));
+        let verb: Record = serde_json::from_str(VERB).unwrap();
+        assert!(matches!(verb.body, Body::Verb(_)));
+        let event: Record = serde_json::from_str(EVENT).unwrap();
+        assert!(matches!(event.body, Body::Event(_)));
+    }
+
+    #[test]
+    fn the_body_keys_are_flattened_into_the_header_object() {
+        // `Record::body` is `#[serde(flatten)]`: the `kind` tag and the body's
+        // own keys sit in the same object as `t`/`run`/`char`/`server`, which
+        // is what the binary's "other key" arm at `0x1013c30c0` buffers.
+        let value: serde_json::Value = serde_json::from_str(EDGE).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "char", "cmd", "dir", "from", "kind", "lines", "result", "rt", "run", "server",
+                "t", "to"
+            ]
+        );
+        assert_eq!(object["kind"], serde_json::Value::from("edge"));
+
+        // A nested body (`{"kind":"edge","edge":{…}}`) is *not* the format.
+        let nested = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"event","event":{"sid":"s1","what":"died"}}"#;
+        assert!(serde_json::from_str::<Record>(nested).is_err());
+    }
+
+    #[test]
+    fn every_record_type_round_trips_through_serde() {
+        for line in [ROOM, EDGE, VERB, EVENT] {
+            let record: Record = serde_json::from_str(line).unwrap();
+            let text = serde_json::to_string(&record).unwrap();
+            let again: Record = serde_json::from_str(&text).unwrap();
+            assert_eq!(record, again, "{}", text);
+            // ... and the same through the crate's own entry point.
+            assert_eq!(parse(&text).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn the_room_schema_is_the_seventeen_recovered_fields_in_order() {
+        // `serde` writes a struct's fields in declaration order, so this pins
+        // the recovered `FIELDS` order at `0x1044337e8` as well as every type.
+        assert_eq!(
+            serde_json::to_string(&RoomRecord::default()).unwrap(),
+            r#"{"sid":"","uid":null,"title":"","desc":"","paths":"","compass":[],"exits":[],"roommeta":{},"via":null,"pos":null,"climate":null,"terrain":null,"animals":[],"overhead":null,"sensed_exit":null,"tracked":[],"location":null}"#
+        );
+        // ... and the other four, whose `FIELDS` tables are 7, 6 and 2 wide.
+        assert_eq!(
+            serde_json::to_string(&EdgeRecord::default()).unwrap(),
+            r#"{"from":"","cmd":"","to":null,"rt":null,"dir":null,"result":"arrived","lines":[]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&VerbRecord::default()).unwrap(),
+            r#"{"sid":"","verb":"","lines":[],"rt":0.0,"cast_rt":0.0,"prompt_closed":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&EventRecord::default()).unwrap(),
+            r#"{"sid":"","what":"died"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Via::default()).unwrap(),
+            r#"{"from":"","cmd":""}"#
+        );
+    }
+
+    #[test]
+    fn a_record_is_the_header_then_the_flattened_body() {
+        assert_eq!(
+            serde_json::to_string(&Record::default()).unwrap(),
+            r#"{"t":"","run":"","char":"","server":"","kind":"event","sid":"","what":"died"}"#
+        );
+        // Every `kind` tag the binary's `VARIANTS` table carries.
+        let tags: Vec<String> = [
+            Body::Room(Box::default()),
+            Body::Verb(VerbRecord::default()),
+            Body::Edge(EdgeRecord::default()),
+            Body::Event(EventRecord::default()),
+        ]
+        .iter()
+        .map(|body| {
+            let record = Record {
+                body: body.clone(),
+                ..Record::default()
+            };
+            serde_json::to_string(&record).unwrap()
+        })
+        .collect();
+        for (text, tag) in tags.iter().zip(["room", "verb", "edge", "event"]) {
+            assert!(
+                text.contains(&format!(r#""kind":"{}""#, tag)),
+                "{}: {}",
+                tag,
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn an_optional_field_may_be_absent_or_null() {
+        let absent = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","sid":"s1","title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{},"animals":[],"tracked":[]}"#;
+        let nulls = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","sid":"s1","uid":null,"title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{},"via":null,"pos":null,"climate":null,"terrain":null,"animals":[],"overhead":null,"sensed_exit":null,"tracked":[],"location":null}"#;
+        for line in [absent, nulls] {
+            let Body::Room(room) = serde_json::from_str::<Record>(line).unwrap().body else {
+                panic!("not a room record");
+            };
+            assert_eq!(room.uid, None, "{}", line);
+            assert_eq!(room.via, None, "{}", line);
+            assert_eq!(room.pos, None, "{}", line);
+            assert_eq!(room.location, None, "{}", line);
+            // ... and the two forms serialize identically.
+            assert_eq!(
+                serde_json::to_string(&*room).unwrap(),
+                serde_json::to_string(&RoomRecord {
+                    sid: "s1".to_owned(),
+                    title: "T".to_owned(),
+                    desc: "D".to_owned(),
+                    ..RoomRecord::default()
+                })
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn roommeta_is_a_string_to_string_map() {
+        let line = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","sid":"s1","title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{"b":"2","a":"1"},"animals":[],"tracked":[]}"#;
+        let Body::Room(room) = serde_json::from_str::<Record>(line).unwrap().body else {
+            panic!("not a room record");
+        };
+        // A `BTreeMap`, so the order is the map's, not the document's.
+        let entries: Vec<(&str, &str)> = room
+            .roommeta
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(entries, [("a", "1"), ("b", "2")]);
+        // A value that is not a string is refused, as `deserialize_string`
+        // would refuse it (`0x1013b8038`).
+        let numbers = line.replace(r#""a":"1""#, r#""a":1"#);
+        let error = serde_json::from_str::<Record>(&numbers)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid type: integer `1`, expected a string"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn pos_is_an_option_of_three_integers() {
+        let base = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","sid":"s1","title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{},"animals":[],"tracked":[],"pos":POS}"#;
+        for (pos, want) in [
+            ("[12,-4,0]", Some((12, -4, 0))),
+            ("[-1,2,3]", Some((-1, 2, 3))),
+            ("null", None),
+        ] {
+            let line = base.replace("POS", pos);
+            let Body::Room(room) = serde_json::from_str::<Record>(&line).unwrap().body else {
+                panic!("not a room record");
+            };
+            assert_eq!(room.pos, want, "{}", line);
+        }
+        // Three elements exactly: `invalid_length` is what the binary raises.
+        let short = base.replace("POS", "[12,-4]");
+        let error = serde_json::from_str::<Record>(&short)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid length 2"), "{}", error);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let line = r#"{"t":"1","run":"r","char":"c","server":"s","zzz":1,"kind":"event","sid":"s1","what":"died","extra":"ignored"}"#;
+        let record: Record = serde_json::from_str(line).unwrap();
+        assert_eq!(record.t, "1");
+        let Body::Event(event) = record.body else {
+            panic!("not an event record");
+        };
+        assert_eq!(event.what, Happening::Died);
+    }
+
+    #[test]
+    fn the_error_wording_is_serdes() {
+        // Unknown `kind` tag: `TaggedContentVisitor` names all four variants.
+        let bad_kind = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"roomy","sid":"s1"}"#;
+        let error = serde_json::from_str::<Record>(bad_kind)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "unknown variant `roomy`, expected one of `room`, `verb`, `edge`, `event` at line 1 column 69"
+        );
+
+        // Unknown `what`: the enum's own variant list.
+        let bad_what = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"event","sid":"s1","what":"woke"}"#;
+        let error = serde_json::from_str::<Record>(bad_what)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "unknown variant `woke`, expected one of `died`, `healed`, `resumed`, `stopped` at line 1 column 83"
+        );
+
+        // A missing header field is reported by name.
+        let no_run = r#"{"t":"1","char":"c","server":"s","kind":"event","sid":"s1","what":"died"}"#;
+        let error = serde_json::from_str::<Record>(no_run)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "missing field `run` at line 1 column 73");
+
+        // A body field that is missing is reported by name, too.
+        let no_sid = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"event","what":"died"}"#;
+        let error = serde_json::from_str::<Record>(no_sid)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "missing field `sid` at line 1 column 72");
+    }
+
+    #[test]
+    fn a_bare_number_is_not_a_string() {
+        // The `std` stand-in accepted `{"sid":1710}` (the log writes some ids
+        // bare); the recovered arms call `deserialize_string` (`0x1013b7ae0`),
+        // so `serde` refuses it. A deliberate, documented tightening.
+        let line = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"room","sid":1710,"title":"T","desc":"D","paths":"","compass":[],"exits":[],"roommeta":{},"animals":[],"tracked":[]}"#;
+        let error = serde_json::from_str::<Record>(line)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid type: integer `1710`, expected a string"),
+            "{}",
+            error
+        );
+        assert!(parse(line).is_err());
+    }
+
+    #[test]
+    fn a_verb_roundtime_may_be_written_or_left_out() {
+        // The binary deserialises both roundtimes through `Option::<T>`
+        // (`0x1013cc7d4`); the crate's `f64` fields fold that to `0.0`.
+        let base = r#"{"t":"1","run":"r","char":"c","server":"s","kind":"verb","sid":"s1","verb":"lnorth","lines":[]RT}"#;
+        for (extra, rt, cast_rt) in [
+            (r#","rt":1.5,"cast_rt":2"#, 1.5, 2.0),
+            (r#","rt":null,"cast_rt":null"#, 0.0, 0.0),
+            ("", 0.0, 0.0),
+            (r#","rt":3"#, 3.0, 0.0),
+        ] {
+            let line = base.replace("RT", extra);
+            let Body::Verb(verb) = serde_json::from_str::<Record>(&line).unwrap().body else {
+                panic!("not a verb record: {}", line);
+            };
+            assert_eq!((verb.rt, verb.cast_rt), (rt, cast_rt), "{}", line);
+            assert!(!verb.prompt_closed);
+        }
+        // A roundtime that is not a number is still an error.
+        let line = base.replace("RT", r#","rt":"soon""#);
+        let error = serde_json::from_str::<Record>(&line)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid type: string"), "{}", error);
+    }
+
+    #[test]
+    fn the_two_enums_are_written_as_bare_variant_strings() {
+        // `visit_enum` on `Content` reads the bare string (`0x1013c2c94`,
+        // `0x1013c2e54`), not a `{"variant":…}` object.
+        assert_eq!(
+            serde_json::to_string(&Happening::Resumed).unwrap(),
+            r#""resumed""#
+        );
+        assert_eq!(
+            serde_json::to_string(&EdgeResult::Stayed).unwrap(),
+            r#""stayed""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Happening>(r#""healed""#).unwrap(),
+            Happening::Healed
+        );
+        assert!(serde_json::from_str::<Happening>(r#"{"healed":{}}"#).is_err());
     }
 }

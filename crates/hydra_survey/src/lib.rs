@@ -8,9 +8,10 @@
 //!
 //! * the original deserialised the log with `serde`/`serde_json` over nine
 //!   derived types (`Record`, `Happening`, `Body`, `Via`, `EdgeRecord`,
-//!   `EdgeResult`, `RoomRecord`, `VerbRecord`, `EventRecord`). This build has no
-//!   dependencies, so [`json`] is a small reader and [`log`] carries the
-//!   hand-written field readers with the *recovered* names, order and types.
+//!   `EdgeResult`, `RoomRecord`, `VerbRecord`, `EventRecord`). **Phase 1:**
+//!   those are `#[derive(Deserialize)]` again over the recovered field names,
+//!   order and types (`serde` 1.0.229, `serde_json` 1.0.151), [`json`] is a
+//!   thin alias over `serde_json`, and no hand-written parser is left.
 //! * the graph itself is `std` only (`BTreeMap`, `BTreeSet`, `HashMap`), which
 //!   is what the original used too.
 

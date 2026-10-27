@@ -2,3 +2,22 @@
 name = "hydra_survey"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Phase 1 reconnection: the crates the original linked, both pinned in the
+# workspace root and used through `cargo --offline`.
+#
+# * `serde` 1.0.229 (feature `derive`) is the `Deserialize` machinery over the
+#   nine log types. The binary keeps one `__Visitor::expecting` symbol per type
+#   — `struct Via with 2 elements` (0x104433588), `struct EdgeRecord with 7
+#   elements` (0x104433598), `struct RoomRecord with 17 elements`
+#   (0x1044335a8), `struct VerbRecord with 6 elements` (0x1044335b8),
+#   `struct EventRecord with 2 elements` (0x1044335c8) — plus
+#   `TaggedContentVisitor::new("kind", "internally tagged enum Body")` in
+#   `Deserialize for Body` at 0x1013c2674 and the "other key" arm that copies
+#   the body's keys into a `Content` (0x1013c30c0), which is what makes
+#   `Record::body` a `#[serde(flatten)]` field.
+# * `serde_json` 1.0.151 is the line format itself: `serde_json::de::from_trait`
+#   (0x1013c6f50) is the per-line step inside `log::read`.
+serde = { workspace = true }
+serde_json = { workspace = true }

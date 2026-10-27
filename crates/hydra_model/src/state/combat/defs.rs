@@ -71,8 +71,8 @@ impl Def {
             .collect()
     }
 
-    /// One `extra` value.
-    pub fn extra_value(&self, key: &str) -> Option<&str> {
+    /// One `extra` value (`Def::extra` in the binary).
+    pub fn extra(&self, key: &str) -> Option<&str> {
         self.extra_values()
             .into_iter()
             .find(|(k, _)| *k == key)
@@ -193,9 +193,9 @@ mod tests {
             "damaging=1;aoe=0;spawns=0;key=ThornsImpact_GS;",
             "^The thorny barrier",
         );
-        assert_eq!(def.extra_value("damaging"), Some("1"));
-        assert_eq!(def.extra_value("key"), Some("ThornsImpact_GS"));
-        assert_eq!(def.extra_value("missing"), None);
+        assert_eq!(def.extra("damaging"), Some("1"));
+        assert_eq!(def.extra("key"), Some("ThornsImpact_GS"));
+        assert_eq!(def.extra("missing"), None);
         assert_eq!(def.extra_values().len(), 4);
     }
 

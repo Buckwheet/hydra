@@ -29,6 +29,10 @@ version = "0.0.0"
 [[package]]
 name = "hydra_exp"
 version = "0.0.0"
+dependencies = [
+ "hydra_model",
+ "hydra_net",
+]
 
 [[package]]
 name = "hydra_gui"

@@ -83,6 +83,28 @@ impl StatusInfo {
         self.flags.remove(&key);
     }
 
+    /// Apply one `<indicator>` line.
+    ///
+    /// `// UNKNOWN:` the recovered `GameState::apply` calls `StatusInfo::set`
+    /// with the indicator id and the `visible` flag; the tag shape is the
+    /// protocol's `<indicator id="IconX" visible="y"/>`. Returns the change as a
+    /// fact when it did change.
+    pub fn set_from_line(&mut self, line: &str) -> Option<crate::state::Fact> {
+        let (_, rest) = line.split_once("indicator")?;
+        let id = attribute_of(rest, "id")?;
+        let visible = attribute_of(rest, "visible")
+            .map(|value| value == "y" || value == "1" || value == "on" || value == "true")
+            .unwrap_or(true);
+        if self.set(&id, visible) {
+            Some(crate::state::Fact::Status {
+                name: StatusInfo::normalize(&id),
+                value: visible,
+            })
+        } else {
+            None
+        }
+    }
+
     /// `self.get("dead")` — a 16-byte thunk in the binary.
     pub fn dead(&self) -> bool {
         self.get("dead")
@@ -135,6 +157,14 @@ impl<'a> StatusReading<'a> {
     pub fn invisible(&self) -> Option<bool> {
         self.read("invisible")
     }
+}
+
+fn attribute_of(text: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -651,6 +651,26 @@ impl Relay {
         }
     }
 
+    /// Drain stdout lines that the reader thread has already produced after
+    /// the child exited.  The reader may still be between `read_until` and
+    /// `send`, so poll for a short grace period instead of dropping a tail
+    /// line.
+    fn drain_ready_lines(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            match self.lines.try_recv() {
+                Ok(line) => self.output.push(line),
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     /// Drive one relay step: wait for a stdout line, or notice that the
     /// child has exited.  Returns `false` once the child is gone and the
     /// line channel has been drained.
@@ -663,10 +683,7 @@ impl Relay {
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(status) = self.child.try_wait()? {
                     self.status = Some(status);
-                    // Drain any lines the reader thread already produced.
-                    while let Ok(line) = self.lines.try_recv() {
-                        self.output.push(line);
-                    }
+                    self.drain_ready_lines();
                     Ok(false)
                 } else {
                     Ok(true)

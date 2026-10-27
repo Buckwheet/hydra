@@ -33,9 +33,27 @@ const PROMPT_TAG: &str = "<prompt time=\"";
 /// `0x1044a86c0` are `(&str, &str)` pairs holding `("GS3", "Prime")`,
 /// `("GSF", "Shattered")` and `("GST", "Test")`; the pointer/length pair at
 /// `+0x10` of each record is what `hydra_net::gemstone::endpoint::instance`
-/// returned.
+/// returned.  The rows are in the order the original compared them (`gs3`,
+/// then `gsf`, then `gst`) and point at the run
+/// `"GS3PrimeGSFShatteredGST"` at `0x103bf962d` plus `"Test"` at `0x10213f868`.
 const INSTANCE_NAMES: [(&str, &str); 3] =
     [("GS3", "Prime"), ("GSF", "Shattered"), ("GST", "Test")];
+
+/// The display name the original's static table gave a short instance code.
+///
+/// ESTABLISHED from `hydra_net::gemstone::endpoint::instance` (`0x101c44af8`):
+/// the trimmed argument is compared against exactly three spellings —
+/// `gs3`, `gsf` and `gst` — three ASCII bytes at a time and case-insensitively
+/// (the `sub w, w, #0x41 / cmp #0x1a / csel w8, #0x20, wzr, lo` idiom), and the
+/// table's second `&str` is returned; every other spelling falls to `mov x0, #0`
+/// (`None`).  A longer or shorter string cannot match a three byte row, so the
+/// length check the original does first is implied here.
+fn display_name(code: &str) -> Option<&'static str> {
+    INSTANCE_NAMES
+        .iter()
+        .find(|(short, _)| short.eq_ignore_ascii_case(code))
+        .map(|&(_, name)| name)
+}
 
 /// One recorded session.
 ///
@@ -92,9 +110,10 @@ impl PartialOrd for Session {
 ///
 /// Recovered from `0x10026368c`: the `<app ... game="...">` attribute is tried
 /// first and returned verbatim when it is non-empty; otherwise the
-/// `<settingsInfo ... instance="...">` attribute is resolved through
-/// `hydra_net::gemstone::endpoint::instance` and the resulting display name is
-/// returned (so `instance="GS3"` becomes `"Prime"`).
+/// `<settingsInfo ... instance="...">` attribute is resolved through the
+/// original's three row static table and the resulting display name is returned
+/// (so `instance="GS3"` becomes `"Prime"`, `"GST"` becomes `"Test"` and
+/// `"GSF"` becomes `"Shattered"`).
 pub fn instance_of(text: &str) -> Option<String> {
     if let Some(game) = attribute_of(text, APP_TAG, GAME_ATTR) {
         if !game.is_empty() {
@@ -105,18 +124,21 @@ pub fn instance_of(text: &str) -> Option<String> {
     }
     let code = attribute_of(text, SETTINGS_TAG, INSTANCE_ATTR)?;
     let code = code.trim();
+    // ESTABLISHED: the original's table — which lives in the sibling crate as
+    // `hydra_net::gemstone::endpoint::instance` (`0x101c44af8`) — answers for
+    // exactly `gs3`/`gsf`/`gst` with the display name.  The workspace's
+    // reconstruction of that function returns an `Endpoint` (host/port/game)
+    // for `GS4`/`GS3` instead, which cannot produce the display names, so the
+    // recovered rows are applied here first.  See `NOTES.md` §1.1 and §4.
+    if let Some(name) = display_name(code) {
+        return Some(name.to_string());
+    }
+    // DEPARTURE: the original returned `None` for every other spelling.  The
+    // recovered sibling table still knows `GS4` (and `GS3`), so a recording
+    // that names one of those codes only in `<settingsInfo ...>` keeps the code
+    // itself as its game instead of being skipped as "no game named".
     let endpoint = hydra_net::gemstone::endpoint::instance(code)?;
-    // DEPARTURE: `hydra_net::gemstone::endpoint::instance` was recovered in
-    // this workspace as `Option<&'static Endpoint>` (host/port/game), while the
-    // original returned the second `&str` of its static record, i.e. the
-    // display name.  Keep the original spelling when the code is one of the
-    // three recovered rows, and fall back to the endpoint's game otherwise.
-    let name = INSTANCE_NAMES
-        .iter()
-        .find(|(short, _)| short.eq_ignore_ascii_case(code))
-        .map(|&(_, name)| name)
-        .unwrap_or(endpoint.game);
-    Some(name.to_string())
+    Some(endpoint.game.to_string())
 }
 
 /// Recover a session identity from a `.bytes` recording's file name.
@@ -387,6 +409,25 @@ mod tests {
         assert_eq!(attribute_of("", APP_TAG, GAME_ATTR), None);
     }
 
+    #[test]
+    fn attribute_takes_any_character_after_the_name_as_the_quote() {
+        // The original decodes the character after the attribute name and
+        // searches for the same character again, so `"` is not special.
+        assert_eq!(
+            attribute_of(r#"<app game=|GS4| other="x">"#, APP_TAG, GAME_ATTR).as_deref(),
+            Some("GS4")
+        );
+        assert_eq!(
+            attribute_of(r#"<app game=*GS4*x>"#, APP_TAG, GAME_ATTR).as_deref(),
+            Some("GS4")
+        );
+        // A multi-byte quote is consumed by its UTF-8 length.
+        assert_eq!(
+            attribute_of("<app game=\u{a7}GS4\u{a7}>", APP_TAG, GAME_ATTR).as_deref(),
+            Some("GS4")
+        );
+    }
+
     // ------------------------------------------------------- instance_of
 
     #[test]
@@ -407,11 +448,56 @@ mod tests {
             instance_of(r#"<settingsInfo instance=" gs3 ">"#).as_deref(),
             Some("Prime")
         );
-        // UNKNOWN/DEPARTURE: the original table also held GST -> "Test" and
-        // GSF -> "Shattered", but the recovered
-        // `hydra_net::gemstone::endpoint` table only knows GS4 and GS3, so
-        // those two codes resolve to `None` here.
-        assert_eq!(instance_of(r#"<settingsInfo instance="GST">"#), None);
+    }
+
+    #[test]
+    fn instance_of_resolves_the_three_recovered_instance_codes() {
+        // ESTABLISHED: the original's static table held exactly these three
+        // rows (`0x1044a8680`/`0x1044a86a0`/`0x1044a86c0`, the strings
+        // `"GS3PrimeGSFShatteredGST"` at `0x103bf962d` and `"Test"` at
+        // `0x10213f868`), compared case-insensitively against the trimmed code.
+        let cases = [
+            ("GS3", "Prime"),
+            ("gs3", "Prime"),
+            (" gs3\t", "Prime"),
+            ("GSF", "Shattered"),
+            ("gsf", "Shattered"),
+            (" GST ", "Test"),
+            ("GST", "Test"),
+            ("gst", "Test"),
+        ];
+        for (code, expected) in cases {
+            let text = format!(r#"<settingsInfo instance="{code}">"#);
+            assert_eq!(instance_of(&text).as_deref(), Some(expected), "{code}");
+        }
+    }
+
+    #[test]
+    fn display_name_only_knows_three_whole_codes() {
+        for (code, expected) in INSTANCE_NAMES {
+            assert_eq!(display_name(code), Some(expected));
+            assert_eq!(display_name(&code.to_ascii_lowercase()), Some(expected));
+        }
+        // Exactly three bytes, no surrounding whitespace: trimming is
+        // `instance_of`'s job, not the table's.
+        for code in ["", "GS", "GS4", "GSTX", "GS3 ", " GSF", "gs4", "Test"] {
+            assert_eq!(display_name(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn instance_of_keeps_the_game_code_for_an_endpoint_only_spelling() {
+        // DEPARTURE: the original answered only for gs3/gsf/gst and returned
+        // `None` otherwise, so `instance="GS4"` alone was "no game named".
+        // The recovered sibling table still knows GS4, so the code survives.
+        assert_eq!(
+            instance_of(r#"<settingsInfo instance="GS4">"#).as_deref(),
+            Some("GS4")
+        );
+        assert_eq!(
+            instance_of(r#"<settingsInfo instance=" gs4 ">"#).as_deref(),
+            Some("GS4")
+        );
     }
 
     #[test]
@@ -424,11 +510,11 @@ mod tests {
     fn instance_of_is_none_without_a_known_instance() {
         assert_eq!(instance_of(r#"<app game="">"#), None);
         assert_eq!(instance_of(r#"<settingsInfo instance="GSTX">"#), None);
+        assert_eq!(instance_of(r#"<settingsInfo instance="GS3X">"#), None);
+        assert_eq!(instance_of(r#"<settingsInfo instance="">"#), None);
         assert_eq!(instance_of("no records here"), None);
-        // DEPARTURE: the original's static table also held GSF -> "Shattered",
-        // but the recovered `hydra_net::gemstone::endpoint` table does not know
-        // GSF, so the resolution fails before the name lookup.
-        assert_eq!(instance_of(r#"<settingsInfo instance="GSF">"#), None);
+        // A short spelling that is neither a table row nor an endpoint.
+        assert_eq!(instance_of(r#"<settingsInfo instance="GS">"#), None);
     }
 
     // ------------------------------------------------------- name_of

@@ -2,3 +2,6 @@
 name = "hydra_combat_log"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+hydra_net = { path = "../hydra_net" }

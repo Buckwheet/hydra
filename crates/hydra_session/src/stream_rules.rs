@@ -40,9 +40,15 @@
 //! **UNKNOWN**: the TOML member names and the class numbering.  We write
 //! `name`, `stream`, `class`, `regex` and `fighting`, and we pick `Fighting`
 //! as class number 2 to match the recovered comparison.
+//!
+//! **Phase 1**: the TOML is the real thing.  [`Rules::parse`] is
+//! `toml::from_str` into the derived [`RulesDoc`] / [`RuleDoc`] shapes (the
+//! member names are the ones this crate recovered, and every member is
+//! optional on read), and [`Rules::to_toml`] builds a `toml_edit` document with
+//! one `[[rules]]` table per rule — nested rules are written as an array of
+//! inline tables, so a rule set round trips through the file.
 
 use crate::pattern::{self, Pattern};
-use crate::textfmt::{self, Value};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -346,46 +352,32 @@ impl Rules {
         Rules::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Parse the TOML form.
+    /// Parse the TOML form with the `toml` crate.
     ///
     /// The document is a list of `[[rules]]` tables; each may nest further
-    /// rules by repeating the table name with a dot, which is our spelling for
-    /// the recovered `nested` vector.
+    /// rules in a `nested` array, which is our spelling for the recovered
+    /// `nested` vector.
     pub fn parse(text: &str) -> Result<Rules, String> {
-        let doc = textfmt::parse_toml(text)?;
-        let mut rules = Vec::new();
-        match doc.get("rules") {
-            Some(Value::Arr(items)) => {
-                for item in items {
-                    rules.push(rule_of(item)?);
-                }
-            }
-            Some(other) => return Err(format!("`rules` is not a list: {other:?}")),
-            None => {}
+        let doc: RulesDoc = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut rules = Vec::with_capacity(doc.rules.len());
+        for item in doc.rules {
+            rules.push(rule_of(item)?);
         }
         Ok(Rules { rules })
     }
 
-    /// Render the TOML form.
+    /// Render the TOML form with `toml_edit`.
     ///
-    /// **ESTABLISHED**: the original serialises with `toml`.
+    /// **ESTABLISHED**: the original serialises with `toml` (and writes
+    /// through `toml_writer`).
     pub fn to_toml(&self) -> String {
-        let mut out = String::new();
+        let mut doc = toml_edit::DocumentMut::new();
+        let mut tables = toml_edit::ArrayOfTables::new();
         for rule in &self.rules {
-            out.push_str("[[rules]]\n");
-            out.push_str(&format!("name = \"{}\"\n", textfmt::toml_escape(&rule.name)));
-            out.push_str(&format!(
-                "stream = \"{}\"\n",
-                textfmt::toml_escape(&rule.stream)
-            ));
-            out.push_str(&format!("class = \"{}\"\n", rule.class.name()));
-            out.push_str(&format!(
-                "regex = \"{}\"\n",
-                textfmt::toml_escape(&rule.regex)
-            ));
-            out.push_str(&format!("fighting = {}\n\n", rule.fighting));
+            tables.push(table_of(rule));
         }
-        out
+        doc["rules"] = toml_edit::Item::ArrayOfTables(tables);
+        doc.to_string()
     }
 
     /// Compile the whole set.
@@ -394,24 +386,68 @@ impl Rules {
     }
 }
 
-fn rule_of(v: &Value) -> Result<Rule, String> {
-    let class = match v.get("class").and_then(Value::as_str) {
-        Some(name) => {
-            Class::of(name).ok_or_else(|| format!("`{name}` is not a stream class"))?
-        }
+/// The document `rules.toml` holds: `[[rules]]` tables.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RulesDoc {
+    #[serde(default)]
+    rules: Vec<RuleDoc>,
+}
+
+/// One `[[rules]]` table.  Every member is optional, so a hand-written file
+/// that leaves one out still loads (the same tolerance the hand parser had).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct RuleDoc {
+    name: String,
+    stream: String,
+    class: Option<String>,
+    regex: String,
+    fighting: bool,
+    nested: Vec<RuleDoc>,
+}
+
+fn rule_of(doc: RuleDoc) -> Result<Rule, String> {
+    let class = match doc.class.as_deref() {
+        Some(name) => Class::of(name).ok_or_else(|| format!("`{name}` is not a stream class"))?,
         None => Class::Gag,
     };
-    let regex = v.str_of("regex");
-    let mut rule = Rule::new(&v.str_of("name"), &v.str_of("stream"), &regex, class);
-    if v.get("fighting").and_then(Value::as_bool).unwrap_or(false) {
+    let mut rule = Rule::new(&doc.name, &doc.stream, &doc.regex, class);
+    if doc.fighting {
         rule.fighting = true;
     }
-    if let Some(Value::Arr(items)) = v.get("nested") {
-        for item in items {
-            rule.nested.push(rule_of(item)?);
-        }
+    for item in doc.nested {
+        rule.nested.push(rule_of(item)?);
     }
     Ok(rule)
+}
+
+/// One rule as a `[[rules]]` table.
+fn table_of(rule: &Rule) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table["name"] = toml_edit::value(rule.name.as_str());
+    table["stream"] = toml_edit::value(rule.stream.as_str());
+    table["class"] = toml_edit::value(rule.class.name());
+    table["regex"] = toml_edit::value(rule.regex.as_str());
+    table["fighting"] = toml_edit::value(rule.fighting);
+    if !rule.nested.is_empty() {
+        let mut nested = toml_edit::Array::new();
+        for child in &rule.nested {
+            nested.push(inline_of(child));
+        }
+        table["nested"] = toml_edit::value(nested);
+    }
+    table
+}
+
+/// One nested rule as an inline table, so `nested` stays inside its rule.
+fn inline_of(rule: &Rule) -> toml_edit::Value {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("name", rule.name.as_str().into());
+    table.insert("stream", rule.stream.as_str().into());
+    table.insert("class", rule.class.name().into());
+    table.insert("regex", rule.regex.as_str().into());
+    table.insert("fighting", rule.fighting.into());
+    toml_edit::Value::InlineTable(table)
 }
 
 /// The session's current rule set, swappable while the session runs.
@@ -571,4 +607,86 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(Rules::load(&p).unwrap(), Rules::default());
     }
+
+    #[test]
+    fn toml_round_trips_nested_rules_and_escaped_regexes() {
+        // A quoted, backslashed expression is what the `regex` column really
+        // holds, and it has to survive the `toml_edit` writer.
+        let mut outer = Rule::new("outer", "combat", "^x \"quoted\" \\w+", Class::Gag);
+        outer
+            .nested
+            .push(Rule::new("inner", "combat", "^y", Class::Fighting));
+        let rules = Rules {
+            rules: vec![outer, say_rule()],
+        };
+        let text = rules.to_toml();
+        // The writer produces TOML the `toml` crate accepts, on its own terms.
+        let as_doc: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            as_doc.get("rules").and_then(|v| v.as_array()).map(Vec::len),
+            Some(2)
+        );
+        let back = Rules::parse(&text).unwrap();
+        assert_eq!(back.rules.len(), 2);
+        assert_eq!(back.rules[0].regex, "^x \"quoted\" \\w+");
+        assert_eq!(back.rules[0].nested.len(), 1);
+        assert_eq!(back.rules[0].nested[0].name, "inner");
+        assert_eq!(back.rules[0].nested[0].class, Class::Fighting);
+        assert!(back.rules[0].nested[0].fighting);
+        assert_eq!(back.rules[1].stream, "speech");
+        // and the second pass is stable
+        assert_eq!(back.to_toml(), text);
+    }
+
+    #[test]
+    fn parse_tolerates_missing_members_and_ignores_unknown_ones() {
+        let text = r#"
+            # a hand-written file: no `class`, no `fighting`, an unknown key
+            [[rules]]
+            name = "say"
+            regex = "^\\w+ says"
+            colour = "green"
+        "#;
+        let rules = Rules::parse(text).unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].class, Class::Gag, "class defaults to gag");
+        assert!(!rules.rules[0].fighting);
+        assert!(rules.rules[0].stream.is_empty());
+        assert!(rules.rules[0].finds("Aelith says hi").unwrap());
+    }
+
+    #[test]
+    fn a_bad_class_or_broken_toml_is_reported() {
+        let bad_class = "[[rules]]\nname = \"x\"\nclass = \"sparkle\"\n";
+        let e = Rules::parse(bad_class).unwrap_err();
+        assert_eq!(e, "`sparkle` is not a stream class");
+        let broken = "[[rules]\nname = \"x\"\n";
+        let e = Rules::parse(broken).unwrap_err();
+        assert!(!e.is_empty(), "a TOML error carries the crate's message");
+        // `rules` that is not a list of tables is refused too.
+        assert!(Rules::parse("rules = 3\n").is_err());
+    }
+
+    #[test]
+    fn a_rules_file_round_trips_through_the_filesystem() {
+        let dir = std::env::temp_dir().join(format!("hydra-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.toml");
+        let rules = Rules {
+            rules: vec![
+                say_rule(),
+                Rule::new("hit", "combat", "^(\\w+) hits", Class::Fighting),
+            ],
+        };
+        std::fs::write(&path, rules.to_toml()).unwrap();
+        let back = Rules::load(&path).unwrap();
+        assert_eq!(back.rules.len(), 2);
+        assert_eq!(back.rules[1].class, Class::Fighting);
+        // the file really says `[[rules]]` twice
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[[rules]]").count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

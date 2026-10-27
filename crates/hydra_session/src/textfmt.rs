@@ -258,280 +258,89 @@ pub fn json_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// TOML (the small subset the settings and stream rules use)
+// TOML — the `toml` crate for reading, `toml_edit` for writing
 // ---------------------------------------------------------------------------
 
-/// Parse the TOML subset: scalars, single-line arrays, `[table]` and
-/// `[[array of tables]]`, with `#` comments.  Trailing `\r` from CRLF files is
-/// stripped.  Later duplicate keys win, which matches `serde`'s behaviour of
-/// taking the last value it is handed for a field.
+/// Parse a TOML document with the `toml` crate.
+///
+/// The document is converted into [`Value`] so that the file stores keep one
+/// document type: tables become [`Value::Obj`], arrays [`Value::Arr`], integers
+/// and floats [`Value::Num`], and a TOML datetime is kept as its rendered
+/// [`Value::Str`] (no store in this crate reads a datetime back).
 pub fn parse_toml(text: &str) -> Result<Value, String> {
-    let mut root: Vec<(String, Value)> = Vec::new();
-    // Path of the table we are currently filling.
-    let mut path: Vec<String> = Vec::new();
-
-    for (n, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("[[") {
-            let name = line
-                .strip_prefix("[[")
-                .and_then(|r| r.strip_suffix("]]"))
-                .ok_or_else(|| format!("line {}: bad array-of-tables header", n + 1))?
-                .trim();
-            let name = unquote_key(name);
-            path = vec![name.clone()];
-            // Push a fresh table onto the array at `path`.
-            let parent = table_of(&mut root, &[]);
-            let idx = match parent.iter().position(|(k, _)| *k == name) {
-                Some(i) => i,
-                None => {
-                    parent.push((name, Value::Arr(Vec::new())));
-                    parent.len() - 1
-                }
-            };
-            match &mut parent[idx].1 {
-                Value::Arr(items) => items.push(Value::Obj(Vec::new())),
-                other => *other = Value::Arr(vec![Value::Obj(Vec::new())]),
-            }
-            continue;
-        }
-        if line.starts_with('[') {
-            let name = line
-                .strip_prefix('[')
-                .and_then(|r| r.strip_suffix(']'))
-                .ok_or_else(|| format!("line {}: bad table header", n + 1))?
-                .trim()
-                .to_string();
-            path = name.split('.').map(|s| unquote_key(s.trim())).collect();
-            let (parent, last) = match path.split_last() {
-                Some((last, rest)) => (rest.to_vec(), last.clone()),
-                None => (Vec::new(), String::new()),
-            };
-            let table = table_of(&mut root, &parent);
-            if !table.iter().any(|(k, _)| *k == last) {
-                table.push((last, Value::Obj(Vec::new())));
-            }
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {}: not a `key = value` line", n + 1))?;
-        let key = unquote_key(key.trim());
-        let value = parse_toml_value(value.trim()).map_err(|e| format!("line {}: {e}", n + 1))?;
-        let table = table_of(&mut root, &path);
-        match table.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, existing)) => *existing = value,
-            None => table.push((key, value)),
-        }
-    }
-    Ok(Value::Obj(root))
+    let doc: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(from_toml(doc))
 }
 
-/// Walk to the table at `path`, creating tables as needed.  Descending into an
-/// array of tables goes to its last element, which is what `[[name]]` opens.
-fn table_of<'a>(
-    root: &'a mut Vec<(String, Value)>,
-    path: &[String],
-) -> &'a mut Vec<(String, Value)> {
-    let Some((seg, rest)) = path.split_first() else {
-        return root;
-    };
-    let idx = match root.iter().position(|(k, _)| k == seg) {
-        Some(i) => i,
-        None => {
-            root.push((seg.clone(), Value::Obj(Vec::new())));
-            root.len() - 1
-        }
-    };
-    match &mut root[idx].1 {
-        Value::Obj(pairs) => table_of(pairs, rest),
-        Value::Arr(items) => {
-            if !matches!(items.last(), Some(Value::Obj(_))) {
-                items.push(Value::Obj(Vec::new()));
-            }
-            match items.last_mut() {
-                Some(Value::Obj(pairs)) => table_of(pairs, rest),
-                _ => unreachable!(),
-            }
-        }
-        other => {
-            *other = Value::Obj(Vec::new());
-            match other {
-                Value::Obj(pairs) => table_of(pairs, rest),
-                _ => unreachable!(),
-            }
+fn from_toml(v: toml::Value) -> Value {
+    match v {
+        toml::Value::String(s) => Value::Str(s),
+        toml::Value::Integer(i) => Value::Num(i as f64),
+        toml::Value::Float(f) => Value::Num(f),
+        toml::Value::Boolean(b) => Value::Bool(b),
+        toml::Value::Datetime(d) => Value::Str(d.to_string()),
+        toml::Value::Array(items) => Value::Arr(items.into_iter().map(from_toml).collect()),
+        toml::Value::Table(table) => {
+            Value::Obj(table.into_iter().map(|(k, v)| (k, from_toml(v))).collect())
         }
     }
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_str = false;
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' if i == 0 || bytes[i - 1] != b'\\' => in_str = !in_str,
-            b'#' if !in_str => return &line[..i],
-            _ => {}
-        }
-        i += 1;
-    }
-    line
-}
-
-fn unquote_key(k: &str) -> String {
-    let k = k.trim();
-    if k.len() >= 2 && k.starts_with('"') && k.ends_with('"') {
-        parse_toml_string(k).unwrap_or_else(|_| k[1..k.len() - 1].to_string())
-    } else {
-        k.to_string()
-    }
-}
-
-fn parse_toml_value(s: &str) -> Result<Value, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty value".to_string());
-    }
-    if s.starts_with('"') {
-        return parse_toml_string(s).map(Value::Str);
-    }
-    if s == "true" {
-        return Ok(Value::Bool(true));
-    }
-    if s == "false" {
-        return Ok(Value::Bool(false));
-    }
-    if s.starts_with('[') {
-        let inner = s
-            .strip_prefix('[')
-            .and_then(|r| r.strip_suffix(']'))
-            .ok_or("unterminated array")?;
-        let mut items = Vec::new();
-        for piece in split_array(inner) {
-            let piece = piece.trim();
-            if piece.is_empty() {
-                continue;
-            }
-            items.push(parse_toml_value(piece)?);
-        }
-        return Ok(Value::Arr(items));
-    }
-    let cleaned = s.replace('_', "");
-    if let Ok(i) = cleaned.parse::<i64>() {
-        return Ok(Value::Num(i as f64));
-    }
-    if let Ok(f) = cleaned.parse::<f64>() {
-        return Ok(Value::Num(f));
-    }
-    Err(format!("`{s}` is not a value"))
-}
-
-fn split_array(inner: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    let mut depth = 0i32;
-    let mut escaped = false;
-    for c in inner.chars() {
-        match c {
-            '"' if !escaped => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '[' if !in_str => {
-                depth += 1;
-                cur.push(c);
-            }
-            ']' if !in_str => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if !in_str && depth == 0 => {
-                out.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
-        }
-        escaped = c == '\\' && !escaped;
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-fn parse_toml_string(s: &str) -> Result<String, String> {
-    let inner = s
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .ok_or("unterminated string")?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => return Err("dangling escape".to_string()),
-        }
-    }
-    Ok(out)
 }
 
 /// Escape a string for a TOML basic string.
+///
+/// `toml_edit` escapes what it writes itself (see [`to_toml`]); this helper is
+/// kept for callers that render a single TOML scalar by hand, and escapes the
+/// same set of characters `serde_json` does.
 pub fn toml_escape(s: &str) -> String {
     json_escape(s)
 }
 
-/// Render a flat table (scalars and arrays of scalars only) as TOML.
+/// Render a flat table (scalars and arrays of scalars only) as TOML with
+/// `toml_edit`.
+///
+/// Nested tables and arrays of tables are skipped, as before: they are the
+/// shapes `stream_rules` renders itself, and the settings file is JSON.
 pub fn to_toml(obj: &Value) -> String {
-    let mut out = String::new();
+    let mut doc = toml_edit::DocumentMut::new();
     if let Value::Obj(pairs) = obj {
         for (k, v) in pairs {
             match v {
-                Value::Obj(_) | Value::Arr(_) if is_table_array(v) => continue,
                 Value::Obj(_) => continue,
                 Value::Arr(items) => {
-                    let rendered: Vec<String> = items.iter().map(toml_scalar).collect();
-                    out.push_str(&format!("{k} = [{}]\n", rendered.join(", ")));
+                    if is_table_array(v) {
+                        continue;
+                    }
+                    let mut arr = toml_edit::Array::new();
+                    for item in items {
+                        arr.push(toml_value(item));
+                    }
+                    doc[k] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
                 }
-                other => out.push_str(&format!("{k} = {}\n", toml_scalar(other))),
+                other => {
+                    doc[k] = toml_edit::Item::Value(toml_value(other));
+                }
             }
         }
     }
-    out
+    doc.to_string()
 }
 
 fn is_table_array(v: &Value) -> bool {
     matches!(v, Value::Arr(items) if items.iter().any(|i| matches!(i, Value::Obj(_))))
 }
 
-fn toml_scalar(v: &Value) -> String {
+/// One scalar as a `toml_edit` value.  An integral `f64` becomes a TOML
+/// integer, which is how the crate has always written `window = 30`.
+fn toml_value(v: &Value) -> toml_edit::Value {
     match v {
-        Value::Null => "\"\"".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Num(n) => {
-            if n.fract() == 0.0 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{n}")
-            }
+        Value::Null => toml_edit::Value::from(""),
+        Value::Bool(b) => toml_edit::Value::from(*b),
+        Value::Num(n) if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.0e15 => {
+            toml_edit::Value::from(*n as i64)
         }
-        Value::Str(s) => format!("\"{}\"", toml_escape(s)),
-        Value::Arr(_) | Value::Obj(_) => "\"\"".to_string(),
+        Value::Num(n) => toml_edit::Value::from(*n),
+        Value::Str(s) => toml_edit::Value::from(s.as_str()),
+        Value::Arr(_) | Value::Obj(_) => toml_edit::Value::from(""),
     }
 }
 
@@ -668,5 +477,32 @@ mod tests {
             ),
         ]);
         assert_eq!(to_toml(&v), "sym = \".\"\nn = 3\nb = false\narr = [\"a\", \"b\"]\n");
+        // and the toml crate reads back what toml_edit wrote.  `toml`'s table is
+        // a `BTreeMap` (its `preserve_order` feature is off in the workspace
+        // pins), so the re-read document is key-sorted: compare by key.
+        let back = parse_toml(&to_toml(&v)).unwrap();
+        assert_eq!(back.str_of("sym"), ".");
+        assert_eq!(back.u64_of("n"), Some(3));
+        assert!(!back.bool_of("b"));
+        assert_eq!(back.strings_of("arr"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_toml_crate_brings_the_rest_of_the_syntax() {
+        // Multi-line strings, dotted keys, inline tables, dates and
+        // underscores in integers — none of which the hand parser read.
+        let text = "title = \"\"\"\nline one\nline two\n\"\"\"\na.b.c = 1\ninline = { x = 1, y = \"two\" }\nwhen = 2024-05-01T10:00:00Z\nbig = 1_000_000\n";
+        let v = parse_toml(text).unwrap();
+        assert_eq!(v.str_of("title"), "line one\nline two\n");
+        assert_eq!(
+            v.get("a").unwrap().get("b").unwrap().get("c").unwrap().as_u64(),
+            Some(1)
+        );
+        assert_eq!(v.get("inline").unwrap().str_of("y"), "two");
+        assert_eq!(v.str_of("when"), "2024-05-01T10:00:00Z");
+        assert_eq!(v.u64_of("big"), Some(1_000_000));
+        // A syntax error carries the crate's own line/column message.
+        let e = parse_toml("a = \n").unwrap_err();
+        assert!(e.contains("line 1"), "{e}");
     }
 }

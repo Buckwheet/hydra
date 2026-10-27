@@ -2,3 +2,7 @@
 name = "hydra_rewards"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+hydra_net = { path = "../hydra_net" }
+hydra_session = { path = "../hydra_session" }

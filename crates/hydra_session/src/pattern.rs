@@ -1,67 +1,68 @@
-//! A small regular-expression matcher.
+//! Regular expressions.
 //!
 //! The original linked the `regex` crate: `hydra_session::stream_rules` calls
 //! `regex_automata::meta::regex::Regex::search_half` (`0x101a061e0`) and
 //! `regex::escape` (`0x101a02398`, `0x101a03f80`), and the player log's search
-//! takes either a literal or a regex.  `hydra_session` is std-only here, so
-//! this module implements the subset of `regex` syntax the rules use:
+//! takes either a literal or a regex.  **Phase 1** reconnected the real crate:
+//! [`Pattern`] wraps a `regex::Regex`, so the syntax the rules are written in
+//! (`\w`, `\d`, `\s`, classes, `* + ?`, `^ $`, alternation, groups — and now
+//! everything else `regex` understands: `\b`, `[[:alpha:]]`, `{2,3}`, `(?i)`,
+//! lazy repetitions, `(?:…)`, `(?P<name>…)`) is the crate's own, and a broken
+//! pattern is reported with the crate's error message instead of a hand-written
+//! one.
 //!
-//! * literals, and `\` escaping of any metacharacter (see [`escape`], which is
-//!   `regex::escape`);
-//! * `.` — any character except `\n`;
-//! * `[abc]`, `[^abc]`, `[a-z]`, `[[:alpha:]]`-free POSIX classes are *not*
-//!   supported;
-//! * the class escapes \w, \d, \s and their negations;\n//! * the greedy postfix operators `*`, `+`, `?`, and the lazy forms `*?`, `+?`,
-//!   `??` (lazy is accepted and treated as greedy-from-the-shortest);
-//! * `^` and `$` anchors;
-//! * alternation `|`, and non-capturing/unnamed groups `(...)`; captures are
-//!   not exposed.
+//! Two behaviours are deliberately *kept* from the reconstruction:
 //!
-//! Departures from `regex` are recorded in `NOTES.md`; the important one is
-//! that matching is character-based and backtracks, so a pathological pattern
-//! can be exponential (the recovered rules are short and anchored).
+//! * [`Pattern::literal`] is a substring test — it compiles `regex::escape` of
+//!   the text, which is exactly `str::contains` for the same input;
+//! * [`escape`] is `regex::escape`, the function the binary calls.
+//!
+//! The three broken-pattern behaviours the crate tests are the `regex` crate's:
+//! an unclosed group (`^(a`), an unclosed class (`[abc`) and a repetition with
+//! nothing to repeat (`*a`) are all `Err`, and each error carries the span and
+//! the reason.
+
+use regex::Regex;
+use std::fmt;
+use std::sync::Arc;
 
 /// A compiled pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Cloning is cheap: the compiled `Regex` is shared through an `Arc`, which is
+/// what the rule set does when it hands a compiled pattern to `Compiled`.
+#[derive(Clone)]
 pub struct Pattern {
-    /// alternatives, each a sequence of nodes
-    alts: Vec<Vec<Node>>,
+    /// the compiled expression
+    inner: Arc<Regex>,
     /// the original source, kept for display and for `Debug`
     source: String,
-    /// literal patterns skip the matcher entirely (`Pattern::literal`)
+    /// literal patterns are `regex::escape`d text (`Pattern::literal`)
     literal: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Node {
-    Lit(char),
-    Any,
-    Class { ranges: Vec<(char, char)>, negated: bool },
-    Start,
-    End,
-    Star(Box<Node>, bool),
-    Plus(Box<Node>, bool),
-    Opt(Box<Node>, bool),
-    Group(Vec<Vec<Node>>),
 }
 
 impl Pattern {
     /// A pattern that matches `text` literally (no metacharacters at all).
+    ///
+    /// **ESTABLISHED** shape: the reader's literal search is a substring test,
+    /// so the literal is escaped and compiled like any other pattern.
     pub fn literal(text: &str) -> Self {
+        let inner = Regex::new(&regex::escape(text))
+            .expect("`regex::escape` always produces a valid expression");
         Pattern {
-            alts: vec![text.chars().map(Node::Lit).collect()],
+            inner: Arc::new(inner),
             source: text.to_string(),
             literal: true,
         }
     }
 
-    /// Compile a regular expression.
+    /// Compile a regular expression with the `regex` crate.
+    ///
+    /// **ESTABLISHED** (`0x101a02398`, `0x101a03f80`): the original compiled
+    /// with `regex` and used `regex::escape` to build anchored patterns.
     pub fn regex(src: &str) -> Result<Self, String> {
-        let chars: Vec<char> = src.chars().collect();
-        let mut p = Comiler { c: &chars, i: 0 };
-        let alts = p.alternatives()?;
+        let inner = Regex::new(src).map_err(|e| e.to_string())?;
         Ok(Pattern {
-            alts,
+            inner: Arc::new(inner),
             source: src.to_string(),
             literal: false,
         })
@@ -78,324 +79,42 @@ impl Pattern {
     }
 
     /// Does `text` contain a match?
+    ///
+    /// **ESTABLISHED** (`0x101a061e0`): `search_half` on the compiled
+    /// expression, i.e. an unanchored search.
     pub fn is_match(&self, text: &str) -> bool {
-        if self.literal {
-            // A literal pattern matches as a substring, like `str::contains`.
-            return match self.alts.first() {
-                Some(nodes) => {
-                    let needle: String = nodes
-                        .iter()
-                        .map(|n| match n {
-                            Node::Lit(c) => *c,
-                            _ => '\u{0}',
-                        })
-                        .collect();
-                    text.contains(&needle)
-                }
-                None => true,
-            };
-        }
-        let chars: Vec<char> = text.chars().collect();
-        // An unanchored regex is tried at every start offset.
-        let anchored_start = self
-            .alts
-            .iter()
-            .all(|alt| matches!(alt.first(), Some(Node::Start)));
-        for start in 0..=chars.len() {
-            for alt in &self.alts {
-                if let Some(_end) = match_seq(alt, &chars, start) {
-                    return true;
-                }
-            }
-            if anchored_start {
-                break;
-            }
-        }
-        false
+        self.inner.is_match(text)
+    }
+
+    /// The compiled expression itself, for callers that need captures.
+    pub fn compiled(&self) -> &Regex {
+        &self.inner
     }
 }
 
-struct Comiler<'a> {
-    c: &'a [char],
-    i: usize,
-}
-
-impl<'a> Comiler<'a> {
-    fn peek(&self) -> Option<char> {
-        self.c.get(self.i).copied()
-    }
-
-    fn next(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
-            self.i += 1;
-        }
-        c
-    }
-
-    fn alternatives(&mut self) -> Result<Vec<Vec<Node>>, String> {
-        let mut alts = Vec::new();
-        loop {
-            alts.push(self.sequence()?);
-            if self.peek() == Some('|') {
-                self.i += 1;
-                continue;
-            }
-            break;
-        }
-        if self.i < self.c.len() {
-            return Err(format!(
-                "unexpected `{}` at offset {}",
-                self.c[self.i], self.i
-            ));
-        }
-        Ok(alts)
-    }
-
-    fn sequence(&mut self) -> Result<Vec<Node>, String> {
-        let mut out = Vec::new();
-        while let Some(c) = self.peek() {
-            if c == '|' || c == ')' {
-                break;
-            }
-            let atom = self.atom()?;
-            // postfix operators
-            let mut node = atom;
-            loop {
-                match self.peek() {
-                    Some('*') => {
-                        self.i += 1;
-                        let lazy = self.eat_lazy();
-                        node = Node::Star(Box::new(node), lazy);
-                    }
-                    Some('+') => {
-                        self.i += 1;
-                        let lazy = self.eat_lazy();
-                        node = Node::Plus(Box::new(node), lazy);
-                    }
-                    Some('?') => {
-                        self.i += 1;
-                        let lazy = self.eat_lazy();
-                        node = Node::Opt(Box::new(node), lazy);
-                    }
-                    _ => break,
-                }
-            }
-            out.push(node);
-        }
-        Ok(out)
-    }
-
-    fn eat_lazy(&mut self) -> bool {
-        if self.peek() == Some('?') {
-            self.i += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn atom(&mut self) -> Result<Node, String> {
-        match self.next() {
-            None => Err("unexpected end of pattern".to_string()),
-            Some('\\') => match self.next() {
-                Some(c @ ('w' | 'd' | 's' | 'W' | 'D' | 'S')) => {
-                    let ranges: Vec<(char, char)> = match c.to_ascii_lowercase() {
-                        'w' => vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
-                        'd' => vec![('0', '9')],
-                        _ => vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
-                    };
-                    Ok(Node::Class {
-                        ranges,
-                        negated: c.is_ascii_uppercase(),
-                    })
-                }
-                Some(c) => Ok(Node::Lit(c)),
-                None => Err("dangling escape".to_string()),
-            },
-            Some('.') => Ok(Node::Any),
-            Some('^') => Ok(Node::Start),
-            Some('$') => Ok(Node::End),
-            Some('(') => {
-                // `(?:` is accepted and ignored, as are capture groups.
-                if self.peek() == Some('?') {
-                    self.i += 1;
-                    if self.peek() == Some(':') {
-                        self.i += 1;
-                    } else {
-                        return Err("unsupported group flag".to_string());
-                    }
-                }
-                let inner = self.alternatives_until_paren()?;
-                Ok(Node::Group(inner))
-            }
-            Some('[') => self.class(),
-            Some(c @ ('*' | '+' | '?') ) => Err(format!("nothing to repeat `{c}`")),
-            Some(c) => Ok(Node::Lit(c)),
-        }
-    }
-
-    fn alternatives_until_paren(&mut self) -> Result<Vec<Vec<Node>>, String> {
-        let mut alts = Vec::new();
-        loop {
-            alts.push(self.sequence()?);
-            match self.peek() {
-                Some('|') => {
-                    self.i += 1;
-                }
-                Some(')') => {
-                    self.i += 1;
-                    return Ok(alts);
-                }
-                _ => return Err("unclosed group".to_string()),
-            }
-        }
-    }
-
-    fn class(&mut self) -> Result<Node, String> {
-        let mut negated = false;
-        if self.peek() == Some('^') {
-            self.i += 1;
-            negated = true;
-        }
-        let mut ranges = Vec::new();
-        let mut first = true;
-        loop {
-            let c = match self.next() {
-                None => return Err("unclosed character class".to_string()),
-                Some(c) => c,
-            };
-            if c == ']' && !first {
-                return Ok(Node::Class { ranges, negated });
-            }
-            first = false;
-            let lo = if c == '\\' {
-                self.next().ok_or("dangling escape in class")?
-            } else {
-                c
-            };
-            if self.peek() == Some('-') && self.c.get(self.i + 1).copied() != Some(']') {
-                self.i += 1;
-                let hi = match self.next() {
-                    Some('\\') => self.next().ok_or("dangling escape in class")?,
-                    Some(h) => h,
-                    None => return Err("unclosed character class".to_string()),
-                };
-                ranges.push((lo, hi));
-            } else {
-                ranges.push((lo, lo));
-            }
-        }
+impl PartialEq for Pattern {
+    /// Two patterns are the same when they were built from the same source the
+    /// same way; the compiled `Regex` is not comparable.
+    fn eq(&self, other: &Self) -> bool {
+        self.literal == other.literal && self.source == other.source
     }
 }
 
-fn match_seq(nodes: &[Node], text: &[char], pos: usize) -> Option<usize> {
-    match nodes.split_first() {
-        None => Some(pos),
-        Some((node, rest)) => match node {
-            Node::Start => {
-                if pos == 0 {
-                    match_seq(rest, text, pos)
-                } else {
-                    None
-                }
-            }
-            Node::End => {
-                if pos == text.len() {
-                    match_seq(rest, text, pos)
-                } else {
-                    None
-                }
-            }
-            Node::Lit(c) => {
-                if text.get(pos) == Some(c) {
-                    match_seq(rest, text, pos + 1)
-                } else {
-                    None
-                }
-            }
-            Node::Any => match text.get(pos) {
-                Some('\n') | None => None,
-                Some(_) => match_seq(rest, text, pos + 1),
-            },
-            Node::Class { ranges, negated } => match text.get(pos) {
-                None => None,
-                Some(c) => {
-                    let inside = ranges.iter().any(|(lo, hi)| lo <= c && c <= hi);
-                    if inside != *negated {
-                        match_seq(rest, text, pos + 1)
-                    } else {
-                        None
-                    }
-                }
-            },
-            Node::Group(alts) => {
-                // Leftmost alternative first, then continue with the rest.
-                for alt in alts {
-                    if let Some(next) = match_seq(alt, text, pos) {
-                        if let Some(done) = match_seq(rest, text, next) {
-                            return Some(done);
-                        }
-                    }
-                }
-                None
-            }
-            Node::Opt(inner, _) => {
-                if let Some(next) = match_seq(std::slice::from_ref(&**inner), text, pos) {
-                    if let Some(done) = match_seq(rest, text, next) {
-                        return Some(done);
-                    }
-                }
-                match_seq(rest, text, pos)
-            }
-            Node::Star(inner, _) => {
-                // Greedy: take one iteration, ask for as many more as possible
-                // (the recursion below), and only then accept zero more.
-                let mut more = vec![Node::Star(inner.clone(), false)];
-                more.extend_from_slice(rest);
-                if let Some(next) = match_seq(std::slice::from_ref(&**inner), text, pos) {
-                    if next > pos {
-                        if let Some(done) = match_seq(&more, text, next) {
-                            return Some(done);
-                        }
-                    }
-                }
-                match_seq(rest, text, pos)
-            }
-            Node::Plus(inner, _) => {
-                let mut more = vec![Node::Star(inner.clone(), false)];
-                more.extend_from_slice(rest);
-                if let Some(next) = match_seq(std::slice::from_ref(&**inner), text, pos) {
-                    if next > pos {
-                        return match_seq(&more, text, next);
-                    }
-                }
-                None
-            }
-        },
-    }
-}
+impl Eq for Pattern {}
 
-/// Match `nodes` at `pos` and return the end position.
-fn match_one(node: &Node, text: &[char], pos: usize) -> Option<usize> {
-    match_seq(std::slice::from_ref(node), text, pos)
+impl fmt::Debug for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pattern")
+            .field("source", &self.source)
+            .field("literal", &self.literal)
+            .finish()
+    }
 }
 
 /// `regex::escape`: put a backslash before every character that means
 /// something to the regex engine.
 pub fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(
-            c,
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
-                | '#' | '&' | '-' | '~'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+    regex::escape(text)
 }
 
 #[cfg(test)]
@@ -461,5 +180,64 @@ mod tests {
         assert!(Pattern::regex("^(a").is_err());
         assert!(Pattern::regex("[abc").is_err());
         assert!(Pattern::regex("*a").is_err());
+    }
+
+    #[test]
+    fn broken_patterns_carry_the_regex_crate_s_message() {
+        // The hand engine reported `unclosed group` / `nothing to repeat` of its
+        // own; the crate's error carries the span and the reason.
+        let e = Pattern::regex("^(a").unwrap_err();
+        assert!(e.contains("unclosed group"), "{e}");
+        let e = Pattern::regex("[abc").unwrap_err();
+        assert!(e.contains("unclosed character class"), "{e}");
+        let e = Pattern::regex("*a").unwrap_err();
+        assert!(e.contains("repetition operator missing expression"), "{e}");
+        // An empty alternation in a repetition is refused by the crate.
+        assert!(Pattern::regex("(?:a|)+").is_ok());
+        assert!(Pattern::regex("(?P<1>x)").is_err(), "bad capture name");
+    }
+
+    #[test]
+    fn the_syntax_the_hand_engine_lacked_now_works() {
+        // word boundaries and explicit repetition counts
+        let p = Pattern::regex(r"\bAelith\b").unwrap();
+        assert!(p.is_match("then Aelith says"));
+        assert!(!p.is_match("Aeliths says"));
+        assert!(Pattern::regex(r"^\d{2,3} coins").unwrap().is_match("123 coins"));
+        assert!(!Pattern::regex(r"^\d{2,3} coins")
+            .unwrap()
+            .is_match("1 coins"));
+        // POSIX classes, which the hand engine explicitly did not support
+        assert!(Pattern::regex("^[[:alpha:]]+ says")
+            .unwrap()
+            .is_match("Aelith says"));
+        // inline flags
+        assert!(Pattern::regex("(?i)^kobold").unwrap().is_match("KOBOLD attacks"));
+        // lazy quantifiers are real now: the match still succeeds, but the
+        // shortest form wins when a capture is read
+        let lazy = Pattern::regex(r"^a.*?c").unwrap();
+        assert!(lazy.is_match("abcbc"));
+        let caps = Pattern::regex(r"^(\w+) attacks (\w+)").unwrap();
+        let got = caps.compiled().captures("Kobold attacks you").unwrap();
+        assert_eq!(&got[1], "Kobold");
+        assert_eq!(&got[2], "you");
+        // named groups, which the crate exposes through `compiled()`
+        let named = Pattern::regex(r"^(?P<who>\w+) says").unwrap();
+        let caps = named.compiled().captures("Aelith says hi").unwrap();
+        assert_eq!(&caps["who"], "Aelith");
+    }
+
+    #[test]
+    fn literal_patterns_are_escaped_not_interpreted() {
+        // A literal never means syntax, and an empty literal matches anything —
+        // both were true of the hand engine and stay true.
+        let p = Pattern::literal("a.c");
+        assert!(p.is_match("see a.c here"));
+        assert!(!p.is_match("see abc here"));
+        assert!(Pattern::literal("").is_match("anything"));
+        assert_eq!(Pattern::literal("a.c").source(), "a.c");
+        // `PartialEq` compares the source and the kind, not the compiled form.
+        assert_eq!(Pattern::literal("a.c"), Pattern::literal("a.c"));
+        assert_ne!(Pattern::literal("a.c"), Pattern::regex("a.c").unwrap());
     }
 }

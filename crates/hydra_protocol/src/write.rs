@@ -152,7 +152,11 @@ pub fn runs(runs: &Runs) -> String {
                 out.push_str("</a>");
                 link_open = false;
             }
-            out.push_str(if want_bold { "<pushBold/>" } else { "<popBold/>" });
+            out.push_str(if want_bold {
+                "<pushBold/>"
+            } else {
+                "<popBold/>"
+            });
             bold = want_bold;
         }
 
@@ -193,10 +197,7 @@ mod tests {
 
     #[test]
     fn escape_attribute_quotes_controls() {
-        assert_eq!(
-            escape_attribute("a\tb\nc\rd"),
-            "a&#9;b&#10;c&#13;d"
-        );
+        assert_eq!(escape_attribute("a\tb\nc\rd"), "a&#9;b&#10;c&#13;d");
         assert_eq!(escape_attribute("a&b"), "a&amp;b");
     }
 
@@ -222,7 +223,11 @@ mod tests {
 
     #[test]
     fn runs_emits_bold_markers() {
-        let r = Runs(vec![Run::new("You see "), Run::bold("a gem"), Run::new(".")]);
+        let r = Runs(vec![
+            Run::new("You see "),
+            Run::bold("a gem"),
+            Run::new("."),
+        ]);
         let wire = super::runs(&r);
         assert_eq!(wire, "You see <pushBold/>a gem<popBold/>.");
     }
@@ -230,10 +235,7 @@ mod tests {
     #[test]
     fn runs_emits_presets() {
         let r = Runs(vec![Run::with_preset("A room", "roomDesc")]);
-        assert_eq!(
-            super::runs(&r),
-            "<preset id=\"roomDesc\">A room</preset>"
-        );
+        assert_eq!(super::runs(&r), "<preset id=\"roomDesc\">A room</preset>");
     }
 
     #[test]

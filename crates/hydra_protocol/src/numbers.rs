@@ -97,9 +97,7 @@ pub fn parse_duration_secs(text: &str) -> Option<u64> {
         }
         let total = match nums.as_slice() {
             [secs] => *secs,
-            [mins, secs] => mins
-                .checked_mul(60)?
-                .checked_add(*secs)?,
+            [mins, secs] => mins.checked_mul(60)?.checked_add(*secs)?,
             [hours, mins, secs] => hours
                 .checked_mul(3600)?
                 .checked_add(mins.checked_mul(60)?)?

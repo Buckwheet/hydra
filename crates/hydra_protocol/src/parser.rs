@@ -283,8 +283,7 @@ mod tests {
     #[test]
     fn object_link_is_extracted() {
         let mut parser = Parser::new();
-        let frames =
-            parser.parse_line("<a exist=\"123\" noun=\"gem\">a blue gem</a>");
+        let frames = parser.parse_line("<a exist=\"123\" noun=\"gem\">a blue gem</a>");
         let runs = first_text(&frames);
         assert_eq!(runs.plain(), "a blue gem");
         let link = runs[0].link.as_ref().expect("link");
@@ -315,13 +314,8 @@ mod tests {
     #[test]
     fn links_nested_inside_roomdesc_are_found() {
         let mut parser = Parser::new();
-        let frames = parser.parse_line(
-            "<roomDesc>A blue gem lies here.</roomDesc>",
-        );
-        assert_eq!(
-            first_text(&frames).plain(),
-            "A blue gem lies here."
-        );
+        let frames = parser.parse_line("<roomDesc>A blue gem lies here.</roomDesc>");
+        assert_eq!(first_text(&frames).plain(), "A blue gem lies here.");
 
         let frames = parser.parse_line(
             "<roomDesc>You see <a exist=\"7\" noun=\"gem\">a blue gem</a> here.</roomDesc>",
@@ -345,10 +339,7 @@ mod tests {
         assert_eq!(frames, vec![Frame::Prompt(">".into())]);
 
         let frames = parser.parse_line("<merchantStatus> STOP </merchantStatus>");
-        assert_eq!(
-            frames,
-            vec![Frame::MerchantStatus(MerchantStatus::Stop)]
-        );
+        assert_eq!(frames, vec![Frame::MerchantStatus(MerchantStatus::Stop)]);
     }
 
     #[test]
@@ -368,10 +359,7 @@ mod tests {
         assert!(parser
             .parse_line("<settings>{\"a\":1}</settings>")
             .is_empty());
-        assert_eq!(
-            first_text(&parser.parse_line("visible")).plain(),
-            "visible"
-        );
+        assert_eq!(first_text(&parser.parse_line("visible")).plain(), "visible");
     }
 
     #[test]

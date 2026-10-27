@@ -202,11 +202,7 @@ mod tests {
 
     #[test]
     fn plain_concatenates_runs() {
-        let runs = Runs(vec![
-            Run::new("a blue "),
-            Run::new("gem"),
-            Run::new("."),
-        ]);
+        let runs = Runs(vec![Run::new("a blue "), Run::new("gem"), Run::new(".")]);
         assert_eq!(runs.plain(), "a blue gem.");
     }
 

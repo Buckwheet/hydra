@@ -352,12 +352,7 @@ mod tests {
         );
 
         let link = link_from_tag("<d cmd=\"look\">").unwrap();
-        assert_eq!(
-            link.target,
-            LinkTarget::Command {
-                cmd: "look".into()
-            }
-        );
+        assert_eq!(link.target, LinkTarget::Command { cmd: "look".into() });
 
         assert!(link_from_tag("<a>").is_none());
     }

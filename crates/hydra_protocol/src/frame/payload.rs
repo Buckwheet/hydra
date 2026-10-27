@@ -11,10 +11,7 @@ use crate::runs::Run;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkTarget {
     /// `<a exist="123" noun="gem">`
-    Object {
-        exist: String,
-        noun: Option<String>,
-    },
+    Object { exist: String, noun: Option<String> },
     /// `<d cmd="look">`
     Command { cmd: String },
     /// `<a href="...">`

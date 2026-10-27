@@ -1,4 +1,4 @@
-#![allow(dead_code,unused)]
+#![allow(dead_code, unused)]
 pub mod banner;
 pub mod binding;
 pub mod chips;
@@ -17,6 +17,7 @@ pub mod seat;
 pub mod sessions;
 pub mod store;
 pub mod stream_rules;
+pub mod text;
 pub mod targets;
 pub mod trainer;
 

@@ -33,8 +33,9 @@ pub fn names_a_snapshot(name: &str) -> bool {
 ///
 /// The original called `hydra_ledger::Ledger::reader()` and
 /// `Reader::latest_snapshots()` (`0x10168c174`) and then wrote through
-/// `hydra_ledger`'s writer; that crate is still a stub in this workspace, so the
-/// two halves are a trait here (see `NOTES.md`).
+/// `hydra_ledger`'s writer; the two halves are a trait here so a caller can
+/// supply its own, and [`crate::ledger::LedgerSink`] is the real implementation
+/// over `hydra_ledger` (see `NOTES.md`).
 pub trait Sink {
     /// The most recent snapshot of every kind (`Reader::latest_snapshots`).
     fn latest_snapshots(&self) -> Result<Vec<Snapshot>, String>;

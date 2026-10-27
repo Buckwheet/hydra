@@ -1,0 +1,136 @@
+# Poses for every family rigged from the "serpentine" template.
+#
+# ANGLES ONLY, in degrees, so a pose transfers to any family of this body
+# type. Keys are BONE names. A key with no _l / _r that names no bone is a
+# PAIR: "leg" poses leg_l as written and leg_r mirrored (y, z negated).
+#
+#   rot  = [x, y, z]  Euler, for the bone's FIRST segment about its pivot, in
+#                     its parent's frame (x = left, y = up, z = front), applied
+#                     Rx * Rz * Ry: twist (y), then spread (z), then swing (x).
+#                     A limb hanging down: +x swings it BACK, -x forward;
+#                     +z lifts a LEFT limb out to the side.
+#   bend = [deg, ..]  one per INNER segment of the chain (elbow; knee, ankle;
+#                     stifle, hock), about its natural hinge. + swings the far
+#                     end BACK for a hanging limb: knees +, elbows -.
+#   root = [x, y, z]  turns the whole figure about the root bone's pivot.
+#
+# No translations: after FK the figure is rested on the ground.
+
+body_type = "serpentine"
+
+[pose.stand]
+
+# Angles are authored on the SERPENT (a rattlesnake coiled in three stacked
+# rings, neck rising out of the top one); the worm, which lies along the
+# ground and rears its front half up, has its own section at the bottom.
+#
+# The rig is one chain: skull <- neck <- fore_body <- mid_body (root, turning
+# about belly_mid) -> hind_body. A bone pointing UP (the neck) tips forward
+# with +x; one pointing FORWARD (the skull) tips its tip down with +x.
+
+# Coiled at rest: the top ring sinks onto the others and the head is laid
+# down on the coils. The neck turns only 40 degrees: its drawn S-bend is
+# carried as sideways station offsets, so a big neck angle swings the bend
+# up into a stub. Lower the whole fore body instead.
+[pose.lie]
+fore_body = { rot = [25.0, 0.0, 0.0] }
+neck = { rot = [40.0, 0.0, 0.0] }
+skull = { rot = [-30.0, 0.0, 0.0] }
+
+# Knocked flat: the top ring slumped and swung aside, head sprawled on the
+# ground beside the coils. (Rolling the root instead tips the whole coil up
+# like a lid, which reads as a slab, not a fallen snake.)
+[pose.fallen_side]
+fore_body = { rot = [30.0, -65.0, 0.0] }
+neck = { rot = [40.0, 0.0, 0.0] }
+skull = { rot = [-25.0, 0.0, 0.0] }
+
+# Groggy: the head sags forward and the snout droops.
+[pose.stunned]
+fore_body = { rot = [12.0, 0.0, 0.0] }
+neck = { rot = [15.0, 0.0, 0.0] }
+skull = { rot = [45.0, 0.0, 0.0] }
+
+# Slack: the top ring slumped the other way, head flat on the ground and
+# rolled over.
+[pose.dead]
+fore_body = { rot = [35.0, -30.0, 0.0] }
+neck = { rot = [55.0, 0.0, 0.0] }
+skull = { rot = [-25.0, 40.0, 0.0] }
+
+# ---------------------------------------------------------------- families
+#
+# `[family.<family>.<pose>]` replaces just the keys it names.
+#
+# The WORM lies along the ground and rears its front half up: its fore_body
+# is a vertical column, not a ring. Folding that column forward (the serpent
+# angles) only hunches it into an arch, and the root cannot lower it without
+# help: the root is mid_body, turning about belly_mid, so pitching it
+# nose-down (+x) brings the column level but swings the tail half up by the
+# same angle. hind_body then pitches back down by more than that, and a bend
+# at back_1 levels the tail on the ground. Net: the whole worm lies flat
+# with a low hump where the root joint is.
+
+[family.worm.lie]
+root = [55.0, 0.0, 0.0]
+hind_body = { rot = [-80.0, 0.0, 0.0], bend = [25.0, 0.0, 0.0] }
+fore_body = { rot = [0.0, 0.0, 0.0] }
+neck = { rot = [20.0, 0.0, 0.0] }
+skull = { rot = [-20.0, 0.0, 0.0] }
+
+# Flat on the ground, the front curled off to one side.
+[family.worm.fallen_side]
+root = [55.0, 0.0, 0.0]
+hind_body = { rot = [-80.0, 0.0, 0.0], bend = [25.0, 0.0, 0.0] }
+fore_body = { rot = [0.0, -40.0, 0.0] }
+neck = { rot = [20.0, -30.0, 0.0] }
+skull = { rot = [-20.0, 0.0, 0.0] }
+
+# Flat and slack, the front curled the other way, head rolled over.
+[family.worm.dead]
+root = [55.0, 0.0, 0.0]
+hind_body = { rot = [-80.0, 0.0, 0.0], bend = [25.0, 0.0, 0.0] }
+fore_body = { rot = [0.0, 35.0, 0.0] }
+neck = { rot = [25.0, 20.0, 0.0] }
+skull = { rot = [-25.0, 0.0, 50.0] }
+
+# Joint limits: how far each bone may turn, [low, high] degrees per Euler
+# angle (x swing, y twist, z spread) and per bend, as poses write them. A pair
+# stem bounds the LEFT side; the right is mirrored. Every pose, blend and
+# death fall is held inside these; the pose editor's sliders stop at them.
+[limits]
+fore_body = { rot = [[-60.0, 90.0], [-90.0, 90.0], [-45.0, 45.0]] }
+neck = { rot = [[-60.0, 90.0], [-90.0, 90.0], [-45.0, 45.0]] }
+skull = { rot = [[-60.0, 70.0], [-80.0, 80.0], [-70.0, 70.0]] }
+hind_body = { rot = [[-110.0, 60.0], [-90.0, 90.0], [-45.0, 45.0]], bend = [[-60.0, 60.0], [-60.0, 60.0], [-60.0, 60.0]] }
+
+# Breathing at rest: the raised fore body sways and the head with it, the
+# hind body rippling behind on a lagging beat.
+[idle]
+period = 4.8
+fore_body = { rot = [2.0, 0.0, 3.5] }
+neck = { rot = [1.5, 0.0, -2.0], phase = -0.1 }
+skull = { rot = [1.5, 0.0, 0.0], phase = -0.15 }
+hind_body = { rot = [0.0, 0.0, 2.0], bend = [2.5, -2.5, 2.5], phase = -0.3 }
+
+# Flinches (see `Pose::flinched`): PEAK offsets for a hit on the region,
+# mirrored for the left. Arms, hands and legs it has none of.
+[flinch.head]
+skull = { rot = [12.0, 0.0, -10.0] }
+neck = { rot = [12.0, 0.0, -12.0] }
+
+[flinch.neck]
+neck = { rot = [14.0, 0.0, 0.0] }
+skull = { rot = [6.0, 0.0, 0.0] }
+
+[flinch.chest]
+fore_body = { rot = [-12.0, 0.0, 8.0] }
+neck = { rot = [8.0, 0.0, 0.0] }
+
+[flinch.abdomen]
+hind_body = { bend = [10.0, -10.0, 10.0] }
+fore_body = { rot = [-6.0, 0.0, 0.0] }
+
+[flinch.back]
+fore_body = { rot = [10.0, 0.0, 0.0] }
+neck = { rot = [-8.0, 0.0, 0.0] }

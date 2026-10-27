@@ -4,8 +4,10 @@ Source: arm64 Mach-O `/Users/cpmbpro/Code/hydra-inspect/hydra` (no DWARF).  Ever
 address below is an unslid virtual address and can be re-read with
 `/usr/bin/objdump -d --start-address=0xA --stop-address=0xB --no-show-raw-insn`.
 
-This crate is a **std-only** reconstruction of `hydra_cast`: the original linked
-`tokio`, `serde`/`serde_json` and `hydra_model`.  See §4 for each departure.
+This crate was recovered as a **std-only** reconstruction of `hydra_cast`; the
+original linked `tokio`, `serde`/`serde_json`, `hydra_model` and (for the
+command queue) `hydra_session`.  **Phase 1 reconnected all four** — see §7 for
+the versions and §4 for what is still a seam.
 
 Legend
 
@@ -58,14 +60,14 @@ called helpers recovered, body not; `seam` = a departure (see §4).
 | `settings` | `CasterSettings::set_verb` | `0x1019b4640` | full |
 | `settings` | `Chosen::named` | `0x1019b4ce8` | full |
 | `settings` | `CasterSettings::which` (not in the stub table) | `0x1019b3b24` | full |
-| `settings` | `settings::spell` (not in the stub table) | `0x1019b4b14` | full except the spell table itself (seam) |
+| `settings` | `settings::spell` (not in the stub table) | `0x1019b4b14` | full — the lookup goes through `hydra_model::spells::spell` again (= the table itself is data) |
 | `settings` | `listed::{{closure}}` | `0x1019b4270` | full (`"none"` when the list is empty, else `", "`-joined) |
 | `answers` | `answers::answer` | `0x1019a0564` | partly — six whole-sentence arms recovered, the rest UNKNOWN |
 | `answers` | `answers::stance` (not in the stub table) | `0x1019a1de8` | full |
 | `plan` | `plan::plan` | `0x1019b0ecc` | partly — checks, order, literals and command formats recovered; the tail of the builder is UNKNOWN |
 | `request` | `request::request` | `0x1019a1ef0` | partly — byte-slice scanner; only two of its texts recovered |
 | `driver` | `Game::fold` | `0x1019a7c70` | full |
-| `driver` | `driver::start` | `0x1019a7d14` | seam — 37 KB tokio task, synchronous equivalent |
+| `driver` | `driver::start` | `0x1019a7d14` | partly — 37 KB tokio task; `driver::Relay` is its `select!` loop (requests / session events / settings watch), the arm bodies are not unwound |
 | `driver` | `Game::{out_of_roundtime,idle,next,send,stance,release}` | `0x10197a58c`..`0x10197bd4c` | partly — call graph recovered, bodies are `async` state machines |
 | `driver` | `Settings::get` | `0x1019a82dc` | partly — `Arc<Mutex<Read>>` shape recovered |
 
@@ -231,15 +233,23 @@ the grammar: `ec on|off|status`, `ec alias <spell> <name>`, `ec alias clear
 * `Game::fold` returns only the lines it has not returned before; an event that
   replaces the model resets that counter and returns an empty `Vec`.
 
-## 4. Departures from the original (std only)
+## 4. Departures from the original
+
+Phase 1 reconnected four of the five departures below; the struck-through rows
+are the ones that are real crates again (§7 for the versions).  What is left in
+the last three rows is what the binary does not let us finish: the `request`
+scanner's corpus, and the queries `hydra_model` answers from the character's
+live `GameState`, which a `&'static` adapter cannot hold.
 
 | original | here | why |
 | --- | --- | --- |
-| `hydra_model::spells`, `state::GameState`, `KnownSpells`, `spell_cost`, `ProcLine` | `game::World` trait + `game::install`/`game::world` | `hydra_model` is being recovered on another branch; the crate may not depend on it yet.  With no `World` installed every spell number is refused — nothing is invented. |
-| `hydra_session` command queue (from `Game::send`, `cast_line`, `cast_through`) | `driver::Sink` (`fn say(&mut self, line)`) | keeps the model/state logic, no-op seam for the transport |
-| `tokio` (task, `mpsc::UnboundedReceiver<Request>`, `broadcast`, `Mutex`/`Arc`) | `std::sync::mpsc::Receiver`, `std::sync::{Arc, Mutex}` | synchronous equivalent: requests are consumed in order, no waiting |
-| `serde` + `serde_json` (`Serialize`/`Deserialize` for `CasterSettings`, `Options`, `Chosen`) | plain structs with `Default`/`Clone`/`Debug`/`PartialEq`; the JSON member names are recorded above but no reader/writer is shipped | only the *shape* is in the binary; a JSON implementation was not needed by any recovered function |
-| `regex`-free byte scanner in `request::request` | `request(line: &str)` over the crate's own command grammar | the original scans a byte slice for game text (see below) |
+| ~~`hydra_model::spells`, `state::GameState`, `KnownSpells`, `spell_cost`, `ProcLine`~~ | ~~`game::World` trait + `game::install`/`game::world`~~ — **reconnected**: the trait stays as the seam, `game::ModelWorld` answers it from `hydra_model` | the spell table, the known-spell set, the row's `Role`/`seconds` come from the real crate; the three queries that need the character's live `GameState` are still unknown (below) |
+| ~~`hydra_session` command queue (from `Game::send`, `cast_line`, `cast_through`)~~ | **reconnected**: `driver::Sink` stays as the transport seam, `session::SessionSink` implements it over `CommandQueue::admit`; `session::watch` hands the driver the session's broadcast | the seam is kept because the driver must stay testable without a session |
+| ~~`tokio` (task, `mpsc::UnboundedReceiver<Request>`, `broadcast`, `Mutex`/`Arc`)~~ | **reconnected**: `driver::Relay` is the `select!` loop over `mpsc`/`watch`/`broadcast`; the synchronous `driver::start` stays for callers and tests | the recovered `Game::*` bodies are still not unwound, so the arms do their work synchronously |
+| ~~`serde` + `serde_json` (`Serialize`/`Deserialize` for `CasterSettings`, `Options`, `Chosen`)~~ | **reconnected**: derived `Serialize`/`Deserialize` with the recovered member names, plus `CasterSettings::to_json`/`from_json` | the JSON shape is established (§2.2); the reader/writer pair is an addition, not a recovered function |
+| `regex`-free byte scanner in `request::request` | `request(line: &str)` over the crate's own command grammar | **stays**: `regex` is not part of this crate's recovered use — the original is a byte scanner over game text (see §5.1), and the corpus is still missing |
+| `hydra_model`'s live-state queries (`mana`, `has_live_target`, `spell_cost(number, resource)`) | `game::World` answers `None`/`false` from `ModelWorld` | `hydra_model` exposes these as methods on `GameState` (which a `&'static` adapter has no handle to), and its `GameState::spell_cost` takes a spellsong *expression*, not `(number, resource)`; `hydra_model` also records vitals as percentage records, not an absolute mana figure.  Reporting "unknown" is the recovered "do not act" answer. |
+| `ProcLine::read(number)` for "the spell works by itself" | `ModelWorld::proc_line` returns `None` | `hydra_model` has `ProcLine::read(line)` (a TSV row parser) but no installed extras table to look a *number* up in |
 
 ## 5. Unknowns
 
@@ -252,9 +262,11 @@ the grammar: `ec on|off|status`, `ec alias <spell> <name>`, `ec alias clear
    `Request`'s field list is UNKNOWN — the crate only knows that it is sent to
    the driver over an unbounded channel and owns heap data.
 2. **`driver::start`** (37 304 bytes, 11 604-byte body): a tokio task that
-   selects over requests, session events and settings changes.  The synchronous
-   `start` keeps the order (fold events → plan → send) and the settings cell but
-   has no waiting.
+   selects over requests, session events and settings changes.  Phase 1 rebuilt
+   the three arms as `driver::Relay` (§7); what is still unknown is *what the
+   arms await* — the recovered `Game::answer`/`release`/`out_of_roundtime` waits
+   are not unwound, so an arm plans and sends without waiting.  The synchronous
+   `start` keeps the order (fold events → plan → send) and the settings cell.
 3. **`Game::{next, send, stance, release, cast, cast_line, cast_through,
    prepare, answer, out_of_roundtime}`**: the call graph
    (`out_of_roundtime → idle → next → fold`, `stance → next, send,
@@ -278,20 +290,92 @@ the grammar: `ec on|off|status`, `ec alias <spell> <name>`, `ec alias clear
    and is used four times in `plan`'s target section.  It is recorded but not
    implemented — it looks like a fixture, and guessing its condition would be
    invented behaviour.
-9. **`settings::spell`'s "is it a spell" test** needs `hydra_model`; see §4.
+9. **`settings::spell`'s "is it a spell" test** is `hydra_model::spells::spell`
+   now (0x1019b4ca0).  The spell table itself is a generated data file the crate
+   does not embed, so the answer is only as good as `spells::set_spells`.
 
 ## 6. Tests
 
-`cargo build -p hydra_cast --offline` and the two test harnesses
-(`--test cast` and the lib unit tests) pass; 24 tests:
+`cargo check -p hydra_cast --offline` and `cargo test -p hydra_cast --offline`
+pass; **40 tests** (24 recovered + 16 for the reconnection):
 
 ```
 tests/cast.rs       14  every expected string is a recovered literal
+tests/relay.rs       6  the tokio loop: order, refusal, settings, events, task
+tests/serde.rs       4  the JSON member names and round trips
+tests/model.rs       2  the hydra_model adapter over a real spell table
 src/answers.rs       3
 src/request.rs       4
 src/driver.rs        3  (fold, the start loop, the settings cell)
+src/game.rs          2  the adapter's default and known-spell answers
+src/session.rs       2  the command queue behind `Sink`, and the broadcast
 ```
 
 `tests/cast.rs` installs a three-spell `game::World` fixture; the spell numbers
 and names there are made up (the real table is `hydra_model`'s) but every
 message, list order and state transition asserted is from the binary.
+`tests/model.rs` fills `hydra_model::spells` with two rows through
+`spells::set_spells` and drives the same code paths (`settings::spell`,
+`plan::plan`) through the real adapter.
+
+## 7. Phase 1 reconnection
+
+Dependencies added to `crates/hydra_cast/Cargo.toml` (all pinned in the root
+`[workspace.dependencies]`, used with `x = { workspace = true }`, resolved and
+built with `cargo --offline`):
+
+| dependency | version | replaces |
+| --- | --- | --- |
+| `serde` (features `derive` from the pin) | 1.0.229 | plain `Debug`/`Clone`/`PartialEq` structs |
+| `serde_json` | 1.0.151 | nothing — the reader/writer the recorded shape never had |
+| `tokio` (features `full` from the pin) | 1.53.1 | `std::sync::mpsc::Receiver` + the synchronous loop |
+| `hydra_model` (workspace path) | 0.0.0 | the `game::World` "no model" default |
+| `hydra_session` (workspace path) | 0.0.0 | the no-op transport behind `driver::Sink` |
+
+What the real crates now back:
+
+* **`serde`/`serde_json`** — `CasterSettings`, `Options` and `Chosen` derive
+  `Serialize`/`Deserialize` with the member names and order of §2.2; `Chosen`
+  is `"cast"`/`"channel"`/`"evoke"` (`rename_all = "lowercase"`), and an unknown
+  word fails through serde's own `unknown variant` path, which is what the enum
+  deserialiser at `0x1019b49a8` calls.  A missing member keeps its default:
+  the recovered visitor's behaviour there is not in the binary (INFERRED).
+  `to_json`/`from_json` are additions (no recovered address) so the shape has a
+  reader and a writer; `tests/serde.rs` pins the exact JSON.
+* **`tokio`** — `driver::Relay` is the recovered task: `tokio::sync::mpsc::
+  unbounded_channel` of `Request` (the type the binary's `driver::start` holds),
+  `tokio::sync::watch` of the settings cell (`Settings::watch`, filled by
+  `Settings::put`), and `tokio::sync::broadcast` of
+  `hydra_session::command::Event`, chosen between with `tokio::select!`.
+  `Relay::start` drives it on a current-thread runtime it owns (the sync
+  adapter) and `Relay::spawn` starts it as a task, which is what the original
+  was.  The synchronous `driver::start` over `std::sync::mpsc` is unchanged.
+  `driver::Sink` gained `Send` because the loop now lives in a task.
+* **`hydra_model`** — `game::ModelWorld` answers `World::spell_name` from
+  `spells::spell` (`0x101bc54a0`), `World::knows` from
+  `state::known_spells::KnownSpells::knows` (`0x101c0e1bc`), `World::is_attack`
+  from the row's `Role` (`Role::Attack` is the recovered kind `0`, see
+  `game::KIND_ATTACK`) and `World::seconds` from the row's `seconds` (the
+  `+0x18` `f64`).  `game::world_model()` is that adapter, so the crate no longer
+  has a "no model" default; `game::install`/`game::world` and the `World` trait
+  are unchanged, and `game::Nothing` is still there for callers (and tests) that
+  want no casting at all.  `install_model()`/`install_model_with(&KnownSpells)`
+  are the constructors.  The queries that need the character's *live*
+  `GameState` (`mana`, `has_live_target`, `spell_cost(number, resource)`) and
+  the proc-line table stay unknown — see §4.
+* **`hydra_session`** — `session::SessionSink` implements `driver::Sink` by
+  admitting an `Envelope` into `SessionHandle::queue` (`CommandQueue::admit`,
+  `0x101a0c52c`), which is what `Game::send`/`cast_line`/`cast_through` did, and
+  `session::watch` returns the session's real `broadcast` receiver for the
+  driver's event arm (`driver::fold_session` maps `Frames`/`Said` to
+  `Event::Said` lines and `Over` to `Event::Reset` — the last mapping is
+  INFERRED).
+
+Tests added: `tests/relay.rs` (ordered request relay, refusal, settings changes
+landing on the next cast and while idle, session events folding, task form),
+`tests/serde.rs` (JSON shape and round trips), `tests/model.rs` (the adapter
+answers a real spell and refuses an unknown one), plus two unit tests in
+`src/game.rs` and two in `src/session.rs`.  `tests/cast.rs` installs its fixture
+explicitly now instead of relying on another test having done it.
+
+EXIT: 40/40 tests pass; `cargo check --workspace --offline` is clean.

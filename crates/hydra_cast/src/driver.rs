@@ -29,9 +29,28 @@
 //! Only [`Game::fold`] (0x1019a7c70, 164 bytes) is small enough to be read
 //! whole; it is implemented exactly.  Everything else is a synchronous
 //! reconstruction with the unknowns marked.
+//!
+//! # Phase 1
+//!
+//! The loop is a real tokio task again.  [`Relay`] is the recovered
+//! `driver::start` body: it owns the unbounded request channel
+//! (`tokio::sync::mpsc`), a `watch` of the settings cell and a `broadcast` of
+//! the session's events, and selects over the three with `tokio::select!`.
+//! [`Relay::start`] is the synchronous adapter that owns a current-thread
+//! runtime, and [`Relay::spawn`] is the task form the original was started as.
+//!
+//! The synchronous [`start`] over `std::sync::mpsc` stays: it is the API the
+//! crate shipped before the reconnection and the one the existing tests use.
+//! The transport seam [`Sink`] stays too; [`crate::session::SessionSink`] is
+//! the `hydra_session` command-queue implementation of it.
 
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+
+use hydra_session::command::Event as SessionEvent;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 
 use crate::game::World;
 use crate::plan::{self, Cast};
@@ -145,9 +164,11 @@ impl Game {
 /// Seam: "send a command to the game".
 ///
 /// The original pushed onto `hydra_session`'s command queue from
-/// `Game::send`/`cast_line`/`cast_through`; nothing of that crate is reachable
-/// from a synchronous loop here, so the driver takes a sink.
-pub trait Sink {
+/// `Game::send`/`cast_line`/`cast_through`; the seam keeps the driver free of
+/// the session, and [`crate::session::SessionSink`] is the queue behind it.
+///
+/// Phase 1: `Send` is required because the driver now lives in a tokio task.
+pub trait Sink: Send {
     /// Send one line.  An error means the connection is gone.
     fn say(&mut self, line: &str) -> Result<(), ()>;
 }
@@ -159,9 +180,23 @@ pub trait Sink {
 /// (0x1019a9de4), and `Settings::get` is at 0x1019a82dc.  UNKNOWN: what
 /// `Read` holds besides the settings; the generation counter is a guess kept
 /// so callers can tell two reads apart.
-#[derive(Clone, Debug, Default)]
+///
+/// Phase 1: the cell also owns the `tokio::sync::watch` the async driver
+/// selects on, so a settings change wakes the loop instead of waiting for the
+/// next request.  The mutex and its `get`/`put` shape are unchanged.
+#[derive(Clone, Debug)]
 pub struct Settings {
     inner: Arc<Mutex<Read>>,
+    changed: watch::Sender<CasterSettings>,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            inner: Arc::new(Mutex::new(Read::default())),
+            changed: watch::Sender::new(CasterSettings::default()),
+        }
+    }
 }
 
 /// What the settings mutex guards.
@@ -189,6 +224,9 @@ impl Settings {
 
     /// Replace the settings; returns the new generation.
     pub fn put(&self, settings: CasterSettings) -> u64 {
+        // The watch comes first so no reader can miss the change; a receiver
+        // that is gone is not an error (`send_replace` keeps the value).
+        self.changed.send_replace(settings.clone());
         match self.inner.lock() {
             Ok(mut read) => {
                 read.settings = settings;
@@ -202,6 +240,12 @@ impl Settings {
                 read.generation
             }
         }
+    }
+
+    /// A receiver that is told about every write — the async driver's third
+    /// `select!` arm.
+    pub fn watch(&self) -> watch::Receiver<CasterSettings> {
+        self.changed.subscribe()
     }
 }
 
@@ -217,7 +261,8 @@ impl Settings {
 /// methods with waits (`Game::answer`, `Game::release`,
 /// `Game::out_of_roundtime`).  This is the synchronous equivalent: requests are
 /// consumed one at a time, no waiting happens, and the command sink is a
-/// [`Sink`] instead of the session's queue.
+/// [`Sink`] instead of the session's queue.  [`Relay`] is the tokio form of the
+/// same loop.
 pub fn start(
     requests: Receiver<Request>,
     settings: Settings,
@@ -242,6 +287,271 @@ pub fn start(
         }
     }
     Err(Halt::Closed)
+}
+
+/// Plan one request and send its lines, in order.
+///
+/// ESTABLISHED: the recovered loop plans against the settings in force and
+/// sends the plan's lines one after the other; a refused plan stops the driver
+/// with "{} could not be prepared." (0x103e7b1ee).
+fn cast_one(
+    game: &mut Game,
+    world: &dyn World,
+    sink: &mut dyn Sink,
+    request: &Request,
+) -> Result<(), Halt> {
+    let cast = Cast {
+        spell: request.spell,
+        target: request.target.clone(),
+    };
+    let plan = match game.next(&cast, world) {
+        Ok(plan) => plan,
+        Err(_) => return Err(Halt::Unprepared(cast.spell.to_string())),
+    };
+    for line in &plan.lines {
+        Game::send(sink, line)?;
+    }
+    Ok(())
+}
+
+/// The request side of the driver.
+///
+/// ESTABLISHED: `driver::start` holds
+/// `tokio::sync::mpsc::unbounded::UnboundedReceiver<Request>` (its drop glue is
+/// at 0x10197f5b4), so the producing side is the unbounded sender.
+#[derive(Clone, Debug)]
+pub struct Handle {
+    tx: UnboundedSender<Request>,
+}
+
+impl Handle {
+    /// Hand one request to the driver.
+    pub fn request(&self, request: Request) -> Result<(), ()> {
+        self.tx.send(request).map_err(|_| ())
+    }
+
+    /// Read a line of the caster's own grammar and hand it over.
+    ///
+    /// `None` when the line is not a request or the driver is gone.
+    pub fn line(&self, line: &str) -> Option<Request> {
+        let request = crate::request::request(line)?;
+        self.request(request.clone()).ok()?;
+        Some(request)
+    }
+
+    /// Whether the driver is still listening.
+    pub fn is_open(&self) -> bool {
+        !self.tx.is_closed()
+    }
+}
+
+/// A request channel: the tokio unbounded pair the recovered driver reads.
+pub fn channel() -> (Handle, UnboundedReceiver<Request>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (Handle { tx }, rx)
+}
+
+/// Fold one session event into the game.
+///
+/// ESTABLISHED: the driver's `select!` had an arm for the session's events and
+/// handed the game text to `Game::fold` (which is why `fold` receives whole
+/// lines).  `Over` is the session ending, which replaces the model and clears
+/// the line counter, so it folds as [`Event::Reset`] (INFERRED).
+pub fn fold_session(game: &mut Game, event: &SessionEvent) {
+    match event {
+        SessionEvent::Frames(lines) => {
+            for line in lines {
+                game.fold(&Event::Said(line.clone()));
+            }
+        }
+        SessionEvent::Said(notice) => {
+            for line in &notice.lines {
+                game.fold(&Event::Said(line.clone()));
+            }
+        }
+        SessionEvent::Over(_) => {
+            game.fold(&Event::Reset);
+        }
+        SessionEvent::Typed(_) | SessionEvent::Symbol(_) | SessionEvent::LichSymbol(_) => {}
+    }
+}
+
+/// The session event arm: the next event, or wait forever when there is no
+/// subscription.
+async fn next_event(
+    events: &mut Option<broadcast::Receiver<SessionEvent>>,
+) -> Option<SessionEvent> {
+    loop {
+        if events.is_none() {
+            return std::future::pending().await;
+        }
+        let received = events.as_mut().expect("checked above").recv().await;
+        match received {
+            Ok(event) => return Some(event),
+            // A slow reader missed events; the session keeps the newest ones.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => {
+                *events = None;
+                return None;
+            }
+        }
+    }
+}
+
+/// The tokio driver: the body of the recovered `driver::start`
+/// (0x10197c128, the 11604-byte `start::{{closure}}`).
+///
+/// It selects over three sources, which is what the symbol list shows the
+/// original owning:
+///
+/// 1. the unbounded channel of [`Request`]s ([`Handle`], [`channel`]);
+/// 2. the session's event broadcast (`hydra_session::command::Event`, through
+///    [`crate::session::watch`]), folded into the [`Game`];
+/// 3. changes to the settings cell ([`Settings::watch`]).
+///
+/// The transport seam stays [`Sink`]; [`crate::session::SessionSink`] is the
+/// `hydra_session` command queue behind it.
+///
+/// UNKNOWN: the bodies of `Game::{next, send, stance, release, answer,
+/// out_of_roundtime}` are async state machines in the binary and only their
+/// call graph was recovered, so the loop here plans and sends synchronously
+/// inside each arm.  What *is* recovered is what the task waits on, and that is
+/// what this type is.
+pub struct Relay<'a> {
+    /// The casts to carry out.
+    pub requests: UnboundedReceiver<Request>,
+    /// The settings cell in force.
+    pub settings: Settings,
+    /// The session's events, when the driver was given a subscription.
+    pub events: Option<broadcast::Receiver<SessionEvent>>,
+    /// The state machine.
+    pub game: &'a mut Game,
+    /// The game model.
+    pub world: &'a dyn World,
+    /// Where the commands go.
+    pub sink: &'a mut dyn Sink,
+}
+
+impl<'a> Relay<'a> {
+    /// The four inputs of the recovered task, minus the event subscription.
+    pub fn new(
+        requests: UnboundedReceiver<Request>,
+        settings: Settings,
+        game: &'a mut Game,
+        world: &'a dyn World,
+        sink: &'a mut dyn Sink,
+    ) -> Relay<'a> {
+        Relay {
+            requests,
+            settings,
+            events: None,
+            game,
+            world,
+            sink,
+        }
+    }
+
+    /// Also select over the session's events.
+    pub fn with_events(mut self, events: broadcast::Receiver<SessionEvent>) -> Relay<'a> {
+        self.events = Some(events);
+        self
+    }
+
+    /// Run until the request channel closes or a cast is refused.
+    ///
+    /// The settings are re-read before every cast (the recovered loop read the
+    /// cell on every send) and kept current while idle by the `watch` arm.
+    pub async fn run(&mut self) -> Result<(), Halt> {
+        let Relay {
+            requests,
+            settings,
+            events,
+            game,
+            world,
+            sink,
+        } = self;
+        let mut changes = settings.watch();
+        game.settings = changes.borrow_and_update().clone();
+
+        loop {
+            tokio::select! {
+                request = requests.recv() => {
+                    match request {
+                        Some(request) => {
+                            // A change that has not been seen yet lands before
+                            // this cast, whichever arm fires first.
+                            if changes.has_changed().unwrap_or(false) {
+                                game.settings = changes.borrow_and_update().clone();
+                            }
+                            cast_one(game, *world, &mut **sink, &request)?;
+                        }
+                        // Every sender is gone: the recovered driver stops.
+                        None => return Err(Halt::Closed),
+                    }
+                }
+                changed = changes.changed() => {
+                    if changed.is_ok() {
+                        game.settings = changes.borrow_and_update().clone();
+                    }
+                }
+                event = next_event(events) => {
+                    if let Some(event) = event {
+                        fold_session(game, &event);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run to completion on a private current-thread runtime.
+    ///
+    /// This is the synchronous adapter: the recovered `driver::start` was
+    /// called from non-async code, so the tokio loop is driven by a runtime the
+    /// call owns.
+    pub fn start(self) -> Result<(), Halt> {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            // No runtime means no driver; "the game could not be reached".
+            Err(_) => return Err(Halt::Closed),
+        };
+        runtime.block_on(async move {
+            let mut relay = self;
+            relay.run().await
+        })
+    }
+}
+
+impl Relay<'static> {
+    /// Start the driver as a tokio task — the shape the original had.
+    ///
+    /// The [`Game`], the model reference and the sink move into the task; the
+    /// task's result is the same [`Halt`] the synchronous loop returns.
+    pub fn spawn<S>(
+        requests: UnboundedReceiver<Request>,
+        settings: Settings,
+        events: Option<broadcast::Receiver<SessionEvent>>,
+        mut game: Game,
+        world: &'static dyn World,
+        mut sink: S,
+    ) -> tokio::task::JoinHandle<Result<(), Halt>>
+    where
+        S: Sink + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut relay = Relay {
+                requests,
+                settings,
+                events,
+                game: &mut game,
+                world,
+                sink: &mut sink,
+            };
+            relay.run().await
+        })
+    }
 }
 
 #[cfg(test)]

@@ -642,6 +642,13 @@ dependencies = [
 [[package]]
 name = "hydra_cast"
 version = "0.0.0"
+dependencies = [
+ "hydra_model",
+ "hydra_session",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "hydra_combat_log"

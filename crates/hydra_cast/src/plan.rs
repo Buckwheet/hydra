@@ -170,10 +170,9 @@ pub fn plan(cast: &Cast, settings: &CasterSettings, world: &dyn World) -> Result
             None
         },
         lines: Vec::new(),
-        seconds: world
-            .spell_cost(number, "second")
-            .map(|(multiplier, cost)| multiplier * cost as f64)
-            .unwrap_or(0.0),
+        // `spell_cost(number, "second")`, multiplied out; the real model
+        // answers it from the spell row's own duration.
+        seconds: world.seconds(number).unwrap_or(0.0),
     };
 
     // 7. The prepare line.

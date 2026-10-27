@@ -40,8 +40,10 @@ impl Load {
     /// [`COMMAND`] and then reads frames until [`DONE`].
     ///
     /// **Departure**: the original ran this on the session's `tokio` actor and
-    /// parsed the frames as they arrived; this returns the command to send and an
-    /// empty load for the caller to feed.
+    /// parsed the frames as they arrived.  `tokio` is back
+    /// (`session::spawn_supervised_with` is the session's real spawn), but the
+    /// 55 KB load state machine is not recovered, so this returns the command to
+    /// send and an empty load for the caller to feed.
     pub fn start() -> (String, Load) {
         (COMMAND.to_string(), Load::default())
     }

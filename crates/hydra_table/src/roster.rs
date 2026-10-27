@@ -1,8 +1,10 @@
 //! `roster.json` — the characters this account has played.
 //!
 //! Recovered from `hydra_table::roster` (`0x10129cb04` … `0x10129e584`).  The
-//! file is a `serde_json` document (see [`crate::json`]) with the fields the
-//! `expecting` strings in `__TEXT` name:
+//! file is a real `serde`/`serde_json` document — [`File`] and [`Entry`] derive
+//! `Serialize`/`Deserialize`, and the field order is the one the recovered
+//! `Entry::serialize` (`0x10129c9b4`) wrote — with the fields the `expecting`
+//! strings in `__TEXT` name:
 //!
 //! ```text
 //! 0x10240c7e8  "schema_version"   0x10240c7f1  "characters"
@@ -18,7 +20,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
-use crate::json;
+use serde::{Deserialize, Serialize};
 
 /// The file name inside the data directory.
 ///
@@ -53,12 +55,18 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// **UNKNOWN**: `Entry::card` also writes a byte at `+0x61`, which cannot be a
 /// field of a five-field `Entry`; the binary stores `self.favourite` there.
 /// Nothing in this reconstruction reads it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub character: String,
     pub account: String,
     pub game_code: String,
+    /// Written after `game_code` and before `nickname` (the declaration order
+    /// `Entry::serialize` uses); a file without it reads as `false`.
+    #[serde(default)]
     pub favourite: bool,
+    /// **ESTABLISHED**: written only when it is `Some` (`Entry::serialize` skips
+    /// the entry entirely otherwise), and a file without it reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nickname: Option<String>,
 }
 
@@ -66,9 +74,15 @@ pub struct Entry {
 ///
 /// **ESTABLISHED** layout (`roster::load` `0x10129cd1c`): the map lives at
 /// `+0x00` (`BTreeMap`, 24 bytes) and `schema_version: u32` at `+0x18`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct File {
+    /// Written first, and stamped to [`SCHEMA_VERSION`] by [`save`].  A file
+    /// without it reads as `0`.
+    #[serde(default)]
     pub schema_version: u32,
+    /// Written second, in `BTreeMap` (key) order — that is the order the
+    /// recovered writer produced.
+    #[serde(default)]
     pub characters: BTreeMap<String, Entry>,
 }
 
@@ -108,69 +122,18 @@ impl Entry {
     pub fn key(&self) -> String {
         key(&self.game_code, &self.character)
     }
-
-    fn from_json(value: &json::Value) -> Option<Entry> {
-        let map = value.object()?;
-        Some(Entry {
-            character: map.get("character")?.text()?.to_string(),
-            account: map.get("account")?.text()?.to_string(),
-            game_code: map.get("game_code")?.text()?.to_string(),
-            favourite: map.get("favourite").and_then(|v| v.bool()).unwrap_or(false),
-            nickname: map
-                .get("nickname")
-                .and_then(|v| v.text())
-                .map(|text| text.to_string()),
-        })
-    }
-
-    fn write_json(&self, out: &mut String) {
-        out.push('{');
-        out.push_str("\"character\":");
-        json::write_text(out, &self.character);
-        out.push_str(",\"account\":");
-        json::write_text(out, &self.account);
-        out.push_str(",\"game_code\":");
-        json::write_text(out, &self.game_code);
-        out.push_str(",\"favourite\":");
-        out.push_str(if self.favourite { "true" } else { "false" });
-        if let Some(nickname) = &self.nickname {
-            out.push_str(",\"nickname\":");
-            json::write_text(out, nickname);
-        }
-        out.push('}');
-    }
-}
-
-impl File {
-    fn from_json(value: &json::Value) -> Option<File> {
-        let map = value.object()?;
-        let mut characters = BTreeMap::new();
-        if let Some(entries) = map.get("characters").and_then(|v| v.object()) {
-            for (name, entry) in entries {
-                characters.insert(name.clone(), Entry::from_json(entry)?);
-            }
-        }
-        Some(File {
-            schema_version: map.get("schema_version").and_then(|v| v.u32()).unwrap_or(0),
-            characters,
-        })
-    }
 }
 
 /// The serialised form of `file` (what [`save`] writes).
+///
+/// **ESTABLISHED**: the recovered writer is
+/// `serde_json::to_string(&file)`, whose output is
+/// `{"schema_version":N,"characters":{…}}` with the entries in `BTreeMap` order
+/// and `serde_json`'s string escapes.  `File` is plain data, so the
+/// serialisation cannot fail; the `Result` is flattened with `unwrap_or_default`
+/// rather than panicking.
 pub fn to_json(file: &File) -> String {
-    let mut out = String::new();
-    json::write_file(&mut out, SCHEMA_VERSION, "characters", |out| {
-        for (at, (name, entry)) in file.characters.iter().enumerate() {
-            if at > 0 {
-                out.push(',');
-            }
-            json::write_text(out, name);
-            out.push(':');
-            entry.write_json(out);
-        }
-    });
-    out
+    serde_json::to_string(file).unwrap_or_default()
 }
 
 /// `game_code:character`, trimmed and lower-cased.
@@ -206,15 +169,12 @@ pub fn load(dir: &Path) -> Result<File, io::Error> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(File::default()),
         Err(error) => return Err(error),
     };
-    match json::parse(&text) {
-        Ok(value) => File::from_json(&value).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: bad roster"))
-        }),
-        Err(error) => Err(io::Error::new(
+    serde_json::from_str::<File>(&text).map_err(|error| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: {}", path.display(), error),
-        )),
-    }
+        )
+    })
 }
 
 /// Write `dir/roster.json`, creating the directory first.
@@ -226,7 +186,14 @@ pub fn load(dir: &Path) -> Result<File, io::Error> {
 pub fn save(dir: &Path, file: &mut File) -> Result<(), io::Error> {
     file.schema_version = SCHEMA_VERSION;
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(FILE_NAME), to_json(file))
+    let path = dir.join(FILE_NAME);
+    let text = serde_json::to_string(file).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {}", path.display(), error),
+        )
+    })?;
+    std::fs::write(path, text)
 }
 
 /// Every entry, ordered by key.
@@ -512,6 +479,150 @@ mod tests {
         std::fs::write(dir.join(FILE_NAME), "{ not json").expect("write");
         let error = load(&dir).expect_err("bad json");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // The recovered wrapping is `format!("{}: {}", path, error)`; the
+        // `serde_json` error is the second half (`0x10129ce14`).
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("{}: ", dir.join(FILE_NAME).display())),
+            "the message names the file first: {message}"
+        );
+        assert!(
+            message.contains("key must be a string"),
+            "the serde_json error follows it: {message}"
+        );
+    }
+
+    #[test]
+    fn a_file_of_the_wrong_shape_is_an_invalid_data_error() {
+        let dir = dir("shape");
+        // `nickname` must be a string: serde rejects the whole document.
+        std::fs::write(
+            dir.join(FILE_NAME),
+            r#"{"schema_version":1,"characters":{"gs4:aelith":{"character":"Aelith","account":"main","game_code":"GS4","nickname":7}}}"#,
+        )
+        .expect("write");
+        let error = load(&dir).expect_err("bad shape");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid type"));
+    }
+
+    /// The recovered `Entry::serialize` order and `serde_json`'s escapes.
+    #[test]
+    fn the_file_round_trips_through_serde() {
+        let mut file = File {
+            schema_version: SCHEMA_VERSION,
+            characters: BTreeMap::new(),
+        };
+        file.characters.insert(
+            "gs4:aelith".to_string(),
+            Entry {
+                character: "Aelith".to_string(),
+                account: "main".to_string(),
+                game_code: "GS4".to_string(),
+                favourite: true,
+                nickname: Some("Ae\"ly".to_string()),
+            },
+        );
+        // No nickname, not a favourite: the `nickname` key is left out.
+        file.characters.insert(
+            "gs4:wynter".to_string(),
+            Entry {
+                character: "Wynter".to_string(),
+                account: "main".to_string(),
+                game_code: "GS4".to_string(),
+                favourite: false,
+                nickname: None,
+            },
+        );
+        let text = to_json(&file);
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"schema_version":1,"characters":{"#,
+                r#""gs4:aelith":{"character":"Aelith","account":"main","game_code":"GS4","favourite":true,"nickname":"Ae\"ly"},"#,
+                r#""gs4:wynter":{"character":"Wynter","account":"main","game_code":"GS4","favourite":false}}}"#,
+            )
+        );
+        // Keys come out in `BTreeMap` order, not insertion order.
+        let aelith = text.find("gs4:aelith").expect("aelith");
+        let wynter = text.find("gs4:wynter").expect("wynter");
+        assert!(aelith < wynter);
+        // And the document reads back as itself.
+        let back: File = serde_json::from_str(&text).expect("read back");
+        assert_eq!(back, file);
+    }
+
+    #[test]
+    fn the_escapes_are_serde_jsons() {
+        let file = File {
+            schema_version: SCHEMA_VERSION,
+            characters: BTreeMap::from([(
+                "gs4:aelith".to_string(),
+                Entry {
+                    character: "tab\there \"quoted\" back\\slash\nnewline".to_string(),
+                    account: "main".to_string(),
+                    game_code: "GS4".to_string(),
+                    favourite: false,
+                    nickname: Some("a\u{1}control".to_string()),
+                },
+            )]),
+        };
+        let text = to_json(&file);
+        assert!(
+            text.contains(r#""character":"tab\there \"quoted\" back\\slash\nnewline""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""nickname":"a\u0001control""#), "{text}");
+        // Non-ASCII is written as UTF-8, exactly as `serde_json` does.
+        let file = File {
+            schema_version: SCHEMA_VERSION,
+            characters: BTreeMap::from([(
+                "gs4:aelith".to_string(),
+                Entry {
+                    character: "Aelïth".to_string(),
+                    account: "main".to_string(),
+                    game_code: "GS4".to_string(),
+                    favourite: false,
+                    nickname: None,
+                },
+            )]),
+        };
+        assert!(to_json(&file).contains("Aelïth"));
+    }
+
+    #[test]
+    fn the_schema_version_is_stamped_on_save_and_kept_on_load() {
+        let dir = dir("schema_version");
+        // A file the game wrote with a later schema still loads as it is.
+        std::fs::write(
+            dir.join(FILE_NAME),
+            r#"{"schema_version":7,"characters":{"gs4:aelith":{"character":"Aelith","account":"main","game_code":"GS4","favourite":false}}}"#,
+        )
+        .expect("write");
+        let mut file = load(&dir).expect("load");
+        assert_eq!(file.schema_version, 7);
+        // Saving stamps it back to 1 (`mov w8, #1` at `0x10129cf68`).
+        save(&dir, &mut file).expect("save");
+        assert_eq!(load(&dir).expect("load").schema_version, SCHEMA_VERSION);
+        assert_eq!(file.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_file_without_the_optional_keys_still_loads() {
+        let dir = dir("minimal");
+        // `favourite`, `nickname` and even `schema_version` are defaulted; an
+        // unknown key is ignored, as `serde`'s derive does by default.
+        std::fs::write(
+            dir.join(FILE_NAME),
+            r#"{"characters":{"gs4:aelith":{"character":"Aelith","account":"main","game_code":"GS4","unknown":1}}}"#,
+        )
+        .expect("write");
+        let file = load(&dir).expect("load");
+        assert_eq!(file.schema_version, 0);
+        assert_eq!(
+            file.characters.get("gs4:aelith"),
+            Some(&entry("Aelith", "main", "GS4"))
+        );
     }
 
     #[test]

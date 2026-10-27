@@ -62,6 +62,20 @@ impl Texture {
         }
     }
 
+    /// The atlas as the `epaint` image `Context::load_texture` consumes.
+    ///
+    /// This is where the crate's texture seam ends: the original gave these
+    /// RGBA8 bytes to `wgpu` (egui's `load_texture` / `TextureHandle`, called from
+    /// `gs_render`'s texture path), and an [`epaint::ColorImage`] carrying the same
+    /// straight (un-premultiplied) bytes is the value an egui painter takes.  A
+    /// `0`-sized texture yields a `0`-sized image.
+    pub fn color_image(&self) -> epaint::ColorImage {
+        epaint::ColorImage::from_rgba_unmultiplied(
+            [self.width as usize, self.height as usize],
+            &self.data,
+        )
+    }
+
     /// Raw texel, clamped to the edges.
     pub fn texel(&self, x: u32, y: u32) -> [f32; 4] {
         if self.width == 0 || self.height == 0 {
@@ -464,6 +478,26 @@ pub fn seam_direction(patch: &Patch) -> f32 {
 mod tests {
     use super::*;
     use crate::model::Segment;
+
+    #[test]
+    fn the_atlas_becomes_an_epaint_color_image() {
+        // Two texels: opaque red, half-alpha blue.
+        let tex = Texture::from_rgba(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 128]);
+        let image = tex.color_image();
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels.len(), 2);
+        // The bytes are straight (un-premultiplied) in, premultiplied out.
+        assert_eq!(image.pixels[0].to_srgba_unmultiplied(), [255, 0, 0, 255]);
+        assert_eq!(image.pixels[1].to_srgba_unmultiplied(), [0, 0, 255, 128]);
+        let [r, g, b, a] = image.pixels[1].to_array();
+        assert_eq!(a, 128);
+        assert_eq!((r, g), (0, 0));
+        assert_eq!(b, 128, "premultiplied blue at half alpha");
+        // A blank atlas is opaque white.
+        let blank = Texture::blank(2, 2).color_image();
+        assert_eq!(blank.size, [2, 2]);
+        assert!(blank.pixels.iter().all(|p| p.to_array() == [255, 255, 255, 255]));
+    }
 
     fn rig() -> Puppet {
         let mut segs = vec![Segment::new("root", 0, Vec3::ZERO, 0.9)];

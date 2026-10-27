@@ -35,6 +35,17 @@
 //! `sh·3·n`, where `sh` is `0 / 3 / 8 / 15` for degree `0 / 1 / 2 / 3` — the
 //! `u64` table at `0x1021dc2a8`).
 //!
+//! # The draw seam
+//!
+//! [`render`] is the seam where the original issued a `wgpu` draw.  With no GPU
+//! here, the CPU side of that draw is expressed as `epaint` values instead:
+//! [`Footprint`] is one splat's projected billboard (the exact maths of the
+//! embedded `splat_gpu.wgsl` / `skin_gpu` vertex shader, constants included), and
+//! [`mesh`] / [`solid_mesh`] / [`prepared_mesh`] turn the far-to-near list
+//! [`prepare`] returns into an [`epaint::Mesh`] of one billboard quad per splat —
+//! the value an egui painter consumes.  The per-fragment Gaussian falloff stays in
+//! the texture's alpha channel; see [`mesh`].
+//!
 //! **[`load_ply`]** (`@0x100a02a90`) is the 3-D Gaussian-splatting `.ply`:
 //! `no end_header`, `only float properties are read`, and the property names
 //! `xyz f_dc_0 f_dc_1 f_dc_2 opacity scale_0 scale_1 scale_2 rot_0 rot_1 rot_2
@@ -52,6 +63,17 @@ use std::path::{Path, PathBuf};
 /// splat vector, and stores: position at `+0x00`, a 36-byte row-major basis at
 /// `+0x0c`, then eight more bytes at `+0x30` and a colour word at `+0x3c`.
 pub const SPLAT_STRIDE: usize = 0x5c;
+
+/// Size of one splat as the draw pass uploads it: **144 bytes, nine `vec4`s**.
+///
+/// The embedded `splat_gpu.wgsl` declares the instance and labels it
+/// `// one splat at rest (144 bytes)`; its nine `vec4<f32>` members are `c`
+/// (centre, `w` glow), `ax0` (`w` film), `ax1` (`w` arrival frame), `ax2`
+/// (`w` own-facing mark), `color` (rgb + alpha), `n` (facing, `w` wet), `bones`,
+/// `shares` and `fx` (`x` the rim).  `9 * 16 = 144`, so the decoded
+/// [`SPLAT_STRIDE`] record is repacked into this before the draw — the two
+/// `bones`/`shares` members are the [`SkinWeights`] pair.
+pub const SPLAT_INSTANCE_STRIDE: usize = 144;
 
 /// Per-point byte counts of the four `.spz` streams, in table-of-contents order.
 ///
@@ -883,6 +905,337 @@ pub fn render(
     prepare(splats, camera, budget)
 }
 
+// ---------------------------------------------------------------------------
+// the per-splat geometry the draw pass needs, and the `epaint` values it becomes
+// ---------------------------------------------------------------------------
+//
+// `splat::render` issued a WGSL draw, and the two shaders the binary carries
+// (`skin_gpu`'s splat passes and `splat_gpu.wgsl`, "the same three passes for a
+// cloud the CPU projected") spell out, in their own comments and code, exactly
+// what one projected splat is:
+//
+// ```wgsl
+// let r = vec2<f32>(3.0 * sqrt(xx), 3.0 * sqrt(yy));   // half-extents, pixels
+// let off = corner[k] * r * u.to_cam.w;                // reach = this scale
+// let p = c.xy + off;
+// o.inv = vec4<f32>(yy / det, -xy / det, -xy / det, xx / det);
+// o.alpha = d.alpha * spread * weight;
+// ```
+//
+// with `corner` the six-vertex triangle list
+// `(-1,-1) (1,-1) (-1,1) (-1,1) (1,-1) (1,1)`, the covariance
+// `xx = xx0 + 0.3`, `det = max(xx*yy - xy*xy, 1e-6)` and the falloff
+// `a = min(v.alpha * exp(-0.5 * gauss_m(local, inv)), 0.99)`.  Everything below
+// is that maths: [`Footprint`] is one splat's projected billboard, and
+// [`mesh`] turns a prepared list into an `epaint::Mesh`.
+//
+// UNKNOWN: the same shaders name `gs_puppet::splat::Gaussian::rim` (a splat's
+// rim, `0..=1`, scaled by `RIM_STEP`) and `gs_puppet::layers::ARRIVAL_AGES`.
+// Neither has a symbol, a drop-glue layout or a literal that pins it down, so
+// neither is reconstructed here — see NOTES.md, "Remaining UNKNOWNs".
+
+/// `CORE_M` — a splat's core, in the shaders' Gaussian-M units.
+///
+/// The literal `2.25` is in both embedded WGSL copies (`skin_gpu`'s splat passes
+/// and `splat_gpu.wgsl`), and each carries the comment naming its origin:
+/// `// gs_puppet::splat::CORE_M and REACH_M: a splat's core, and its reach`.  The
+/// front pass keeps `gauss_m <= CORE_M`.
+pub const CORE_M: f32 = 2.25;
+
+/// `REACH_M` — where a splat stops showing: the blend pass discards fragments
+/// with `gauss_m > REACH_M`.  The quad's half-extent is `sqrt(REACH_M)` = 3
+/// standard deviations, which is [`QUAD_SIGMAS`].
+pub const REACH_M: f32 = 9.0;
+
+/// `RIM_FROM` — where a rim splat (an invisible figure's skin) starts to show,
+/// by how edge-on it is: `smoothstep(RIM_FROM, RIM_TO, 1 - |dot(n, back)|)`.
+pub const RIM_FROM: f32 = 0.3;
+
+/// `RIM_TO` — where a rim splat is whole (see [`RIM_FROM`]).
+pub const RIM_TO: f32 = 0.8;
+
+/// The billboard's half-extent in standard deviations: the shader's
+/// `r = 3.0 * sqrt(xx)`, and `sqrt(REACH_M)`.
+pub const QUAD_SIGMAS: f32 = 3.0;
+
+/// The variance added to the projected covariance before the extent is taken
+/// (the shader's `let xx = xx0 + 0.3`): a splat covers at least a pixel, and one
+/// smaller than a pixel is spread over it — as much fainter as it was made wider
+/// (`spread`, below).
+pub const MIN_VARIANCE: f32 = 0.3;
+
+/// The determinant floor of the inverse covariance: `max(xx*yy - xy*xy, 1e-6)`.
+pub const MIN_DET: f32 = 1e-6;
+
+/// The blend pass' alpha cap: `min(v.alpha * exp(-0.5 * m), 0.99)`.
+pub const MAX_ALPHA: f32 = 0.99;
+
+/// The shaders' `gauss_m(d, inv)`: the squared Mahalanobis distance of a
+/// fragment from the splat's centre, in Gaussian-M units.
+pub fn gauss_m(d: [f32; 2], inv: [f32; 4]) -> f32 {
+    d[0] * (inv[0] * d[0] + inv[1] * d[1]) + d[1] * (inv[2] * d[0] + inv[3] * d[1])
+}
+
+/// The shaders' Gaussian falloff `exp(-0.5 * m)` (`m` in Gaussian-M units).
+pub fn falloff(m: f32) -> f32 {
+    (-0.5 * m).exp()
+}
+
+/// One splat as the draw pass sees it: the screen-space billboard the vertex
+/// shader builds for it.
+///
+/// Recovered field by field from `vs_cloud`:
+///
+/// | field | shader |
+/// |---|---|
+/// | `centre` | `let c = seen(world); … p = c.xy + off` |
+/// | `half` | `let r = vec2(3.0 * sqrt(xx), 3.0 * sqrt(yy))` |
+/// | `inv` | `o.inv = vec4(yy / det, -xy / det, -xy / det, xx / det)` |
+/// | `spread` | `sqrt(clamp((xx0 * yy0 - xy * xy) / det, 0.0, 1.0))` |
+/// | `depth` | `o.z = c.z` |
+/// | `alpha` | `o.alpha = d.alpha * spread * weight` (this is `d.alpha`) |
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Footprint {
+    /// Screen centre of the splat, in pixels (`c.xy`).
+    pub centre: [f32; 2],
+    /// Half-extents of the billboard quad, in pixels (`r`, three sigma).
+    pub half: [f32; 2],
+    /// The inverse of the screen covariance, row-major (`o.inv`).
+    pub inv: [f32; 4],
+    /// How much of the splat survived the sub-pixel spread, `0.0..=1.0`.
+    pub spread: f32,
+    /// View-space depth (`o.z`), as [`crate::camera::Camera::project`] reports it.
+    pub depth: f32,
+    /// The splat's own alpha, before `spread` and the Gaussian falloff.
+    pub alpha: f32,
+}
+
+impl Footprint {
+    /// The four billboard corners, in the shaders' order:
+    /// `(-1,-1) (1,-1) (-1,1) (1,1)` scaled by [`Footprint::half`] about
+    /// [`Footprint::centre`] — the corners of the shader's six-vertex triangle
+    /// list, which is the two triangles `(0,1,2)` and `(2,1,3)`.
+    pub fn corners(&self) -> [[f32; 2]; 4] {
+        let [cx, cy] = self.centre;
+        let [hx, hy] = self.half;
+        [
+            [cx - hx, cy - hy],
+            [cx + hx, cy - hy],
+            [cx - hx, cy + hy],
+            [cx + hx, cy + hy],
+        ]
+    }
+
+    /// A corner's offset from the centre, in pixels — the shader's `off`, which
+    /// is the `local` the falloff is evaluated at.
+    pub fn local(&self, corner: [f32; 2]) -> [f32; 2] {
+        [corner[0] * self.half[0], corner[1] * self.half[1]]
+    }
+
+    /// The Gaussian-M distance of a local offset — [`gauss_m`] against [`Footprint::inv`].
+    pub fn gauss_at(&self, local: [f32; 2]) -> f32 {
+        gauss_m(local, self.inv)
+    }
+
+    /// The falloff at a local offset, `exp(-0.5 * gauss_at(local))`.
+    pub fn falloff_at(&self, local: [f32; 2]) -> f32 {
+        falloff(self.gauss_at(local))
+    }
+
+    /// The peak alpha a fragment reaches at the centre:
+    /// `min(alpha * spread, 0.99)`.
+    pub fn peak_alpha(&self) -> f32 {
+        (self.alpha * self.spread).clamp(0.0, MAX_ALPHA)
+    }
+
+    /// The screen-space area of the quad, in square pixels.
+    pub fn area(&self) -> f32 {
+        4.0 * self.half[0] * self.half[1]
+    }
+
+    pub fn is_finite(&self) -> bool {
+        self.centre.iter().all(|v| v.is_finite())
+            && self.half.iter().all(|v| v.is_finite())
+            && self.inv.iter().all(|v| v.is_finite())
+            && self.spread.is_finite()
+            && self.depth.is_finite()
+            && self.alpha.is_finite()
+    }
+
+    /// The shader's covariance-to-billboard step, shared by both constructors.
+    ///
+    /// `xx0` / `yy0` / `xy` are the sums of squares and products of the splat's
+    /// three projected axes; `xx = xx0 + MIN_VARIANCE` and `yy = yy0 +
+    /// MIN_VARIANCE` as in `vs_cloud`.
+    fn from_covariance(
+        centre: [f32; 2],
+        xx0: f32,
+        yy0: f32,
+        xy: f32,
+        depth: f32,
+        alpha: f32,
+    ) -> Footprint {
+        let xx = xx0 + MIN_VARIANCE;
+        let yy = yy0 + MIN_VARIANCE;
+        let det = (xx * yy - xy * xy).max(MIN_DET);
+        let spread = (((xx0 * yy0 - xy * xy) / det).clamp(0.0, 1.0)).sqrt();
+        Footprint {
+            centre,
+            half: [QUAD_SIGMAS * xx.sqrt(), QUAD_SIGMAS * yy.sqrt()],
+            inv: [yy / det, -xy / det, -xy / det, xx / det],
+            spread,
+            depth,
+            alpha,
+        }
+    }
+
+    /// Project one splat through the camera: the full three-axis covariance of
+    /// `vs_cloud`, evaluated on the CPU.
+    ///
+    /// Returns `None` for a splat that is not in front of the camera or whose
+    /// projection is not finite (the shader parks such a vertex off-image).
+    pub fn of(splat: &Splat, camera: &crate::camera::Camera) -> Option<Footprint> {
+        let (cx, cy, depth) = camera.project(&splat.pos);
+        if !cx.is_finite() || !cy.is_finite() || !(depth > 0.0) {
+            return None;
+        }
+        let mut xx0 = 0.0;
+        let mut yy0 = 0.0;
+        let mut xy = 0.0;
+        for k in 0..3 {
+            let axis = splat.basis.col(k);
+            let (ax, ay, _) = camera.project(&(splat.pos + axis));
+            let (dx, dy) = (ax - cx, ay - cy);
+            if !dx.is_finite() || !dy.is_finite() {
+                return None;
+            }
+            xx0 += dx * dx;
+            yy0 += dy * dy;
+            xy += dx * dy;
+        }
+        Some(Footprint::from_covariance(
+            [cx, cy],
+            xx0,
+            yy0,
+            xy,
+            depth,
+            splat.color[3],
+        ))
+    }
+
+    /// The same for an already-projected splat.
+    ///
+    /// [`PreparedSplat`] keeps one radius, not the covariance, so the recovered
+    /// formulas run on the isotropic special case `xx0 = yy0 = radius²`, `xy = 0`
+    /// (`xx0 * yy0 - xy * xy = radius⁴`, so `spread = radius² / (radius² + 0.3)`).
+    pub fn of_prepared(p: &PreparedSplat) -> Footprint {
+        let r = p.radius;
+        Footprint::from_covariance(p.screen, r * r, r * r, 0.0, p.depth, p.color[3])
+    }
+}
+
+impl PreparedSplat {
+    /// This splat's billboard — see [`Footprint::of_prepared`].
+    pub fn footprint(&self) -> Footprint {
+        Footprint::of_prepared(self)
+    }
+
+    /// One splat's quad as its own `epaint::Mesh` (4 vertices, 6 indices).
+    pub fn mesh(&self, texture: epaint::TextureId) -> epaint::Mesh {
+        mesh(std::slice::from_ref(self), texture)
+    }
+}
+
+/// The quad's UVs, in [`Footprint::corners`] order: the whole of a radial
+/// gaussian texture, top-left first.
+pub const SPLAT_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+
+fn byte(v: f32) -> u8 {
+    // The recovered `255.0` byte scale (`0x437f0000`), rounded as the shader's
+    // `round(… * 255.0) / 255.0` does.
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// A splat's colour at a given alpha, as an `epaint` vertex colour.
+///
+/// `epaint` wants premultiplied sRGB, which is also what the recovered blend
+/// pass emits (`return vec4<f32>(v.rgb / 255.0 * a, a)`).
+fn vertex_color(color: [f32; 4], alpha: f32) -> epaint::Color32 {
+    let a = byte(alpha);
+    let (r, g, b) = (byte(color[0]), byte(color[1]), byte(color[2]));
+    epaint::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn build_prepared(
+    prepared: &[PreparedSplat],
+    texture: epaint::TextureId,
+    textured: bool,
+) -> epaint::Mesh {
+    let mut m = epaint::Mesh::with_texture(texture);
+    m.vertices.reserve(prepared.len() * 4);
+    m.indices.reserve(prepared.len() * 6);
+    for p in prepared {
+        let f = Footprint::of_prepared(p);
+        if !f.is_finite() {
+            continue;
+        }
+        let color = vertex_color(p.color, f.peak_alpha());
+        let base = m.vertices.len() as u32;
+        for (corner, uv) in f.corners().iter().zip(SPLAT_UVS.iter()) {
+            m.vertices.push(epaint::Vertex {
+                pos: epaint::pos2(corner[0], corner[1]),
+                uv: if textured {
+                    epaint::pos2(uv[0], uv[1])
+                } else {
+                    epaint::WHITE_UV
+                },
+                color,
+            });
+        }
+        // The shaders' corner order is the triangle list
+        // (-1,-1) (1,-1) (-1,1) / (-1,1) (1,-1) (1,1).
+        m.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    }
+    m
+}
+
+/// Turn a prepared splat list into one `epaint::Mesh`: a textured billboard quad
+/// per splat, in the list's order.
+///
+/// This is the CPU equivalent of the draw `splat::render` issued: `vs_cloud`'s
+/// billboard (`Footprint`) with the recovered corner order and UVs into the
+/// gaussian falloff texture `texture`, the splat's colour and its peak alpha on
+/// every vertex.  **The Gaussian falloff itself is per-fragment in the shader**
+/// (`min(alpha * exp(-0.5 * m), 0.99)`) and an `epaint` mesh can only vary alpha
+/// per vertex, so it has to come from that texture's alpha channel — that is why
+/// the UVs span the whole quad.  Pass [`solid_mesh`] for hard-edged quads with no
+/// texture.  Splats that are not finite are dropped, as the shader parks them
+/// off-image.
+///
+/// The order is [`prepare`]'s: sorted far to near, so a painter's-algorithm
+/// consumer draws them in index order.
+pub fn mesh(prepared: &[PreparedSplat], texture: epaint::TextureId) -> epaint::Mesh {
+    build_prepared(prepared, texture, true)
+}
+
+/// The same quads with no texture: `TextureId::default()` and `WHITE_UV`, which
+/// is `epaint`'s way of saying "use the vertex colour alone".
+pub fn solid_mesh(prepared: &[PreparedSplat]) -> epaint::Mesh {
+    build_prepared(prepared, epaint::TextureId::default(), false)
+}
+
+/// Project a cloud and build its `epaint::Mesh` in one step — [`prepare`] then
+/// [`mesh`] — which is the whole CPU side of the recovered splat draw.
+pub fn prepared_mesh(
+    splats: &[Splat],
+    camera: &crate::camera::Camera,
+    budget: usize,
+    texture: epaint::TextureId,
+) -> epaint::Mesh {
+    mesh(&prepare(splats, camera, budget), texture)
+}
+
 /// Bone weights for one splat: up to four `(bone, weight)` pairs.
 ///
 /// `gs_puppet::splat::skin_weights` (a local symbol at `0x100a003cc`) picks the
@@ -1339,5 +1692,396 @@ mod tests {
         assert!(out[0].depth > out[1].depth, "{out:?}");
         // A splat at the centre projects to the screen centre.
         assert!((out[1].screen[0] - 320.0).abs() < 1e-3, "{out:?}");
+    }
+
+    // -- the recovered draw-pass geometry, and the `epaint` values -----------
+
+    /// A camera at the origin looking down +z: `focal / depth` is `400 / 8 = 50`
+    /// pixels per unit at the origin.
+    fn cam() -> crate::camera::Camera {
+        crate::camera::Camera::new(320.0, 240.0, 0.0, 0.0, 8.0, 400.0)
+    }
+
+    /// An isotropic splat of `sigma` model units at `pos`.
+    fn ball(pos: Vec3, sigma: f32, color: [f32; 4]) -> Splat {
+        Splat::new(
+            pos,
+            Mat3::from_cols_array([sigma, 0.0, 0.0, 0.0, sigma, 0.0, 0.0, 0.0, sigma]),
+            color,
+        )
+    }
+
+    #[test]
+    fn the_recovered_shader_constants_are_the_recovered_values() {
+        assert_eq!(CORE_M, 2.25);
+        assert_eq!(REACH_M, 9.0);
+        // The quad reaches exactly sqrt(REACH_M) standard deviations, which is
+        // why the vertex shader can write `3.0 * sqrt(xx)`.
+        assert_eq!(QUAD_SIGMAS, REACH_M.sqrt());
+        assert_eq!(RIM_FROM, 0.3);
+        assert_eq!(RIM_TO, 0.8);
+        assert_eq!(MIN_VARIANCE, 0.3);
+        assert_eq!(MIN_DET, 1e-6);
+        assert_eq!(MAX_ALPHA, 0.99);
+        // CORE_M is the -2.25 M contour: exp(-0.5 * CORE_M) = 0.3247.
+        assert!((falloff(CORE_M) - 0.324_652_5).abs() < 1e-6, "{}", falloff(CORE_M));
+        // REACH_M is the -9 M contour, invisible but not zero.
+        assert!((falloff(REACH_M) - 0.011_109).abs() < 1e-6, "{}", falloff(REACH_M));
+    }
+
+    #[test]
+    fn the_gpu_instance_is_nine_vec4s() {
+        // The shader's comment: "one splat at rest (144 bytes)".
+        assert_eq!(SPLAT_INSTANCE_STRIDE, 144);
+        assert_eq!(SPLAT_INSTANCE_STRIDE, 9 * 16);
+        // It is a repacking of the 92-byte decoded record, not the same record.
+        assert_eq!(SPLAT_STRIDE, 0x5c);
+        assert_ne!(SPLAT_STRIDE, SPLAT_INSTANCE_STRIDE);
+    }
+
+    #[test]
+    fn gauss_m_is_the_shaders_quadratic_form() {
+        // An isotropic inverse covariance of 2: gauss_m(d) = 2 * |d|^2.
+        let inv = [2.0, 0.0, 0.0, 2.0];
+        assert_eq!(gauss_m([0.0, 0.0], inv), 0.0);
+        assert!((gauss_m([1.0, 0.0], inv) - 2.0).abs() < 1e-6);
+        assert!((gauss_m([0.0, 2.0], inv) - 8.0).abs() < 1e-6);
+        assert!((gauss_m([3.0, 4.0], inv) - 50.0).abs() < 1e-5);
+        // The off-diagonal terms are the cross product: inv = [[1, 1], [1, 1]]
+        // makes the form (d.x + d.y)^2.
+        let diag = [1.0, 1.0, 1.0, 1.0];
+        assert!((gauss_m([1.0, 2.0], diag) - 9.0).abs() < 1e-6);
+        assert!((gauss_m([1.0, -1.0], diag)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_projected_splat_gets_the_shaders_billboard() {
+        // sigma 0.02 model units at depth 8 with focal 400 is 1.0 screen pixel.
+        let s = ball(Vec3::ZERO, 0.02, [1.0, 0.5, 0.0, 1.0]);
+        let f = Footprint::of(&s, &cam()).unwrap();
+        assert_eq!(f.centre, [320.0, 240.0]);
+        assert_eq!(f.depth, 8.0);
+        assert_eq!(f.alpha, 1.0);
+        // xx = yy = 1 + 0.3, so the half-extent is 3 * sqrt(1.3).
+        let h = 3.0 * 1.3f32.sqrt();
+        assert!((f.half[0] - h).abs() < 1e-5, "{:?}", f.half);
+        assert!((f.half[1] - h).abs() < 1e-5);
+        // The quad really does reach the REACH_M contour along both axes:
+        // gauss_m at the half-extent is exactly the variance-reduced 9.0.
+        assert!((f.gauss_at([f.half[0], 0.0]) - REACH_M).abs() < 1e-4);
+        assert!((f.gauss_at([0.0, f.half[1]]) - REACH_M).abs() < 1e-4);
+        // spread = sigma^2 / (sigma^2 + 0.3) = 1 / 1.3, and the inverse
+        // covariance is the diagonal 1 / 1.3.
+        assert!((f.spread - 1.0 / 1.3).abs() < 1e-6, "{}", f.spread);
+        assert!((f.inv[0] - 1.0 / 1.3).abs() < 1e-6, "{:?}", f.inv);
+        assert!((f.inv[3] - 1.0 / 1.3).abs() < 1e-6);
+        // An isotropic footprint has no cross term.
+        assert_eq!((f.inv[1], f.inv[2]), (0.0, 0.0));
+        // The peak alpha is the splat's alpha attenuated by the spread.
+        assert!((f.peak_alpha() - 1.0 / 1.3).abs() < 1e-6);
+        // The quad is a square about the centre, in the shaders' corner order.
+        let c = f.corners();
+        assert!((c[0][0] - (320.0 - h)).abs() < 1e-4);
+        assert!((c[0][1] - (240.0 - h)).abs() < 1e-4);
+        assert!((c[3][0] - (320.0 + h)).abs() < 1e-4);
+        assert!((c[3][1] - (240.0 + h)).abs() < 1e-4);
+        assert_eq!(f.local(c[3].map(|v| 0.0))[0], 0.0);
+        // local() of the (1, 1) corner is the half-extent itself.
+        let l = f.local([1.0, 1.0]);
+        assert!((l[0] - h).abs() < 1e-4 && (l[1] - h).abs() < 1e-4);
+        assert!((f.area() - 4.0 * h * h).abs() < 1e-3);
+        assert!(f.is_finite());
+    }
+
+    #[test]
+    fn a_sub_pixel_splat_is_spread_over_a_pixel_and_fades() {
+        // Half a pixel of sigma: xx = 0.25 + 0.3.
+        let f = Footprint::of(&ball(Vec3::ZERO, 0.01, [1.0; 4]), &cam()).unwrap();
+        assert!((f.half[0] - 3.0 * 0.55f32.sqrt()).abs() < 1e-5, "{:?}", f.half);
+        // spread = 0.25 / 0.55 -- as much fainter as it was made wider.
+        assert!((f.spread - 0.25 / 0.55).abs() < 1e-6, "{}", f.spread);
+        // A splat with no size at all keeps a pixel of reach and no opacity.
+        let none = Footprint::of(&ball(Vec3::ZERO, 0.0, [1.0; 4]), &cam()).unwrap();
+        assert!((none.half[0] - 3.0 * MIN_VARIANCE.sqrt()).abs() < 1e-6);
+        assert_eq!(none.spread, 0.0);
+        assert_eq!(none.peak_alpha(), 0.0);
+        // A zero-alpha splat stays invisible however large it is.
+        let clear = Footprint::of(&ball(Vec3::ZERO, 0.02, [1.0, 1.0, 1.0, 0.0]), &cam()).unwrap();
+        assert_eq!(clear.peak_alpha(), 0.0);
+    }
+
+    #[test]
+    fn the_peak_alpha_is_capped_like_the_blend_pass() {
+        let f = Footprint::of(&ball(Vec3::ZERO, 0.02, [1.0; 4]), &cam()).unwrap();
+        // alpha 2.0 * spread 0.769 -> capped at MAX_ALPHA.
+        let hot = Footprint { alpha: 2.0, ..f };
+        assert_eq!(hot.peak_alpha(), MAX_ALPHA);
+        // A negative alpha never becomes an opaque pixel.
+        let cold = Footprint { alpha: -1.0, ..f };
+        assert_eq!(cold.peak_alpha(), 0.0);
+    }
+
+    #[test]
+    fn a_stretched_splat_is_an_ellipse_on_the_screen() {
+        // A splat twice as wide as it is tall, still 1 pixel of sigma per axis:
+        // the covariance sums the three projected axes, so xx = 4 + 0.3 and
+        // yy = 1 + 0.3.
+        let sigma = 0.02;
+        let basis = Mat3::from_cols_array([
+            2.0 * sigma, 0.0, 0.0, 0.0, sigma, 0.0, 0.0, 0.0, sigma,
+        ]);
+        let s = Splat::new(Vec3::ZERO, basis, [1.0; 4]);
+        let f = Footprint::of(&s, &cam()).unwrap();
+        assert!((f.half[0] - 3.0 * 4.3f32.sqrt()).abs() < 1e-5, "{:?}", f.half);
+        assert!((f.half[1] - 3.0 * 1.3f32.sqrt()).abs() < 1e-5, "{:?}", f.half);
+        // det = 4.3 * 1.3; the sub-pixel spread factor is sqrt(4 / 5.59).
+        assert!((f.spread - (4.0f32 / 5.59).sqrt()).abs() < 1e-6, "{}", f.spread);
+        // The third axis points at the camera and contributes no screen area.
+        assert!((f.gauss_at([f.half[0], 0.0]) - REACH_M).abs() < 1e-4);
+        assert!((f.gauss_at([0.0, f.half[1]]) - REACH_M).abs() < 1e-4);
+        // The quad is that ellipse's bounding box, four times its half-extents.
+        assert!((f.area() - 4.0 * f.half[0] * f.half[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rotating_a_splat_turns_the_quad_into_a_sheared_footprint() {
+        let sigma = 0.02;
+        let stretched = Mat3::from_cols_array([
+            2.0 * sigma, 0.0, 0.0, 0.0, sigma, 0.0, 0.0, 0.0, sigma,
+        ]);
+        let rot = Mat3::from_rotation_z(45.0 * crate::math::DEG_TO_RAD);
+        let s = Splat::new(Vec3::ZERO, rot.mul_mat3(stretched), [1.0; 4]);
+        let f = Footprint::of(&s, &cam()).unwrap();
+        // A 45 degree turn in the image plane: xx0 = yy0 = 2.5, xy = -1.5.
+        let e = 3.0 * 2.8f32.sqrt();
+        assert!((f.half[0] - e).abs() < 1e-4, "{:?}", f.half);
+        assert!((f.half[1] - e).abs() < 1e-4, "{:?}", f.half);
+        // The inverse covariance is symmetric, and det(inv) = 1 / det.
+        assert!((f.inv[1] - f.inv[2]).abs() < 1e-7);
+        assert!(f.inv[1] > 0.0, "xy = -1.5 flips the sign: {:?}", f.inv);
+        let det = 2.8f32 * 2.8 - 1.5 * 1.5;
+        let det_inv = f.inv[0] * f.inv[3] - f.inv[1] * f.inv[2];
+        assert!((det_inv * det - 1.0).abs() < 1e-4, "{det_inv} {det}");
+        assert!((f.inv[0] - 2.8 / det).abs() < 1e-4, "{:?}", f.inv);
+        // Turning a splat does not fade it: the spread is a determinant, so it is
+        // the same as the unrotated ellipse's.
+        assert!((f.spread - (4.0f32 / 5.59).sqrt()).abs() < 1e-4, "{}", f.spread);
+        // The quad still reaches the reach contour along each axis of the ellipse
+        // (the corners of the bounding box reach further: (3, 3) sigma).
+        assert!(f.gauss_at([e, e]) > REACH_M);
+    }
+
+    #[test]
+    fn a_non_finite_splat_has_no_footprint() {
+        let nan = ball(Vec3::new(f32::NAN, 0.0, 0.0), 0.02, [1.0; 4]);
+        assert!(Footprint::of(&nan, &cam()).is_none());
+        let inf = ball(Vec3::new(0.0, f32::INFINITY, 0.0), 0.02, [1.0; 4]);
+        assert!(Footprint::of(&inf, &cam()).is_none());
+    }
+
+    #[test]
+    fn prepared_splat_footprints_are_the_isotropic_special_case() {
+        let p = PreparedSplat {
+            screen: [320.0, 240.0],
+            radius: 1.0,
+            depth: 8.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let f = p.footprint();
+        // Exactly the same numbers as the full three-axis projection of an
+        // isotropic splat of the same screen radius.
+        let full = Footprint::of(&ball(Vec3::ZERO, 0.02, [1.0; 4]), &cam()).unwrap();
+        assert!((f.half[0] - full.half[0]).abs() < 1e-5);
+        assert!((f.half[1] - full.half[1]).abs() < 1e-5);
+        assert!((f.spread - full.spread).abs() < 1e-6);
+        assert!((f.inv[0] - full.inv[0]).abs() < 1e-6);
+        assert_eq!((f.inv[1], f.inv[2]), (0.0, 0.0));
+        assert_eq!(f.depth, 8.0);
+    }
+
+    #[test]
+    fn the_mesh_is_one_billboard_quad_per_splat() {
+        use crate::camera::Camera;
+        let cam = Camera::new(320.0, 240.0, 0.0, 0.0, 8.0, 400.0);
+        let splats = vec![
+            ball(Vec3::new(0.0, 0.0, 0.0), 0.02, [1.0, 0.5, 0.0, 1.0]),
+            ball(Vec3::new(0.5, 0.0, 0.0), 0.02, [0.0, 1.0, 0.0, 1.0]),
+        ];
+        let prepared = prepare(&splats, &cam, 16);
+        assert_eq!(prepared.len(), 2);
+        let tex = epaint::TextureId::User(7);
+        let m = mesh(&prepared, tex);
+        assert_eq!(m.texture_id, tex);
+        assert_eq!(m.vertices.len(), 8, "four vertices per splat");
+        assert_eq!(m.indices.len(), 12, "six indices per splat");
+        assert!(m.is_valid(), "every index is inside the vertex list");
+        assert_eq!(m.indices, vec![0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7]);
+        for v in &m.vertices {
+            assert!(v.pos.x.is_finite() && v.pos.y.is_finite());
+        }
+        // The first splat: a square of half-extent 3 * sqrt(1.3) about (320, 240).
+        let h = 3.0 * 1.3f32.sqrt();
+        let want = epaint::pos2(320.0 - h, 240.0 - h);
+        assert!((m.vertices[0].pos - want).length() < 1e-4, "{:?}", m.vertices[0].pos);
+        assert!((m.vertices[3].pos.x - (320.0 + h)).abs() < 1e-4);
+        assert!((m.vertices[3].pos.y - (240.0 + h)).abs() < 1e-4);
+        // The UVs span a radial gaussian texture, top-left first.
+        assert_eq!(m.vertices[0].uv, epaint::pos2(0.0, 0.0));
+        assert_eq!(m.vertices[1].uv, epaint::pos2(1.0, 0.0));
+        assert_eq!(m.vertices[2].uv, epaint::pos2(0.0, 1.0));
+        assert_eq!(m.vertices[3].uv, epaint::pos2(1.0, 1.0));
+        // The colour is the splat's, carrying the recovered peak alpha
+        // (1.0 * spread 1/1.3 = 0.769 -> 196/255).
+        let a = (255.0f32 / 1.3).round() as u8;
+        assert_eq!(a, 196);
+        assert_eq!(
+            m.vertices[0].color,
+            epaint::Color32::from_rgba_unmultiplied(255, 128, 0, 196)
+        );
+        // The second splat is the same quad shifted by 0.5 * 50 px, green.
+        assert!((m.vertices[4].pos.x - (345.0 - h)).abs() < 1e-4, "{:?}", m.vertices[4].pos);
+        assert_eq!(
+            m.vertices[4].color,
+            epaint::Color32::from_rgba_unmultiplied(0, 255, 0, 196)
+        );
+        // The mesh bbox is the union of the quads.
+        let b = m.calc_bounds();
+        assert!((b.min.x - (320.0 - h)).abs() < 1e-4);
+        assert!((b.max.x - (345.0 + h)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_mesh_keeps_the_prepared_far_to_near_order() {
+        use crate::camera::Camera;
+        let cam = Camera::new(320.0, 240.0, 0.0, 0.0, 8.0, 400.0);
+        // Three splats up the view axis: the far one is prepared (and drawn) first.
+        let splats = vec![
+            ball(Vec3::new(0.0, 0.0, 4.0), 0.02, [1.0; 4]),
+            ball(Vec3::new(0.0, 0.0, 0.0), 0.02, [1.0; 4]),
+            ball(Vec3::new(0.0, 0.0, 2.0), 0.02, [1.0; 4]),
+        ];
+        let prepared = prepare(&splats, &cam, 16);
+        let depths: Vec<f32> = prepared.iter().map(|p| p.depth).collect();
+        assert_eq!(depths, vec![8.0, 6.0, 4.0]);
+        let m = solid_mesh(&prepared);
+        assert_eq!(m.vertices.len(), 12);
+        // Each quad's centre is prepared[i].screen, and the radii grow as the
+        // depth shrinks (the same sigma, projected closer).
+        let mut widths = Vec::new();
+        for (i, p) in prepared.iter().enumerate() {
+            let quad = &m.vertices[i * 4..i * 4 + 4];
+            let cx = (quad[0].pos.x + quad[3].pos.x) * 0.5;
+            let cy = (quad[0].pos.y + quad[3].pos.y) * 0.5;
+            assert!((cx - p.screen[0]).abs() < 1e-4, "quad {i} at {cx}");
+            assert!((cy - p.screen[1]).abs() < 1e-4);
+            widths.push(quad[3].pos.x - quad[0].pos.x);
+        }
+        assert!(widths[0] < widths[1] && widths[1] < widths[2], "{widths:?}");
+    }
+
+    #[test]
+    fn the_solid_mesh_uses_the_untextured_white_uv() {
+        let prepared = vec![PreparedSplat {
+            screen: [10.0, 20.0],
+            radius: 1.0,
+            depth: 4.0,
+            color: [0.2, 0.4, 0.6, 1.0],
+        }];
+        let m = solid_mesh(&prepared);
+        assert_eq!(m.texture_id, epaint::TextureId::default());
+        assert_eq!(m.vertices.len(), 4);
+        for v in &m.vertices {
+            assert_eq!(v.uv, epaint::WHITE_UV);
+        }
+        // (r, g, b) at 0.2 / 0.4 / 0.6 -> 51 / 102 / 153.
+        assert_eq!(
+            m.vertices[0].color,
+            epaint::Color32::from_rgba_unmultiplied(51, 102, 153, (255.0f32 / 1.3).round() as u8)
+        );
+        // The textured mesh differs only in the texture id and the UVs.
+        let t = mesh(&prepared, epaint::TextureId::User(1));
+        assert_eq!(t.vertices[0].color, m.vertices[0].color);
+        assert_eq!(t.vertices[1].uv, epaint::pos2(1.0, 0.0));
+    }
+
+    #[test]
+    fn a_single_splat_can_build_its_own_mesh() {
+        let p = PreparedSplat {
+            screen: [100.0, 50.0],
+            radius: 2.0,
+            depth: 3.0,
+            color: [1.0; 4],
+        };
+        let m = p.mesh(epaint::TextureId::Managed(3));
+        assert_eq!(m.vertices.len(), 4);
+        assert_eq!(m.indices, vec![0, 1, 2, 2, 1, 3]);
+        assert!(m.is_valid());
+        // Half-extent 3 * sqrt(4 + 0.3).
+        let h = 3.0 * 4.3f32.sqrt();
+        assert!((m.vertices[3].pos.x - (100.0 + h)).abs() < 1e-4, "{h}");
+        assert!((m.vertices[0].pos.y - (50.0 - h)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn prepared_mesh_projects_and_builds_in_one_step() {
+        use crate::camera::Camera;
+        let cam = Camera::new(320.0, 240.0, 0.0, 0.0, 8.0, 400.0);
+        let splats = vec![
+            ball(Vec3::ZERO, 0.02, [1.0; 4]),
+            ball(Vec3::new(0.0, 0.0, 3.0), 0.02, [1.0; 4]),
+        ];
+        let m = prepared_mesh(&splats, &cam, 8, epaint::TextureId::User(2));
+        assert_eq!(m.vertices.len(), 8);
+        assert!(m.is_valid());
+        // The nearer splat (depth 5) is drawn last and is the wider quad.
+        let near = &m.vertices[4..8];
+        assert!((near[0].pos.x + near[3].pos.x) * 0.5 - 320.0 < 1e-4);
+        assert!(near[3].pos.x - near[0].pos.x > m.vertices[3].pos.x - m.vertices[0].pos.x);
+        // The budget still applies: only the nearest one survives a budget of 1.
+        let one = prepared_mesh(&splats, &cam, 1, epaint::TextureId::User(2));
+        assert_eq!(one.vertices.len(), 4);
+    }
+
+    #[test]
+    fn a_real_egui_frame_paints_the_splat_mesh() {
+        use crate::camera::Camera;
+        let cam = Camera::new(320.0, 240.0, 0.0, 0.0, 8.0, 400.0);
+        let splats = vec![
+            ball(Vec3::ZERO, 0.02, [1.0, 0.5, 0.0, 1.0]),
+            ball(Vec3::new(0.5, 0.0, 0.0), 0.02, [0.0, 1.0, 0.0, 1.0]),
+        ];
+        let m = prepared_mesh(&splats, &cam, 16, epaint::TextureId::User(4));
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let out = ctx.run_ui(input, |ui| {
+            ui.painter().add(epaint::Shape::mesh(m.clone()));
+        });
+        let meshes: Vec<&epaint::Mesh> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                epaint::Shape::Mesh(mesh) => Some(&**mesh),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes.len(), 1, "the frame carries our one mesh");
+        assert_eq!(meshes[0].vertices.len(), 8);
+        assert_eq!(meshes[0].indices.len(), 12);
+        assert_eq!(meshes[0].texture_id, epaint::TextureId::User(4));
+        assert!(meshes[0].vertices[0].color.a() > 0);
+        // The frame's mesh is our mesh, bounds and all.
+        let want = m.calc_bounds();
+        let got = meshes[0].calc_bounds();
+        assert!((got.min - want.min).length() < 1e-4, "{got:?} {want:?}");
+        assert!((got.max - want.max).length() < 1e-4);
+        // And it is the first splat's quad that lands at the screen centre +-3 sigma.
+        let h = 3.0 * 1.3f32.sqrt();
+        assert!((got.min.x - (320.0 - h)).abs() < 1e-4);
+        assert!((got.max.x - (345.0 + h)).abs() < 1e-4);
     }
 }

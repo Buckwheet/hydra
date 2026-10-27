@@ -59,6 +59,15 @@ impl ShadowCaster {
         }
         list
     }
+
+    /// The shadow as an `epaint` shape: the silhouette hull filled with `color`.
+    ///
+    /// The `epaint` face of [`ShadowCaster::draw_list`] — one convex polygon, or
+    /// nothing when the hull is degenerate (fewer than three points), which is
+    /// also what `draw_list` emits.
+    pub fn shapes(&self, color: [u8; 4]) -> Vec<epaint::Shape> {
+        self.draw_list(color).filled_shapes()
+    }
 }
 
 impl Posed {
@@ -162,5 +171,62 @@ mod tests {
             assert_eq!(list.filled.len(), 1);
             assert_eq!(list.filled[0].1, [0, 0, 0, 80]);
         }
+    }
+
+    #[test]
+    fn the_caster_hull_becomes_one_epaint_polygon() {
+        // A rig whose three ground footprints are not collinear (the shared
+        // `rig()`'s arm and leg are antipodal through the root, so its hull is a
+        // line whatever the camera does).
+        let p = Puppet::new(
+            "biped",
+            vec![
+                Segment::new("root", 0, Vec3::ZERO, 1.0),
+                Segment::new("arm", 0, Vec3::new(-0.5, 1.0, 0.3), 0.3),
+                Segment::new("leg", 0, Vec3::new(0.4, 0.8, -0.6), 0.5),
+            ],
+        )
+        .unwrap();
+        let cam = Camera::new(50.0, 50.0, 0.0, 30.0, 8.0, 300.0);
+        let caster = p.pose().shadow_caster(&cam, &p);
+        assert!(caster.hull.len() >= 3, "a tilted camera gives the hull area");
+        let shapes = caster.shapes([0, 0, 0, 80]);
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            epaint::Shape::Path(path) => {
+                assert!(path.closed);
+                // Exactly the caster's hull, point for point.
+                assert_eq!(path.points.len(), caster.hull.len());
+                for (got, want) in path.points.iter().zip(caster.hull.iter()) {
+                    assert_eq!((got.x, got.y), (want[0], want[1]));
+                }
+                assert_eq!(path.fill.a(), 80);
+                assert_eq!((path.fill.r(), path.fill.g(), path.fill.b()), (0, 0, 0));
+                assert_eq!(path.stroke, epaint::PathStroke::NONE);
+            }
+            other => panic!("expected a path, got {other:?}"),
+        }
+        // The hull's epaint bounds are the screen-space bounds of the bones.
+        let (lo, hi) = crate::draw::Shape::poly(caster.hull.clone()).bounds();
+        let bounds = epaint::Shape::Path(match shapes[0].clone() {
+            epaint::Shape::Path(p) => p,
+            _ => unreachable!(),
+        })
+        .visual_bounding_rect();
+        assert!((bounds.min.x - lo[0]).abs() < 1e-4, "{bounds:?}");
+        assert!((bounds.min.y - lo[1]).abs() < 1e-4);
+        assert!((bounds.max.x - hi[0]).abs() < 1e-4);
+        assert!((bounds.max.y - hi[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_flat_caster_paints_nothing() {
+        let p = rig();
+        // No pitch: the ground plane projects onto a line, so the hull of the
+        // bone origins has no area and there is no polygon to paint.
+        let cam = Camera::new(0.0, 0.0, 0.0, 0.0, 8.0, 400.0);
+        let caster = p.pose().shadow_caster(&cam, &p);
+        assert!(caster.hull.len() < 3);
+        assert!(caster.shapes([0, 0, 0, 90]).is_empty());
     }
 }

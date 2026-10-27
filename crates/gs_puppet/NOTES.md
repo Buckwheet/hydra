@@ -7,10 +7,12 @@ string pool, the demangled globals and the local symbols (`nm -an | rustfilt`
 gives many more local text symbols than `symbols_demangled.txt`, which is what
 made the struct layouts recoverable via the drop glue).
 
-The crate is `std`-only.  The original used `glam`, `wgpu`, `toml` + `serde`,
-`ruzstd`, `hashbrown` and `anyhow`; each is replaced by a hand-written
-`std`-only equivalent and every departure is marked in the code with
-`**std departure**`.
+The crate is `std`-only apart from `egui` + `epaint`, which arrived in Phase 4
+for the draw seams only (see "Phase 4: egui" below): the binary has **no**
+`gs_puppet` -> `egui` call edge, so nothing here is widget code.  The original
+used `glam`, `wgpu`, `toml` + `serde`, `ruzstd`, `hashbrown` and `anyhow`; each is
+replaced by a hand-written `std`-only equivalent and every departure is marked in
+the code with `**std departure**`.
 
 | tag | meaning |
 |---|---|
@@ -266,6 +268,14 @@ being written as a 3×3 basis at `+0x0c`.
 | fall sampling step | double `0.0078125` | 1/128 |
 | bit-mask table | bytes @ `0x1021dc9a8` | `[1,2,4,8,16,32,64,128]` |
 | pose file table | `0x1043b60d8` | 13 × `(&str,&str)`, 0x1a0 bytes |
+| splat `CORE_M` / `REACH_M` | embedded WGSL, `const CORE_M: f32 = 2.25;` / `REACH_M = 9.0` | 2.25 / 9.0 (`sqrt(REACH_M) = 3σ`) |
+| splat `RIM_FROM` / `RIM_TO` | embedded WGSL, `0.3` / `0.8` | 0.3 / 0.8 |
+| billboard half-extent | `let r = vec2(3.0 * sqrt(xx), 3.0 * sqrt(yy));` | `3σ` |
+| variance / determinant floor | `xx0 + 0.3`, `max(…, 1e-6)` | 0.3 / 1e-6 |
+| alpha cap | `min(v.alpha * exp(-0.5 * m), 0.99)` | 0.99 |
+| GPU splat instance | `// one splat at rest (144 bytes)`, nine `vec4` | 144 (= 9·16) |
+| draw `LIGHT_ABOVE` / `DARK_BELOW` | embedded WGSL, named as `gs_puppet::draw::…` | 0.62 / −0.08 |
+| layers `FRESH_SECS` / `FALL_FT_S2` | embedded WGSL, named as `gs_puppet::layers::…` | 4.0 / 24.0 |
 
 ---
 
@@ -291,12 +301,187 @@ elephantid `trunk` override, the 4.2 s biped idle with a `-0.16` arm phase, …)
 
 ---
 
+## Phase 4: egui
+
+### The binary has no egui UI here (the evidence)
+
+* **No call edge.**  `docs/EGUI.md` §3.6 scanned the whole `__TEXT` disassembly
+  (`objdump -d`) for `bl` edges into egui-family symbols: 1 940 edges exist, and
+  **zero** come from `gs_puppet` (against 248 from `hydra_gui`, 7 from
+  `gs_render`, 2 from `hydra_board`).
+* **No named type.**  No `gs_puppet` symbol in `symbols_demangled.txt`, nor in
+  `nm -an | rustfilt`, mentions `egui` / `epaint` / `ecolor` / `emath`.
+* **No widget strings.**  Nothing in the shared string pool names an egui widget,
+  layer or painter.
+
+There is therefore no widget, layout, hotbar or window code to restore in this
+crate, and none was invented.  What the crate *did* do was build the draw data the
+`gs_render` GPU passes consumed — `splat::render` issued a draw, `draw_list`
+produced the limb layers, `skin`/`shadow`/`uv` produced the textures — and those
+seams now also emit `epaint` values (a `Mesh`, `Shape`s, `ColorImage`s).  The
+seams themselves (`render`, `prepare`, `draw_list`, `ground_shadow`, `skin_*`,
+`shadow_caster`) are unchanged; everything below is additive.
+
+### The recovered evidence the new geometry comes from
+
+The binary embeds its WGSL: `skin_gpu`'s three splat passes and `splat_gpu.wgsl`
+("the same three passes for a cloud the CPU projected").  Both copies carry
+comments naming this crate's items, and their code pins the billboard maths
+exactly:
+
+| shader line | what it pins |
+|---|---|
+| `// gs_puppet::splat::CORE_M and REACH_M: a splat's core, and its reach` | the two constants exist here; `2.25` and `9.0` are their values |
+| `// gs_puppet::splat::RIM_FROM and RIM_TO: where a rim splat starts to show, / and is whole, by how edge-on it is` | `0.3` and `0.8` |
+| `let r = vec2<f32>(3.0 * sqrt(xx), 3.0 * sqrt(yy));` / `let off = corner[k] * r * u.to_cam.w;` | the quad's half-extent is `3σ`, and the reach multiplier applied to it |
+| `let corner = array<vec2<f32>, 6>((-1,-1), (1,-1), (-1,1), (-1,1), (1,-1), (1,1));` | the exact corner/triangle order |
+| `let xx = xx0 + 0.3; let det = max(xx * yy - xy * xy, 1e-6);` | the variance floor and the determinant floor |
+| `let spread = sqrt(clamp((xx0 * yy0 - xy*xy) / det, 0.0, 1.0));` | the sub-pixel fade ("as much fainter as it was made wider") |
+| `o.inv = vec4(yy / det, -xy / det, -xy / det, xx / det);` + `gauss_m(d, inv)` | the inverse covariance and the falloff form |
+| `let a = min(v.alpha * exp(-0.5 * m), 0.99);` | the peak alpha and its cap |
+| `// one splat at rest (144 bytes)` + the nine `vec4` members | the GPU instance stride `9 × 16 = 144` (vs the 92-byte decoded record) |
+| `// gs_puppet::draw::LIGHT_ABOVE / DARK_BELOW, as mesh::render shades` | `0.62` and `-0.08` |
+| `// gs_puppet::layers::FRESH_SECS and FALL_FT_S2` | `4.0` and `24.0` |
+| `// (gs_puppet::layers::Particle::at, line for line)` | confirms `Particle::at`'s formula (already recovered) |
+
+`3.0 = sqrt(REACH_M)` is the consistency check: the quad reaches exactly the
+`REACH_M` contour along each axis, which is why the shader can write `3.0 * sqrt`.
+
+### New public API (all additive; nothing renamed or removed)
+
+`splat`:
+
+| item | what it is |
+|---|---|
+| `CORE_M`, `REACH_M`, `RIM_FROM`, `RIM_TO` | the four `gs_puppet::splat` constants the shaders name |
+| `QUAD_SIGMAS` (3.0), `MIN_VARIANCE` (0.3), `MIN_DET` (1e-6), `MAX_ALPHA` (0.99) | the billboard/falloff numbers |
+| `SPLAT_INSTANCE_STRIDE` (144) | the GPU instance stride, beside the existing `SPLAT_STRIDE` (92) |
+| `gauss_m([f32;2], [f32;4]) -> f32`, `falloff(f32) -> f32` | the shader's quadratic form and `exp(-0.5 m)` |
+| `struct Footprint { centre, half, inv, spread, depth, alpha }` | one splat's projected billboard |
+| `Footprint::{corners, local, gauss_at, falloff_at, peak_alpha, area, is_finite}` | its geometry |
+| `Footprint::of(&Splat, &Camera) -> Option<Footprint>` | the full three-axis covariance of `vs_cloud`, on the CPU |
+| `Footprint::of_prepared(&PreparedSplat) -> Footprint` | the isotropic special case |
+| `PreparedSplat::{footprint, mesh}` | per-splat convenience |
+| `SPLAT_UVS` | the quad's UVs into a radial gaussian sheet |
+| `mesh(&[PreparedSplat], TextureId) -> epaint::Mesh` | one textured billboard quad per splat, in the list's order |
+| `solid_mesh(&[PreparedSplat]) -> epaint::Mesh` | the same, untextured (`WHITE_UV`) |
+| `prepared_mesh(&[Splat], &Camera, budget, TextureId) -> epaint::Mesh` | `prepare` + `mesh` in one call |
+
+`draw`: `LIGHT_ABOVE`, `DARK_BELOW`, `color32([u8;4])`, `color32_rgb([u8;3])`,
+`Shape::{pos2s, to_fill, to_stroke}`, `Prim::to_epaint`,
+`DrawList::{shapes, filled_shapes, layer_shapes, prim_shapes}`,
+`Posed::{shapes, shadow_shapes}`.
+
+`shadow`: `ShadowCaster::shapes`.
+
+`skin`: `SkinSurface::color_image`.  `uv`: `Texture::color_image`.
+
+`layers`: `FRESH_SECS`, `FALL_FT_S2`.
+
+### What each seam emits, and how it is tested
+
+* **splat → `epaint::Mesh`.**  `mesh` walks the far-to-near list `prepare`
+  returns, so the mesh's quad order *is* the draw order.  Per splat: 4 vertices
+  (the `3σ` box), 6 indices in the shader's triangle order, UVs `(0,0) (1,0) (0,1)
+  (1,1)`, and one vertex colour (the splat's rgb, premultiplied — which is what
+  the recovered blend pass writes — at `peak_alpha = min(alpha·spread, 0.99)`).
+  The Gaussian falloff is per-fragment in the shader and `epaint` can only vary
+  alpha per vertex, so it must come from the texture's alpha channel; that is why
+  the UVs span the whole quad.  `solid_mesh` is the hard-edged variant.
+* **`draw_list` → `epaint::Shape`s.**  `DrawList::shapes` emits `filled` (4-byte),
+  `tinted` (3-byte, opaque) and then every `SegDraw` quad of every `layers` entry
+  in the recovered far-to-near order; `prims` is the flat copy of the same quads,
+  so it is not re-emitted (no double painting of the ground shadow, which lives in
+  both `filled` and `prims`).  `prim_shapes` / `layer_shapes` expose the two views
+  separately.
+* **`ground_shadow` / `shadow_caster` → one hull polygon.**  `filled_shapes`, so
+  the translucent colour keeps its alpha.
+* **surfaces → `ColorImage`.**  `SkinSurface::color_image` and `Texture::color_image`
+  are the values `Context::load_texture` consumes; both use the recovered `255.0`
+  fixed point.
+
+Tests (179 unit + 2 integration, all value-asserting; the pre-existing 151 are
+untouched and still green):
+
+| test | values pinned |
+|---|---|
+| `splat::tests::the_recovered_shader_constants_are_the_recovered_values` | 2.25 / 9.0 / 0.3 / 0.8 / 0.3 / 1e-6 / 0.99; `QUAD_SIGMAS == sqrt(REACH_M)`; `exp(-CORE_M/2) = 0.3246525`, `exp(-REACH_M/2) = 0.011109` |
+| `splat::tests::the_gpu_instance_is_nine_vec4s` | 144 = 9·16, ≠ 92 |
+| `splat::tests::gauss_m_is_the_shaders_quadratic_form` | the form at `(1,0)+(2,0)+(3,4)` offsets, and the cross term `(d.x+d.y)²` |
+| `splat::tests::a_projected_splat_gets_the_shaders_billboard` | centre `(320,240)`, depth 8, `half = 3·sqrt(1.3)`, `spread = 1/1.3`, `inv = diag(1/1.3)`, `gauss_m(half) = REACH_M`, the four corners, `peak_alpha`, `area` |
+| `splat::tests::a_sub_pixel_splat_is_spread_over_a_pixel_and_fades` | `half = 3·sqrt(0.55)`, `spread = 0.25/0.55`, a zero-size splat keeps a pixel of reach at alpha 0 |
+| `splat::tests::a_stretched_splat_is_an_ellipse_on_the_screen` | `half = (3·sqrt(4.3), 3·sqrt(1.3))`, `spread = sqrt(4/5.59)`, the axis pointing at the camera contributes nothing |
+| `splat::tests::rotating_a_splat_turns_the_quad_into_a_sheared_footprint` | a 45° basis gives `xx0 = yy0 = 2.5`, `xy = -1.5`, a symmetric `inv` with `det(inv)·det = 1`, and the *same* spread (rotation does not fade a splat) |
+| `splat::tests::the_peak_alpha_is_capped_like_the_blend_pass` | cap 0.99, floor 0.0 |
+| `splat::tests::the_mesh_is_one_billboard_quad_per_splat` | 8 vertices / 12 indices, `is_valid`, the literal index list, corner positions, the four UVs, the premultiplied colours (`255,128,0,196`), the bbox |
+| `splat::tests::the_mesh_keeps_the_prepared_far_to_near_order` | depths `[8,6,4]` in that order, each quad centred on `prepared[i].screen`, quad width growing as depth shrinks |
+| `splat::tests::the_solid_mesh_uses_the_untextured_white_uv` | `TextureId::default()`, `WHITE_UV`, `(51,102,153,196)` |
+| `splat::tests::prepared_mesh_projects_and_builds_in_one_step` | the budget truncation and the near-splat-wider rule |
+| `splat::tests::a_real_egui_frame_paints_the_splat_mesh` | one real `ctx.run_ui` frame: the `Shape::Mesh` is there, 8 vertices, 12 indices, the texture id, the frame's mesh bounds = `±(320,240) ∓ 3·sqrt(1.3)` |
+| `draw::tests::a_bone_quad_becomes_one_epaint_polygon` | the four exact screen points `(185,120) (185,70) (135,70) (135,120)`, closed, the fill and the empty stroke |
+| `draw::tests::shapes_come_out_far_to_near` | the trunk (depth 8) before the neck (depth 6), centroids `(160,95)` and `(160,46.67)` |
+| `draw::tests::a_shadow_hull_is_emitted_once_not_twice` | `filled = 1`, `prims = 1`, `shapes() = 1`, alpha 90 |
+| `draw::tests::the_layer_and_flat_views_hold_the_same_quads` | the layer depths are non-increasing, `layer_shapes` is exactly their prims, `shapes()` = `layer_shapes` here |
+| `draw::tests::degenerate_shapes_paint_nothing` | 0/1/2-point shapes, the transparent fill of a line, the tint alpha |
+| `draw::tests::byte_colours_become_premultiplied_epaint_colours` | `(200,100,40,128)` premultiplies channel by channel |
+| `draw::tests::a_real_egui_frame_paints_the_limb_quads` | one real frame: two `Path`s, the trunk's four points, its clip-independent bounding rect `(135,70)..(185,120)` |
+| `shadow::tests::the_caster_hull_becomes_one_epaint_polygon` | the hull point for point, alpha 80, the stroke, the bounds |
+| `shadow::tests::a_flat_caster_paints_nothing` | a pitch-0 camera has no hull and yields no shape |
+| `skin::tests::the_surface_becomes_an_epaint_color_image` | `[2,2]`, the four texels `(255,128,64,255)`, `(0,0,0,0)`, `(51,102,153,255)`, the premultiplied half-alpha white, agreement with `to_texture` |
+| `uv::tests::the_atlas_becomes_an_epaint_color_image` | straight-in / premultiplied-out bytes, the blank atlas |
+| `tests/headless_paint.rs::a_posed_figure_and_its_splats_paint_into_one_frame` | one real frame with a **loaded texture**: 3 shapes in paint order, the two limb quads' exact points, the mesh's texture id = the handle's, 8 vertices, bounds `±3·sqrt(1.6²+0.3)`, and the 4×4 sheet in `textures_delta.set` |
+| `tests/headless_paint.rs::a_tilted_camera_paints_the_ground_shadow_too` | one hull polygon from a pitched camera, alpha 90, finite bounds |
+
+No test asserts "it did not panic"; each one pins numbers.  Nothing opens a window
+or creates a `wgpu` device: the only egui entry points used are
+`Context::default`, `Context::load_texture`, `Context::run_ui` and
+`Painter::add`.
+
+### The `epaint` translation choices (INFERRED, and why)
+
+1. **Falloff source.**  Per-fragment `exp(-0.5·m)` cannot live in a 4-vertex mesh,
+   so it moves to the texture's alpha channel and the vertices carry the *peak*
+   alpha.  `solid_mesh` exists for callers with no sheet.  (The shader's own corner
+   value is `exp(-9) ≈ 1.2e-4`, i.e. effectively 0 — carrying the corner value on
+   the vertices would paint nothing.)
+2. **`PreparedSplat` has one radius, not the covariance.**  `Footprint::of_prepared`
+   is the recovered formula's isotropic special case (`xx0 = yy0 = radius²`,
+   `xy = 0`); [`Footprint::of`] uses the real three projected axes and is the
+   faithful one when the caller still has the [`Splat`]s.
+3. **Paint order for `DrawList::shapes`.**  `filled` → `tinted` → `layers`, i.e. the
+   list's own structure; `prims` stands aside because it duplicates `layers`.
+   Which of the binary's layers `gs_render` actually consumed is not recoverable
+   from the symbols (only the types survive), so no other order was invented.
+
+### Remaining UNKNOWNs (this phase)
+
+1. **`splat::Gaussian::rim`.**  The shader names it
+   (`// x: its rim (gs_puppet::splat::Gaussian::rim)`, `o.glow += RIM_STEP *
+   round(clamp(i.fx.x, 0.0, 1.0) * 8.0)`), so a `Gaussian` type with a `rim()`
+   method existed here — but no symbol and no drop glue pins its layout or its
+   formula (only that it returns a `0..=1` value).  Not reconstructed; no
+   placeholder type was invented.
+2. **`layers::ARRIVAL_AGES`.**  The shader's uniform comment mentions
+   `gs_puppet::layers::ARRIVAL_AGES` ("the ages of its frames"); the *values* never
+   appear outside the CPU builder, so no array was added.
+3. **Which layer `gs_render` consumed** (see choice 3 above).
+4. **The skin/body GPU path stays a texture seam.**  `skin::skin_surface` still
+   produces a `SkinSurface` (now also convertible to `ColorImage`); the shader that
+   consumes it (`skin_gpu`) does the projection itself, so there is no `epaint`
+   geometry to emit for it — converting the body mesh to 2-D triangles would be
+   inventing a path the binary does not have.
+5. **`layers::Dot` / `Hollow` / `Particle` → no `epaint` producer.**  They are
+   instanced into the same shader (`vs_cloud`'s `thrown`/`mote`), not painted by
+   the CPU; emitting 2-D shapes for them would be a second, invented renderer.
+
+---
+
 ## std departures
 
 | original | replacement | notes |
 |---|---|---|
 | `glam` | `math::{Vec3, Mat3, Quat, Xf}` | layouts and constants are the recovered ones |
-| `wgpu` | data-returning functions | `splat::render`, `skin::*` and `shadow::*` produce the buffers the GPU pass consumed; nothing is silently dropped |
+| `wgpu` | data-returning functions, plus `epaint` values | `splat::render`, `skin::*` and `shadow::*` produce the buffers the GPU pass consumed (nothing is silently dropped), and the Phase 4 seam turns that data into an `epaint::Mesh` / `Shape`s / `ColorImage`s |
 | `toml` + `serde` | `toml::parse` + `PoseSet::from_toml` / `BakedPuppet::from_toml` | subset: `[a.b]`, `[[a]]`, `key = "str" / num / bool / [..] / {..}`, `#` comments |
 | `ruzstd` | `splat::zstd_decode` | frame header + **Raw/RLE** blocks; a `Compressed` block returns an error rather than garbage |
 | `hashbrown` | `std::collections::HashMap` | `Mesh::parse_obj`'s vertex merge |
@@ -363,6 +548,16 @@ elephantid `trunk` override, the 4.2 s biped idle with a `-0.16` arm phase, …)
   seam: `splat::prepare(&[Splat], &Camera, budget) -> Vec<PreparedSplat>` replaces
   the GPU vertex-buffer build, and `splat::render` returns that list instead of
   issuing a draw.
+* For a painter (egui or otherwise) the same list becomes geometry:
+  `splat::mesh(&[PreparedSplat], TextureId) -> epaint::Mesh` (or `solid_mesh`,
+  `prepared_mesh`), `PreparedSplat::footprint` / `Footprint::of` for one splat's billboard,
+  `Posed::{shapes, shadow_shapes}`, `ShadowCaster::shapes`,
+  `SkinSurface::color_image`, `Texture::color_image`.  All additive: the seam
+  functions above are unchanged.
+* `splat::{CORE_M, REACH_M, RIM_FROM, RIM_TO}` and `draw::{LIGHT_ABOVE,
+  DARK_BELOW}` and `layers::{FRESH_SECS, FALL_FT_S2}` are the constants the shipped
+  WGSL names, in case a renderer wants the same thresholds.
 * The `pose::Posed` inherent methods are spread over modules (`draw`, `skin`,
-  `shadow`, `joints`) exactly as the binary had them, so
-  `use gs_puppet::{draw, joints, shadow, skin};` is required before calling them.
+  `shadow`, `joints`) exactly as the binary had them; they are *inherent*, so no
+  extra `use` is needed to call them (only to name a module-level helper such as
+  `draw::convex_hull`).

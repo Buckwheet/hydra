@@ -52,9 +52,11 @@ module, so the reconstruction is a documented equivalent.
 | `queue` | `admit` | `0x101a0c52c` | full |
 | `queue` | `clear_waiting` | `0x101a0c308` | full |
 | `queue` | `open_window` / `written_at_once` | `0x101a0c0f0` / `0x101a0c48c` | full |
-| `queue` | `close_window` / `offer` / `answer_all` | `0x101a0c1a4` / `0x101a0c5b8` / `0x101a0bb3c` | full |
+| `queue` | `close_window` / `offer` / `answer_all` | `0x101a0c1a4` / `0x101a0c5b8` / `0x101a0bb3c` | partly (audited: entry shapes recovered, `answer_all` also drains `waiting`) |
+| `queue` | `drop_in_place<Owed>` / `drop_in_place<Envelope>` | `0x101a3ff2c` / `0x101a42220` | full (layout evidence) |
 | `queue` | `take_next` | `0x101a0c764` | partly (60 KB; entry semantics) |
-| `supervisor` | `jitter` / `backoff` | `0x101a0ba08` / `0x101a0ba90` | full / partly (constants) |
+| `supervisor` | `jitter` | `0x101a0ba08` | full (audited: `f64` fraction) |
+| `supervisor` | `backoff` | `0x101a0ba90` | full (audited: table `1,2,5,10,30`) |
 | `supervisor` | `answer_between` | `0x101a0ad6c` | helper |
 | `lich` | `lock` | `0x101a884e0` | full |
 | `lich` | `Slot::{takes_typing, hand, wire, begin, close, waits}` | `0x101a88014`…`0x101a8846c` | full |
@@ -75,7 +77,9 @@ module, so the reconstruction is a documented equivalent.
 | `alias` | `character` | `0x101aafcf8` | full |
 | `alias` | `AliasFile::{of, put, remove, load, expand}` | `0x101aae0c8`…`0x101aaf7e4` | full / partly (`expand`) |
 | `alias` | `Aliases::{for_character, expand, problem}` | `0x101aad5fc` / `0x101aad79c` / `0x101aadc60` | full |
-| `steps` | `pieces` / `steps` / `said` / `wait` | `0x101ab0c08` / `0x101ab01e8` / `0x101aafedc` / `0x101aaffb8` | full (separator UNKNOWN) |
+| `steps` | `pieces` | `0x101ab0c08` | partly (audited: `,` and `\` recovered; `[`/`]` UNKNOWN) |
+| `steps` | `steps` / `said` / `wait` | `0x101ab01e8` / `0x101aafedc` / `0x101aaffb8` | full (audited) |
+| `steps` | `behaviour_said` | `0x101aafd40` | helper (not modelled) |
 | `notes` | `notes_path` / `key_for` / `forget` / `remove` / `rewrite` / `add` / `add_lines` / `write` | `0x101a52988`…`0x101a54ed0` | full |
 | `notes` | `load` / `Notes::{get, find, search}` | `0x101a53bbc` / `0x101a53f28` / `0x101a540b8` / `0x101a548b0` | full |
 | `notes` | `Note::{first_line, clipped}` / `Clip::of_room` | `0x101a53a90` / `0x101a53b74` / `0x101a52e20` | full |
@@ -184,6 +188,103 @@ impl CommandQueue {
 `CommandQueue` is exactly two `VecDeque`s (element sizes `0x28` and `0x20`), the
 window tags are `1e9` / `1e9 + 1`, and a window older than 30 s
 (`cmp x0, #0x1e` on `Instant::elapsed`) is dropped.
+
+Re-checked in the audit pass (§6).  What the disassembly pins down:
+
+* **`Envelope` (40 bytes)** — `drop_in_place` (`0x101a42220`) drops a `String` at
+  `+0x00` (a `__rust_dealloc(ptr, cap, 1)` with cap `+0x00`) and an
+  `Option<oneshot::Sender<Outcome>>` at `+0x18`; the last word `+0x20` has no
+  drop glue.  `admit` copies exactly 40 bytes, `clear_waiting` sends
+  discriminant **6** to the `+0x18` sender and returns the drained length.
+* **`Owed` (32 bytes) is an enum, not a plain struct** —
+  `drop_in_place<Owed>` (`0x101a3ff2c`, duplicated at `0x101a12944`) first reads
+  a `u32` at `+0x18` and **returns early when it is `1e9`**, otherwise drops an
+  `Arc`-based `Option<oneshot::Sender<Outcome>>` at `+0x00` and an
+  `Option<Box<Frame>>` at `+0x08`.  `1e9`/`1e9 + 1` are not valid nanoseconds,
+  which is why they work as variant tags in the same slot as the `Instant`
+  nanoseconds.
+* Its three states and their constructors:
+  * `written_at_once` (`0x101a0c48c`) builds `{ at: Instant@0x00, tag = 1e9@0x18 }`
+    (the `0x10` word is *poison* — nothing is stored there), i.e. "written, no
+    answer owed to anyone";
+  * `open_window` (`0x101a0c0f0`) builds `{ reply@0x00, frame = None@0x08,
+    at: Instant@0x10, at.nanos@0x18 }` — so it takes the **reply sender as its
+    argument** (`x1` is stored straight into `+0x00`) rather than creating the
+    channel; the valid nanosecond value is what tags this variant;
+  * `close_window` recognised the `1e9`/`1e9+1` tags by masking
+    (`and w9, w9, #0x3ffffffe`) before deciding whether to send.
+* `offer` (`0x101a0c5b8`) walks the owed queue, drops `1e9`-tagged entries whose
+  `Instant::elapsed` is `>= 30` s, and stores a cloned `Box<Frame>` into
+  `+0x08` of the newest entry that has none.
+* `answer_all` (`0x101a0bb3c`) drains **both** deques: first the owed queue
+  (sending the answer's frame to entries that are not already tagged), then the
+  *waiting* queue, answering each envelope's `+0x18` sender.  The crate's
+  reconstruction only touches the owed queue, so this is the remaining **gap**.
+
+The reconstruction keeps the documented std-only model (`Owed` as a plain
+struct, `open_window`/`written_at_once` creating the channel and taking a `key`)
+because turning it into an enum and moving the sender to the caller would change
+the crate's public API.  The constants, the size, the field offsets and the
+30-second rule are exact; the *shape* of `Outcome` and of `answer_all` is not.
+
+### 2.3a `supervisor` — retries (ESTABLISHED in the audit pass)
+
+`jitter` (`0x101a0ba08`) takes **no argument** and returns an `f64`:
+
+```
+SystemTime::now().duration_since(UNIX_EPOCH)  -> Err => 0.0
+micros = subsec_nanos / 1000                  (umull 0x10624dd3, lsr #38)
+fraction = (micros % 1000) as f64 / 999.0     (umull 0x418938, msub, fdiv 0x408F380000000000)
+```
+
+`backoff` (`0x101a0ba90`) takes `(attempt: u32, jitter: f64)`:
+
+```
+i    = min(attempt, 4)                        (cmp w0,#4 ; csel)
+base = TABLE[i] * 1000                        (ms; TABLE @0x1039c5c60)
+j    = clamp(jitter, 0.0, 1.0)                (fcsel x2)
+ms   = (u64)((0.8 + 0.4 * j) * base)          (0.8 @0x101a0baec, 0.4 @0x101a0bad8)
+out  = Duration { secs: ms / 1000, nanos: (ms % 1000) * 1e6 }
+```
+
+The table is five `u64`s: **`1, 2, 5, 10, 30`** seconds — not a doubling, and the
+cap is 30 s, not 60 s.  `SupervisedSession::wait_before_retry` calls
+`jitter()` and passes `d0` straight into `backoff` (`0x1000089cc` / `0x1000089d4`),
+then bumps the attempt counter with a saturating `+1`.
+
+The reconstruction was **wrong here** before the audit (1 s doubling capped at
+60 s plus up to 250 ms additive jitter — an INFERRED doubling from an
+instruction count).  It now uses the recovered table and the multiplicative
+jitter, keeping the one-argument `backoff(u32)` and the `Duration`-shaped
+`jitter(up_to)` so the public API is unchanged; `JITTER_MS` survives only as an
+unused, documented constant.
+
+### 2.3b `steps` — pieces, waits and rendering (ESTABLISHED in the audit pass)
+
+```
+pieces 0x101ab0c08  char loop comparing ',', '[', ']', '\'   => ',' splits, '\' escapes
+steps  0x101ab01e8  pieces(line) then wait(piece) for every piece; Err => send as-is
+wait   0x101aaffb8  first char == 's' (case-folded) and rest parses as f32,
+                    need 0.0 <= s < 60.0, else the literal at 0x103e7cc12:
+                    "`{}` waits from a moment to {} seconds" (second arg 60)
+said   0x101aafedc  map steps to text, join with 7 bytes @0x1039c770b = ", then "
+```
+
+Step renderings (the `Map::fold` at `0x101a9e900`, element stride `0x30`):
+
+| tag | rendering |
+| --- | --- |
+| 0 | the line itself |
+| 1 | `format!("wait {} s", secs + nanos/1e9)` (f32 math) |
+| 2 | `"wait for roundtime"` (23 bytes @0x1039c751b) |
+| 3 | `"wait for cast roundtime"` (18 bytes @0x1039c7509) |
+| other | `steps::behaviour_said` (`0x101aafd40`) — **UNKNOWN** |
+
+Corrections made in the audit pass: the separator is `,` (was `;`), the wait
+spelling is `s<seconds>` (was only `wait <seconds>`, kept as a tolerated extra),
+and a wait renders as `"wait N s"` (was `"wait N seconds"` / `"wait a moment"`).
+Still **UNKNOWN**: what `[`/`]` group, the roundtime step kinds (they need game
+state, so `Step` models only send/wait), and the `behaviour_said` arms.
 
 ### 2.4 `claimant` — the desk (ESTABLISHED)
 
@@ -342,12 +443,15 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 * `queue`: 1000-deep FIFO, `clear_waiting` clearing every caller, the exact
   window tags (`0x3b9aca00`), `answer_all`/`offer`/`close_window`, and
   `take_next` recording what was written.
-* `supervisor`: doubling backoff capped at 60 s, jitter bounds,
-  `answer_between` first-value and deadline.
+* `supervisor`: the recovered `[1, 2, 5, 10, 30]` s table with the 80 %..=120 %
+  band per step, the clamp at entry 4, the constants themselves, the jitter
+  fraction bounds, and `answer_between` first-value and deadline.
 * `alias`: `{}_{}` key, name/rest split, single-command expansion, the
   multi-command `\?` error verbatim, `put`/`remove`, JSON round trip.
-* `steps`: piece splitting, `wait` words and the out-of-range message,
-  `said` with the 7-byte separator.
+* `steps`: comma splitting + `\,` escaping, `wait` in both spellings
+  (`s2`/`S2.5`/`s60` and `wait`/`wait 5`/`WAIT 60`), the recovered out-of-range
+  message, and `said` rendering `wait N s` joined by the confirmed 7-byte
+  separator.
 * `notes`: `notes.json`, key building, `first_line`/`clipped`, clip exits, get/
   find/search, JSON round trip + schema guard, civil-date arithmetic, and an
   on-disk add/append/forget cycle.
@@ -381,3 +485,46 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 Gates: `cargo check -p hydra_session`, `cargo test -p hydra_session` (158 tests
 passing) and `cargo check --workspace` are clean, and
 `grep -rn 'todo!' crates/hydra_session/src` is empty.
+
+## 6. Audit pass (verification batch)
+
+This crate had already been recovered and merged; this pass re-read the
+disassembly against the reconstruction.  Gates re-run from the worktree root:
+`cargo check -p hydra_session`, `cargo test -p hydra_session` (158 passing) and
+`grep -Rn 'todo!()\|unimplemented!()' crates/hydra_session/src` (empty).
+
+Checked against the binary: `queue::{admit, clear_waiting, open_window,
+written_at_once, close_window, offer, answer_all}` plus both `drop_in_place`
+glues, `supervisor::{jitter, backoff}` and their caller, `lich::{claim, symbol,
+session_over}` and the two `hand_to_lich` literals, `steps::{pieces, steps, said,
+wait}` (incl. the inlined `Map::fold` renderings), `stream_rules::fought`,
+`bestiary`'s literal set, and `hydra_table::account::env_name`.
+
+Fixed (behaviour was silently wrong):
+
+1. `supervisor::backoff`/`jitter` — the crate claimed a doubling from 1 s capped
+   at 60 s with up to 250 ms of additive jitter, marked INFERRED because the
+   constants "cannot be seen without decompiling".  They can: the table at
+   `0x1039c5c60`, the `0.4`/`0.8` doubles and the `fcvtzu`/`ms` split give
+   `backoff(attempt) = [1,2,5,10,30][min(attempt,4)] s × (0.8 + 0.4 × jitter())`
+   with millisecond truncation, and `jitter()` is a `f64` fraction from the wall
+   clock's sub-millisecond field.  See §2.3a.  `BACKOFF_CAP` is now 30 s.
+2. `steps::pieces` — the separator is `,` (with `\` escaping), not `;`.
+3. `steps::wait` — the original's spelling is `s<seconds>` (f32, `0.0..60.0`);
+   the crate now accepts it as well as its own `wait <seconds>`.
+4. `steps::said`/`Step::text` — a wait renders as `wait N s`, not
+   `wait N seconds`/`wait a moment`; `steps()` runs `wait` over every piece,
+   which is what `0x101ab01e8` does.
+
+Recorded but **not** fixed (would change the public API):
+
+* `queue::Owed` is an enum in the binary (three states tagged through the
+  `Instant` nanosecond slot, `1e9` / `1e9 + 1`; `open_window` takes the reply
+  sender as an argument), and `queue::answer_all` also drains the *waiting*
+  queue.  The reconstruction keeps a plain `Owed` struct with a `key` parameter
+  and only walks the owed queue.  Constants, sizes and the 30-second rule match.
+* `steps::Step` models two of the original's (at least) five kinds; the
+  roundtime waits and `behaviour_said` are not modelled.
+* `notice::help` and `notice::closes_a_hunt`'s wording, `saves`' prefixes,
+  `menu.tsv`/`links.json` file names, and the `player_log::links` JSON members
+  have no literal in `__TEXT` — they remain INFERRED, as §2.2 says.

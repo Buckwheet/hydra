@@ -92,6 +92,79 @@ impl Button {
 /// **ESTABLISHED** (`0x102418e80`): `hotbar`.
 pub const HOTBAR: &str = "hotbar";
 
+/// The size of one hotbar button, in points.
+///
+/// **UNKNOWN**: the binary's own cell size was not recovered; this is a cell
+/// wide enough for a short command label beside [`MAX_COMMAND`]'s message.
+pub const CELL: [f32; 2] = [56.0, 26.0];
+
+/// The space left between two buttons of a bar, in points.
+///
+/// **UNKNOWN**: not recovered.
+pub const GAP: f32 = 4.0;
+
+impl Button {
+    /// The words on the button: its label, or its command when it has none.
+    pub fn words(&self) -> String {
+        let label = self.label.trim();
+        if !label.is_empty() {
+            return label.to_string();
+        }
+        match self.lines() {
+            Ok(lines) => lines.first().cloned().unwrap_or_default(),
+            Err(_) => self.command.trim().to_string(),
+        }
+    }
+
+    /// Draw the button: an [`egui::Button`] of [`CELL`] size, insensitive and
+    /// with its complaint hovering over it when it would send nothing.
+    ///
+    /// **ESTABLISHED** for the behaviour: whether the button can send is
+    /// [`Button::lines`], and the words are the label.  The hover text is the
+    /// command's lines, or the complaint [`Button::lines`] gives.  **UNKNOWN**:
+    /// the cell size ([`CELL`]).
+    pub fn ui(&self, ui: &mut egui::Ui) -> egui::Response {
+        let lines = self.lines();
+        let sendable = lines.is_ok();
+        let response = ui
+            .add_enabled_ui(sendable, |ui| {
+                ui.add_sized(CELL, egui::Button::new(self.words()))
+            })
+            .inner;
+        match lines {
+            Ok(lines) => response.on_hover_text(lines.join("\n")),
+            Err(why) => response.on_hover_text(why),
+        }
+    }
+}
+
+impl Hotbars {
+    /// Draw every bar in name order — the bar's name, then its buttons — and
+    /// give back what the buttons pressed this frame would send, worded by
+    /// [`press`].
+    ///
+    /// **ESTABLISHED**: the bars are found through [`named`], pressed through
+    /// [`press`]; the cell size is [`CELL`] (**UNKNOWN**, see there).
+    pub fn ui(&self, ui: &mut egui::Ui) -> Vec<String> {
+        let mut pressed = Vec::new();
+        for name in self.bars.keys() {
+            let Some(buttons) = named(self, name) else {
+                continue;
+            };
+            ui.horizontal(|ui| {
+                ui.label(name.as_str());
+                for button in buttons {
+                    if button.ui(ui).clicked() {
+                        pressed.push(press(self, name, &button.label));
+                    }
+                    ui.add_space(GAP);
+                }
+            });
+        }
+        pressed
+    }
+}
+
 /// Where a character's hotbars live.
 ///
 /// **ESTABLISHED** (`0x101420da4`): the character folder's `hotbars.toml`.
@@ -280,5 +353,131 @@ main = [ { label = \"look\", command = \"look\" } ]
         );
         let doc = write(&bars);
         assert_eq!(hotbars_for(&doc), bars);
+    }
+
+    fn bars() -> Hotbars {
+        parse(
+            "\
+[hotbars]
+main = [ { label = \"look\", command = \"look\" }, { label = \"fight\", command = \"kill\" } ]
+asides = [ { label = \"heal\", command = \"cast heal\" } ]
+",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn u_i_draws_a_cell_per_button_at_the_cell_size() {
+        let mut seen = Vec::new();
+        let (_, out) = crate::testkit::frame(|ui| {
+            let bars = bars();
+            for name in bars.bars.keys() {
+                ui.horizontal(|ui| {
+                    for button in named(&bars, name).unwrap() {
+                        seen.push((button.words(), button.ui(ui).rect));
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            seen.iter().map(|(words, _)| words.as_str()).collect::<Vec<_>>(),
+            vec!["heal", "look", "fight"]
+        );
+        for (_, rect) in &seen {
+            assert_eq!(rect.size(), egui::vec2(CELL[0], CELL[1]), "{rect:?}");
+        }
+        // The words are painted, one galley per button, in bar-name order.
+        assert_eq!(
+            crate::testkit::words(&out),
+            vec!["heal".to_string(), "look".to_string(), "fight".to_string()]
+        );
+        // A button paints its background as a rectangle of the cell's size.
+        let rects = crate::testkit::rect_fills(&out);
+        assert!(rects.iter().any(|(rect, _)| rect.width() == CELL[0]));
+    }
+
+    #[test]
+    fn a_button_that_sends_nothing_is_insensitive() {
+        let broken = Button {
+            label: "press".into(),
+            command: "hotbar main look".into(),
+        };
+        let mut clicked = false;
+        let (_, out) = crate::testkit::frame(|ui| {
+            clicked = broken.ui(ui).clicked();
+        });
+        assert!(!clicked);
+        // It is still laid out at the cell size, and still says its label.
+        assert_eq!(crate::testkit::words(&out), vec!["press".to_string()]);
+        assert_eq!(
+            crate::testkit::rect_fills(&out)
+                .first()
+                .map(|(rect, _)| rect.size()),
+            Some(egui::vec2(CELL[0], CELL[1]))
+        );
+        // A label-less button falls back to its command's first line.
+        let plain = Button {
+            label: String::new(),
+            command: "look\\rglance".into(),
+        };
+        assert_eq!(plain.words(), "look");
+    }
+
+    #[test]
+    fn pressing_a_drawn_button_sends_its_command() {
+        let bars = bars();
+        let ctx = egui::Context::default();
+        // One frame to find where the first button of the first bar landed.
+        let first = ctx.run_ui(crate::testkit::input(crate::testkit::SCREEN), |ui| {
+            let _ = bars.ui(ui);
+        });
+        // Every bar's name comes first, then its buttons, in name order.
+        assert_eq!(
+            crate::testkit::words(&first),
+            vec![
+                "asides".to_string(),
+                "heal".to_string(),
+                "main".to_string(),
+                "look".to_string(),
+                "fight".to_string()
+            ]
+        );
+        let corner = crate::testkit::rect_fills(&first)
+            .into_iter()
+            .map(|(rect, _)| rect)
+            .find(|rect| rect.size() == egui::vec2(CELL[0], CELL[1]))
+            .expect("a button of the cell size");
+        let at = corner.center();
+
+        // A press and a release over it, in two frames, is a click.
+        let mut press_input = crate::testkit::input(crate::testkit::SCREEN);
+        press_input.events = vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let mut pressed = Vec::new();
+        let _ = ctx.run_ui(press_input, |ui| {
+            pressed = bars.ui(ui);
+        });
+        assert!(pressed.is_empty(), "a press alone is not a click: {pressed:?}");
+
+        let mut release_input = crate::testkit::input(crate::testkit::SCREEN);
+        release_input.events = vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        let _ = ctx.run_ui(release_input, |ui| {
+            pressed = bars.ui(ui);
+        });
+        // The first bar is `asides` (the bars are drawn in name order), whose one
+        // button sends `cast heal`.
+        assert_eq!(pressed, vec!["cast heal".to_string()]);
     }
 }

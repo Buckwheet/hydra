@@ -102,6 +102,28 @@ pub struct Row {
     pub note: String,
 }
 
+impl Row {
+    /// Draw one row of a settings page: the label, then its value, in a grid,
+    /// with the note under them when the page carries one.
+    ///
+    /// **ESTABLISHED** for the contents (`label`, `value`, `note` are the
+    /// recovered strings); the two-column grid is how every `hydra_ui` page
+    /// lays a row out (`hydra_ui::*::{Page, Row}`), and this is the smallest form
+    /// of it — UNKNOWN: the original's exact widths and styles.
+    pub fn ui(&self, ui: &mut egui::Ui) {
+        egui::Grid::new(("hydra_board_row", &self.key))
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label(&self.label);
+                ui.label(&self.value);
+                ui.end_row();
+            });
+        if !self.note.is_empty() {
+            ui.label(egui::RichText::new(&self.note).weak().small());
+        }
+    }
+}
+
 impl BannerFile {
     /// **ESTABLISHED** (`0x1014aaed4` is `look`; the read is beside it).
     pub fn read(doc: &Value) -> BannerFile {
@@ -368,5 +390,29 @@ mod tests {
         assert_eq!(rows[0].value, "wide");
         assert!(rows[5].note.contains("keeps the file small"));
         assert_eq!(PAGE, "hydra_banners");
+    }
+
+    #[test]
+    fn a_row_draws_its_label_then_its_value() {
+        let rows = BannerFile::default().page();
+        let (_, out) = crate::testkit::frame(|ui| {
+            for row in &rows {
+                row.ui(ui);
+            }
+        });
+        // Two labels per row (the key is the row's id, not drawn) ...
+        let words = crate::testkit::words(&out);
+        assert_eq!(words[0], "Across");
+        assert_eq!(words[1], "wide");
+        // ... and the note only under the rows that carry one.
+        let notes = rows.iter().filter(|row| !row.note.is_empty()).count();
+        assert_eq!(notes, 2);
+        assert_eq!(words.len(), rows.len() * 2 + notes);
+        // The label sits left of the value, on the same line.
+        let shapes = crate::testkit::text_shapes(&out);
+        let label = shapes[0].pos;
+        let value = shapes[1].pos;
+        assert!(label.x < value.x, "{label:?} {value:?}");
+        assert_eq!(label.y, value.y);
     }
 }

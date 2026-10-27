@@ -291,6 +291,124 @@ impl TargetsLook {
     }
 }
 
+/// The height of one target line, in points.
+///
+/// **UNKNOWN**: the binary's own line height was not recovered; this is the
+/// height of the body text one [`Target::ui`] line makes room for.
+pub const LINE_HEIGHT: f32 = 18.0;
+
+/// The height of the health bar under a target's name, in points.
+///
+/// **UNKNOWN**: not recovered; a thin bar that fits inside [`LINE_HEIGHT`].
+pub const BAR_HEIGHT: f32 = 4.0;
+
+/// The colour a health bar is drawn in when no threshold applies.
+///
+/// **UNKNOWN**: not recovered; the theme's own warn colour is used instead as
+/// the fallback at the call site, so this only shows when a ui has no theme.
+pub const BAR_COLOR: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x68);
+
+/// The colour of the part of a health bar not yet filled.
+///
+/// **UNKNOWN**: not recovered.
+pub const TRACK: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x24);
+
+impl Target {
+    /// The words a target line shows: the name, and the hint after it.
+    ///
+    /// **ESTABLISHED** (`Target::named`, the `egui::Ui::available_width` call of
+    /// `docs/EGUI.md` §3.5): the name is said with [`TargetsLook::word`], i.e.
+    /// with the [`NameShown`] the look asks for, measured against the width the
+    /// ui has left — [`NameShown::Fit`] measures with [`crate::paint::fit_chars`].
+    /// The status/health hint follows the name when the game gave one
+    /// ([`Target::hint`]).
+    pub fn named(&self, ui: &egui::Ui, look: &TargetsLook) -> String {
+        let word = self.word_in(ui, look).to_string();
+        let hint = self.hint();
+        if hint.is_empty() {
+            word
+        } else {
+            format!("{word} {hint}")
+        }
+    }
+
+    /// The name alone, at the width the ui has left.
+    ///
+    /// The same rule [`Target::named`] uses; split out so a line can colour the
+    /// name and the hint apart.
+    pub fn word_in<'a>(&'a self, ui: &egui::Ui, look: &TargetsLook) -> &'a str {
+        look.word(self, self.chars_in(ui))
+    }
+
+    /// How many characters of a name fit in the width `ui` has left.
+    pub fn chars_in(&self, ui: &egui::Ui) -> usize {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        crate::paint::fit_chars(ui, &font, ui.available_width())
+    }
+
+    /// Draw one target line: the name, the hint, and the health bar under them.
+    ///
+    /// **ESTABLISHED** for the model: the name is [`TargetsLook::word`] at
+    /// [`Target::chars_in`], the colour is [`TargetsLook::listed`] (the worst
+    /// status word the file names, else the health threshold), and the bar is
+    /// the health in percent.
+    ///
+    /// **UNKNOWN**: the line's height ([`LINE_HEIGHT`]), the bar's height
+    /// ([`BAR_HEIGHT`]) and the two bar colours ([`TRACK`], [`BAR_COLOR`]); the
+    /// binary's own figures were not recovered.
+    pub fn ui(&self, ui: &mut egui::Ui, look: &TargetsLook) {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let chars = crate::paint::fit_chars(ui, &font, ui.available_width());
+        let word = look.word(self, chars).to_string();
+        let hint = self.hint();
+        let listed = look.listed(self).unwrap_or("");
+        let name_colour = crate::paint::color_or(listed, ui.visuals().text_color());
+        let hint_colour = crate::paint::color_or(listed, ui.visuals().weak_text_color());
+        let health = self.health;
+        let fill = crate::paint::color_or(
+            health
+                .and_then(|percent| look.threshold_color(percent))
+                .unwrap_or(""),
+            BAR_COLOR,
+        );
+
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), LINE_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.text(
+            rect.left_top(),
+            egui::Align2::LEFT_TOP,
+            &word,
+            font.clone(),
+            name_colour,
+        );
+        if !hint.is_empty() {
+            painter.text(
+                rect.right_top(),
+                egui::Align2::RIGHT_TOP,
+                &hint,
+                font,
+                hint_colour,
+            );
+        }
+        if let Some(health) = health {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - BAR_HEIGHT),
+                rect.right_bottom(),
+            );
+            painter.rect_filled(bar, 0.0, TRACK);
+            let done = bar.width() * health.clamp(0.0, 100.0) / 100.0;
+            painter.rect_filled(
+                egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + done, bar.bottom())),
+                0.0,
+                fill,
+            );
+        }
+    }
+}
+
 /// Whether a line is a targeting order rather than a target.
 ///
 /// **ESTABLISHED** (`0x101482bf0`): the words `target`, `next`, `previous`,
@@ -511,5 +629,114 @@ dead = \"#000000\"
         let placed = placed_targets(&look, &["a grey wolf".to_string(), String::new()]);
         assert_eq!(placed.len(), 1);
         assert_eq!(placed[0].noun, "wolf");
+    }
+
+    /// A look that fits names and steps its health bar twice.
+    fn look() -> TargetsLook {
+        TargetsLook {
+            name: NameShown::Fit,
+            thresholds: vec![
+                Threshold { at: 90.0, color: "#2e8b57".into() },
+                Threshold { at: 50.0, color: "#b03030".into() },
+            ],
+            statuses: StatusesWritten {
+                statuses: BTreeMap::from([("stunned".to_string(), "#cc8844".to_string())]),
+            },
+            show_health: true,
+            ..TargetsLook::default()
+        }
+    }
+
+    fn wolf() -> Target {
+        Target {
+            name: "a grey wolf".into(),
+            noun: "wolf".into(),
+            statuses: vec!["stunned".into()],
+            health: Some(60.0),
+        }
+    }
+
+    #[test]
+    fn named_says_the_name_and_the_hint() {
+        // The default look shows the whole name at any width.
+        let (_, out) = crate::testkit::frame(|ui| {
+            let named = wolf().named(ui, &TargetsLook::default());
+            assert_eq!(named, "a grey wolf stunned, 60%");
+        });
+        assert!(out.shapes.is_empty());
+        // A fitting look narrows to the noun only when the name is too long.
+        crate::testkit::frame(|ui| {
+            let wide = ui.available_width();
+            assert_eq!(wolf().named(ui, &look()), "grey wolf stunned, 60%");
+            // One character is not enough for `grey wolf`, so the noun is said.
+            let chars = wolf().chars_in(ui);
+            assert!(chars > 9, "{chars}");
+            assert_eq!(wolf().word_in(ui, &look()), "grey wolf");
+            assert_eq!(
+                look().word(&wolf(), 4),
+                "wolf",
+                "the recovered rule at width {wide}"
+            );
+        });
+    }
+
+    #[test]
+    fn u_i_draws_the_name_the_hint_and_the_health_bar() {
+        let (_, out) = crate::testkit::frame(|ui| wolf().ui(ui, &look()));
+        // The name, then the hint, both on the line.
+        assert_eq!(
+            crate::testkit::words(&out),
+            vec!["grey wolf".to_string(), "stunned, 60%".to_string()]
+        );
+        let colours = crate::testkit::text_colours(&out);
+        // `listed` gives the worst status word the file names.
+        assert_eq!(colours[0].1, egui::Color32::from_rgb(0xcc, 0x88, 0x44));
+        assert_eq!(colours[1].1, egui::Color32::from_rgb(0xcc, 0x88, 0x44));
+
+        // The bar: the track across the whole line, then 60% of it filled.
+        let rects = crate::testkit::rect_fills(&out);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        let (track, track_fill) = rects[0];
+        let (done, done_fill) = rects[1];
+        assert_eq!(track_fill, TRACK);
+        assert_eq!(track.width(), 800.0);
+        assert_eq!(track.height(), BAR_HEIGHT);
+        assert_eq!(track.min, egui::pos2(0.0, LINE_HEIGHT - BAR_HEIGHT));
+        // 60% of the width, within half a point.
+        assert!((done.width() - 800.0 * 0.6).abs() < 0.5, "{done:?}");
+        assert_eq!(done.height(), BAR_HEIGHT);
+        // The fill colour is the threshold for 60% (the 50% step).
+        assert_eq!(done_fill, egui::Color32::from_rgb(0xb0, 0x30, 0x30));
+    }
+
+    #[test]
+    fn a_target_with_no_health_has_no_bar() {
+        let plain = Target {
+            statuses: Vec::new(),
+            health: None,
+            ..wolf()
+        };
+        let (_, out) = crate::testkit::frame(|ui| plain.ui(ui, &look()));
+        assert_eq!(crate::testkit::words(&out), vec!["grey wolf".to_string()]);
+        assert!(crate::testkit::rect_fills(&out).is_empty());
+    }
+
+    #[test]
+    fn the_fit_width_follows_the_window() {
+        // A window narrower than one glyph of `grey wolf` has no room for it, so
+        // the noun is drawn instead — the same rule `named` uses.
+        for (width, want) in [(800.0, "grey wolf"), (20.0, "wolf")] {
+            let (_, out) = crate::testkit::frame_of(egui::vec2(width, 100.0), |ui| {
+                wolf().ui(ui, &look());
+            });
+            assert_eq!(
+                crate::testkit::words(&out)[0],
+                want,
+                "at {width} points wide"
+            );
+            // And the unknown health bar is clamped into the window.
+            let rects = crate::testkit::rect_fills(&out);
+            assert_eq!(rects[0].0.width(), width);
+        }
     }
 }

@@ -344,13 +344,50 @@ suppresses the per-frame lines):
 on every fixture in `$HYDRA_FIXTURES` (default `~/evidence161`);
 `tools/diff_replay.sh` re-checks that and prints a per-kind delta table.
 
-`--text` prints the plain text of each non-empty frame before that footer.  Its
-*text* is still ours (the reference build goes through
-`hydra::render::Renderer::frame`, §7.1) — text parity is the next phase; the
-histogram in `--text` mode already matches. `Frame::plain()` is what makes all three modes
-deterministic: it concatenates the runs' text without markup.
+`--text` prints the readable text of the recording before that footer, and the
+footer itself is the same one `--summary` prints (it is *not* suppressed — the
+reference build prints it in every mode).  `--text` is byte-identical to the
+reference build on every fixture in `$HYDRA_FIXTURES` too; `tools/diff_replay.sh
+--text` re-checks it.
 
-### 7.1 `hydra::render::Renderer::frame` (`0x1002593ec`) — recorded, not ported
+### 7.2 The `--text` renderer
+
+`render::TextRender` is the readable-text side, verified byte for byte against
+the reference build on all fixtures *and* on hand-written probe lines.  Only
+two frame kinds print anything:
+
+| frame | rendering |
+|---|---|
+| `Text` | its `Runs::plain()`, i.e. the run texts concatenated, entities decoded, control stripped — never the markup |
+| `Prompt` | the prompt text |
+| everything else (`Structural`, `Component`, `DialogWidgets`, `MalformedTag`, `ClientCommand`, `UnknownTag`, `Raw`, …) | nothing; `UnknownTag` does **not** print its tag, and `Raw` prints no line either |
+
+A `Text` frame is **not** a line.  The renderer keeps one buffer and breaks it
+into an output line only at these points:
+
+* the input line ends after visible text — that is why
+  `hydra_protocol::Parser::push_bytes_lines` exists and why `replay` drives
+  `source::pump_groups` instead of `source::pump`;
+* a `Prompt` frame arrives: the pending buffer is written first (even a
+  previous prompt's), then the prompt text becomes the buffer;
+* the recording ends: a pending `Text` buffer is written with its newline, a
+  pending prompt is written **without** one — the footer's leading `\n`
+  terminates it.
+
+So `A<b>B</b>C` on one line prints `ABC`, a prompt's buffer survives across
+input lines until the next `Text`/`Prompt`, a blank input line prints a blank
+line (it is one empty `Text` frame), and a line of structural tags alone prints
+nothing.
+
+One further rule, taken from the reference build: a `Text` frame produced while
+a stream is open is not printed and does not touch the buffer, which is why the
+`<stream>`/`<pushStream>` dumps in a recording never show up.  Prompts are
+always printed (the parser emits its `StreamPopForced` frames first).  The
+renderer tracks the stream stack from the frame sequence — `StreamPush` opens,
+`StreamPop` closes, `StreamPopForced` empties it — so it needs no parser state
+of its own.
+
+### 7.3 `hydra::render::Renderer::frame` (`0x1002593ec`) — recorded, not ported
 
 Facts, for a later pass:
 
@@ -393,7 +430,9 @@ reports (`0x10021dffc`).
    stderr *and* a file) is established, so `stage()`'s text is ours.
 3. `Display for Frame` in the reference build: `replay`'s default per-frame line
    is whatever that impl printed. Our format is documented and tested instead.
-4. `Renderer::frame`'s full output (§7.1).
+4. `Renderer::frame`'s full output (§7.3) — `--text` itself now matches the
+   reference build byte for byte; what is still unported is that other
+   renderer (paragraph breaks, `[death]`/`[group]` brackets).
 5. The `<prompt>`/`<settings>` and `client_region` (`<!-- ENDCLIENT -->`) rules
    inherited from `hydra_protocol`'s own UNKNOWN list — the replay feeds them
    through unchanged, so whatever the parser decides is what the report shows.
@@ -404,7 +443,7 @@ reports (`0x10021dffc`).
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **62 passing** (50 unit + 12 integration).
+`cargo test -p hydra --offline` → **73 passing** (61 unit + 12 integration).
 
 Unit tests (in the modules):
 
@@ -415,9 +454,14 @@ Unit tests (in the modules):
   recovered version string;
 * `replay` — `Show::from_args` ordering and discriminants, the empty recording,
   the exact default/summary/text reports, the `"{file}: {io error}"` error
-  shape, 4 KiB chunking;
+  shape, 4 KiB chunking, and the `--text` cases: text coalescing across one
+  input line, the footer after the text, a stream-hidden text frame, a prompt
+  closed by the footer, a blank input line, and a line longer than a chunk
+  staying one text line;
 * `render` — kind words, the tab-separated line, escaping (controls, DEL, UTF-8
-  kept), empty-frame skipping, per-kind counts;
+  kept), per-kind counts, and `TextRender`: coalescing inside a line, prompt
+  flush/persistence, an unterminated prompt at the end, blank lines, "only
+  `Text` and `Prompt` print", stream-hidden text and the stream stack;
 * `source` — 4 KiB piece sizes, the empty recording, a line straddling a chunk
   boundary, `Lich` (through `hydra_lich::relay::read_lines`) yielding the same
   frames as `Replay`, and a final unterminated line being flushed;

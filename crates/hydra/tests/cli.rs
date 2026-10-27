@@ -118,15 +118,18 @@ fn replay_text_shows_readable_text_only() {
     assert_eq!(
         stdout(&output),
         concat!(
+            // One line per input line, not one per frame: the two text
+            // segments around the object link coalesce, and only `Text` and
+            // `Prompt` frames print anything (the `WindowHints` frame of
+            // `<room/>` adds no line).
             "Town Square\n",
-            "42\n",
             "You see a fountain here, its water <cold> and clear.\n",
-            "a blue gem\n",
-            " glitters on the ground.\n",
+            "a blue gem glitters on the ground.\n",
             "Vaalor’s gate creaks.\n",
             "ready\n",
-            ">\n",
-            "\n== 16 frames from 316 bytes\n",
+            // The prompt is left unterminated; the footer's leading newline
+            // closes it.
+            ">\n== 16 frames from 316 bytes\n",
             "       1  Prompt\n",
             "       6  Structural\n",
             "       6  Text\n",

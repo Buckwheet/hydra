@@ -142,25 +142,50 @@ where
     S: Source + ?Sized,
     F: FnMut(Frame),
 {
-    let mut frames = 0;
-    while let Some(chunk) = source.next_chunk() {
-        let produced = match chunk {
-            Chunk::Bytes(bytes) if bytes.is_empty() => Vec::new(),
-            Chunk::Bytes(bytes) => parser.push_bytes(&bytes),
-            Chunk::Line(line) => {
-                let mut out = parser.push_bytes(line.as_bytes());
-                out.extend(parser.push_bytes(b"\n"));
-                out
-            }
-        };
-        for frame in produced {
-            frames += 1;
+    pump_groups(source, parser, |group| {
+        for frame in group {
             on_frame(frame);
         }
+    })
+}
+
+/// [`pump`], but one **input line** at a time: `on_line` gets the frames of a
+/// single line together.
+///
+/// The reference build's `--text` renderer coalesces the `Text` frames of one
+/// line into a line buffer and breaks the line when the input line ends, so
+/// the line grouping [`Parser::push_bytes_lines`] returns has to reach the
+/// renderer.
+/// Lines that produce no frames have no group (nothing to render), and the tail
+/// of the recording — a final line without a terminator — is delivered as the
+/// last group, i.e. exactly like a completed line.
+///
+/// Returns the number of frames seen.
+pub fn pump_groups<S, F>(source: &mut S, parser: &mut Parser, mut on_line: F) -> usize
+where
+    S: Source + ?Sized,
+    F: FnMut(Vec<Frame>),
+{
+    let mut frames = 0;
+    while let Some(chunk) = source.next_chunk() {
+        let groups = match chunk {
+            Chunk::Bytes(bytes) if bytes.is_empty() => Vec::new(),
+            Chunk::Bytes(bytes) => parser.push_bytes_lines(&bytes),
+            Chunk::Line(line) => {
+                let mut groups = parser.push_bytes_lines(line.as_bytes());
+                groups.extend(parser.push_bytes_lines(b"\n"));
+                groups
+            }
+        };
+        for group in groups {
+            frames += group.len();
+            on_line(group);
+        }
     }
-    for frame in parser.finish() {
-        frames += 1;
-        on_frame(frame);
+    let tail = parser.finish();
+    if !tail.is_empty() {
+        frames += tail.len();
+        on_line(tail);
     }
     frames
 }

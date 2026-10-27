@@ -56,14 +56,21 @@ impl World for Fixture {
 
 static FIXTURE: Fixture = Fixture;
 
-fn settings() -> CasterSettings {
-    // Install once; a second install is a no-op, which is fine for tests.
+/// Install the fixture model.  A second install is a no-op, which is fine for
+/// tests; every test that needs the spell table calls this first, so no test
+/// depends on another one having run.
+fn fixture() {
     game::install(&FIXTURE);
+}
+
+fn settings() -> CasterSettings {
+    fixture();
     CasterSettings::default()
 }
 
 #[test]
 fn spell_number_parsing() {
+    fixture();
     // 0x1019b4b14: trim, `u16`, then the game's spell table.
     assert_eq!(spell(" 901 "), Ok(SHOCK));
     assert_eq!(spell("+901"), Ok(SHOCK));

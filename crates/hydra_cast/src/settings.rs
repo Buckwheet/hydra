@@ -17,11 +17,21 @@
 //! The serde field order (from the `visit_str` field visitor at 0x1019a95ac and
 //! the `Serialize` impl at 0x101276278) is `on`, `options`, `aliases`, `verbs`,
 //! `stances`, `hide`, and `Options` is `channel`, `conserve`, `safety`,
-//! `stance`, `hide`.
+//! `stance`, `hide`.  `Chosen` is the strings `cast`, `channel` and `evoke`
+//! (the enum deserialiser at 0x1019b49a8 rejects anything else through
+//! `serde::de::Error::unknown_variant`).
+//!
+//! Phase 1: `serde` is a real dependency again and the three types carry
+//! `Serialize`/`Deserialize` with exactly those member names.  `serde_json`
+//! reads and writes them through [`CasterSettings::to_json`] /
+//! [`CasterSettings::from_json`], the shape the session's
+//! `.settings.json` sections hold.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::game::world;
+use serde::{Deserialize, Serialize};
+
+use crate::game::world_model;
 
 /// The stances the game has, in the order the binary joins them for its
 /// "`{}` is not a stance: {}." message (pointer table at 0x10449c640).
@@ -44,7 +54,10 @@ pub const VERBS: [&str; 3] = ["cast", "channel", "evoke"];
 /// The original is a one-byte enum whose niche value `3` encodes "no verb of
 /// its own", which is why `Option<Chosen>` is one byte wide there.  Here it is
 /// a plain enum and the absence is an `Option`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Chosen {
     /// `cast` — the default.
     #[default]
@@ -83,7 +96,14 @@ impl Chosen {
 }
 
 /// The five `on`/`off` options (`ec set <option> on|off`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// The serde member names are the recovered ones (`channel`, `conserve`,
+/// `safety`, `stance`, `hide`, from the field visitor at 0x1019a948c).  A
+/// missing member keeps its default; the recovered visitor's treatment of a
+/// missing member is not in the binary (INFERRED, and the safer reading for a
+/// settings file that gains options over time).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Options {
     /// "channel what can be channeled"
     pub channel: bool,
@@ -127,7 +147,11 @@ impl Options {
 }
 
 /// The whole caster section of a character's settings.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// Serialised with the recovered member names and order (`on`, `options`,
+/// `aliases`, `verbs`, `stances`, `hide` — the field visitor at 0x1019a95ac).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CasterSettings {
     /// "Typed spells are cast." when set, "Typed spells are sent as typed."
     /// when clear (`switch`, 0x1019b4598).
@@ -158,8 +182,10 @@ pub fn spell(text: &str) -> Result<u16, String> {
         Err(_) => return Err(format!("`{}` is not a spell number.", text)),
     };
     // ESTABLISHED: 0x1019b4ca0 `hydra_model::spells::spell(number)` then a
-    // null test.  With no model installed nothing is a spell (see `game`).
-    let known = world().map(|world| world.spell_name(number).is_some()) == Some(true);
+    // null test.  With the real model installed the spell table answers; the
+    // table is empty until `hydra_model::spells::set_spells` fills it, and an
+    // empty table is not a spell either.
+    let known = world_model().spell_name(number).is_some();
     if !known {
         return Err(format!("`{}` is not a spell number.", text));
     }
@@ -451,5 +477,20 @@ impl CasterSettings {
             return Ok(key);
         }
         Ok(spell(&key)?.to_string())
+    }
+
+    /// The settings as JSON, in the recovered member shape.
+    ///
+    /// Not a recovered function (the binary's writer is in the session's
+    /// settings file, not here): this is the `serde_json` side of the recorded
+    /// `Serialize`/`Deserialize` impls, so the shape in §2.2 of `NOTES.md` has
+    /// a reader and a writer again.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Read settings back out of JSON.  Absent members keep their defaults.
+    pub fn from_json(text: &str) -> Result<CasterSettings, serde_json::Error> {
+        serde_json::from_str(text)
     }
 }

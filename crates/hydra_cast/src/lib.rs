@@ -5,14 +5,15 @@
 //! came from.  See `NOTES.md` for the function table, the recovered constants
 //! and the list of unknowns.
 //!
-//! The crate is std-only.  The three things the original got from other crates
-//! are seams here:
+//! The three things the original got from other crates are real again
+//! (Phase 1, see `NOTES.md` §7):
 //!
-//! * `hydra_model` (spells, known spells, mana, spell costs, proc lines)
-//!   becomes [`game::World`];
-//! * the session's command queue becomes [`driver::Sink`];
-//! * `tokio` and `serde`/`serde_json` become a synchronous loop and plain
-//!   structs with `Debug`/`Clone`/`PartialEq`/`Default`.
+//! * `hydra_model` (spells, known spells, mana, spell costs, proc lines) is
+//!   behind [`game::World`] and answered by [`game::ModelWorld`];
+//! * the session's command queue is behind [`driver::Sink`] and implemented by
+//!   [`session::SessionSink`] over `hydra_session`;
+//! * `tokio` is the driver loop ([`driver::Relay`]) and `serde`/`serde_json`
+//!   are the settings' wire format ([`settings::CasterSettings`]).
 
 #![allow(dead_code, unused)]
 
@@ -21,6 +22,7 @@ pub mod driver;
 pub mod game;
 pub mod plan;
 pub mod request;
+pub mod session;
 pub mod settings;
 
 /* unresolved symbols (trait impls, closures, generics):

@@ -295,7 +295,9 @@ printed at `0x100206b1c`) — i.e. `== {frames} frames from {bytes} bytes`.
 ```
 
 * `index` — 1-based, in stream order;
-* `kind` — `text`, `prompt`, `echo`, `raw`, `merchant` or `tag`;
+* `kind` — `text`, `prompt`, `echo`, `raw`, `merchant`, `tag`, `structural`,
+  `client-text` or `client-region` (the last three are the audit pass's new
+  `Frame` variants, kept after the original six so the report stays stable);
 * `tag` — the tag name for `tag` frames, `-` otherwise;
 * `text` — the frame's plain text (for `raw` frames, the raw line),
   escaped so one frame is one line: `\\`, `\t`, `\n`, `\r`, other C0/DEL →

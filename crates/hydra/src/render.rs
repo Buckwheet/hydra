@@ -29,7 +29,8 @@
 //! ```
 //!
 //! * `index` is the 1-based frame number in stream order;
-//! * `kind` is one of `text`, `prompt`, `echo`, `raw`, `merchant`, `tag`;
+//! * `kind` is one of `text`, `prompt`, `echo`, `raw`, `merchant`, `tag`,
+//!   `structural`, `client-text`, `client-region`;
 //! * `tag` is the tag name for `tag` frames and `-` for every other kind;
 //! * `text` is the frame's plain text, or the raw line for `raw` frames.
 //!
@@ -41,7 +42,21 @@
 use hydra_protocol::Frame;
 
 /// The frame kinds, in report order.
-pub const KINDS: [&str; 6] = ["text", "prompt", "echo", "raw", "merchant", "tag"];
+///
+/// The last three are the protocol-audit variants added after this crate was
+/// first written (`Structural`, `ClientText`, `ClientRegion`); they are kept
+/// after the original six so the existing report remains stable.
+pub const KINDS: [&str; 9] = [
+    "text",
+    "prompt",
+    "echo",
+    "raw",
+    "merchant",
+    "tag",
+    "structural",
+    "client-text",
+    "client-region",
+];
 
 /// The kind word for a frame.
 pub fn kind(frame: &Frame) -> &'static str {
@@ -52,6 +67,9 @@ pub fn kind(frame: &Frame) -> &'static str {
         Frame::Raw(_) => "raw",
         Frame::MerchantStatus(_) => "merchant",
         Frame::Unknown { .. } => "tag",
+        Frame::Structural { .. } => "structural",
+        Frame::ClientText(_) => "client-text",
+        Frame::ClientRegion => "client-region",
     }
 }
 
@@ -169,6 +187,15 @@ mod tests {
             }),
             "tag"
         );
+        assert_eq!(
+            kind(&Frame::Structural {
+                tag: "room".into(),
+                text: "a room".into()
+            }),
+            "structural"
+        );
+        assert_eq!(kind(&Frame::ClientText("look".into())), "client-text");
+        assert_eq!(kind(&Frame::ClientRegion), "client-region");
         // KINDS is the closed set `kind` produces.
         for frame in [
             text_frame("hi"),
@@ -176,6 +203,12 @@ mod tests {
             Frame::Echo("hi".into()),
             Frame::Raw("hi".into()),
             Frame::MerchantStatus(MerchantStatus::Stop),
+            Frame::Structural {
+                tag: "room".into(),
+                text: String::new(),
+            },
+            Frame::ClientText("hi".into()),
+            Frame::ClientRegion,
         ] {
             assert!(KINDS.contains(&kind(&frame)));
         }

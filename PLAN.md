@@ -26,9 +26,23 @@ parser wired together, no GUI. Gate: starts, reads a recorded GemStone XML strea
 Capture real Hydra<->Lich loopback traffic to settle the keyed-accept handshake and token framing; differential-test our
 parser against the original on recorded streams (logs from the Tower2 archive). Not for the loop: needs the user.
 
-## Phase 4: GUI (loop, after Phase 1)
-Needs the egui version used by the binary (not in the registry-path strings: probably a git dependency; identify from
-symbols) plus eframe/winit wiring for hydra_ui, hydra_board, hydra_gui, gs_puppet, gs_render.
+## Phase 4: GUI (done 2026-10-27, off-peak loop)
+egui/eframe/egui-wgpu/epaint are pinned by git (`emilk/egui` rev 3da022d, the binary's own rev — see
+docs/EGUI.md) and all five GUI crates now draw through them, headless-testable:
+  * gs_render: the real `egui_wgpu` paint callback (`FieldCallback` + `CallbackTrait`, `paint_view`,
+    `Context::write` state, `Painter::image` for puppet figures);
+  * gs_puppet: the recovered splat/limb/shadow geometry emitted as `epaint::Mesh`/`Shape` (the binary has
+    no egui call edge from this crate, so there is no widget code to restore);
+  * hydra_ui: `PlayView`/`Story`/`Bar`/frame painting over the recovered tokens and layout maths;
+  * hydra_board: the two egui callees (`Target::named` via `Ui::available_width`, the `TextureHandle` cache)
+    plus chip/hotbar/wheel painting and the `Windows` trait;
+  * hydra_gui: the eframe `App` (`Hub`, `Launch`, `build`, `run`), `Bar` as `egui::Widget`, stack/vessel/
+    titlebar/drawer painting, real `egui::Event` key capture.
+`hydra gui` builds and opens the hub window (`"Hydra"`, 660x520, wgpu); every test is a headless
+`egui::Context` frame, never a window. What is still missing before the window is a game client is the
+session side: `hydra_net`/`hydra_table` login, the Lich keyed accept (Phase 3) and `hydra::gui::run`'s
+single-instance/session plumbing.
+
 
 ## Phase 5: improvements
 Backlog is the user to define; start by listing the pain points in Hydra, then one issue/spec per change.

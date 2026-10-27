@@ -180,9 +180,12 @@ fn an_unknown_word_prints_the_usage_to_stderr_and_fails() {
 
 #[test]
 fn the_unwired_subcommands_say_what_they_still_need() {
+    // `gui` is wired since Phase 4: it opens the eframe window, so it is not
+    // exercised here — `main`'s unit test
+    // `the_gui_subcommand_builds_the_recovered_hub_window` asserts the built
+    // plan (`"Hydra"`, 660 × 520, wgpu) without launching it.
     for args in [
         &[][..],
-        &["gui"][..],
         &["play", "Aelith"][..],
         &["login", "Aelith"][..],
         &["serve", "--detach"][..],

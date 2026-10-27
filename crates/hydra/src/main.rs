@@ -40,11 +40,17 @@
 //!
 //! # What this phase runs
 //!
-//! `hydra replay <file>` (the phase gate), `hydra --help` and `hydra
-//! --version`.  Every other subcommand is *recognised* — the recovered word
-//! table and the usage text are exact — and then reports what it still needs,
-//! on stderr, with status 1.  Nothing is stubbed out silently: see `NOTES.md`
-//! for the per-command state and for the GUI boundary.
+//! `hydra replay <file>` (the phase gate), `hydra --help`, `hydra --version`
+//! and `hydra gui …` (the hub window, through eframe's wgpu renderer — see
+//! [`gui`]).  Every other subcommand is *recognised* — the recovered word table
+//! and the usage text are exact — and then reports what it still needs, on
+//! stderr, with status 1.  Nothing is stubbed out silently: see `NOTES.md` for
+//! the per-command state and for the GUI boundary.
+//!
+//! The window is *built* as an [`hydra_gui::app::Launch`] value first, which
+//! touches no device and no event loop, so the tests can assert the recovered
+//! plan (`"Hydra"`, 660 × 520, `Renderer::Wgpu`) and never open a window.  Only
+//! [`gui`] hands that value to eframe.
 
 #![allow(dead_code)]
 
@@ -133,8 +139,13 @@ fn run(command: &Command) -> Option<String> {
         // The usage path: `hydra::main` puts the 848-byte literal into the
         // message slot and falls through to the stderr print.
         Command::Usage => Some(cli::USAGE.to_string()),
+        // `hydra gui …` → `connect::Target::many` + `hydra::gui::run`
+        // (`0x10021deb8`, `0x10021e144`).
+        Command::Gui { targets } => gui(targets),
+        // The bare hub reaches the same `gui::run` in the recovered dispatch
+        // (`0x10021dd40`), but this headless phase keeps it reporting rather
+        // than opening a window; only the explicit `gui` word launches.
         Command::Hub
-        | Command::Gui { .. }
         | Command::Play { .. }
         | Command::Login { .. }
         | Command::Serve { .. }
@@ -143,10 +154,41 @@ fn run(command: &Command) -> Option<String> {
     }
 }
 
+/// `hydra gui …` — build the recovered hub window and hand it to eframe.
+///
+/// The build half ( [`gui_launch`] ) is a pure value: `NativeOptions` with the
+/// recovered `"Hydra"` title, the `"hub"` placement's 660 × 520 size, the
+/// 256 × 256 badge icon, `egui_wgpu::WgpuConfiguration::default()` and the
+/// wgpu renderer, plus the boxed [`hydra_gui::app::Hub`].  Only
+/// [`hydra_gui::app::Launch::run`] starts the platform event loop, and nothing
+/// in this crate's tests calls it.
+fn gui(targets: &[String]) -> Option<String> {
+    let launch = gui_launch(targets);
+    let (width, height) = launch.size();
+    eprintln!(
+        "hydra gui: opening the hub window {:?} ({width:.0}x{height:.0}, wgpu) for {} target(s)",
+        launch.title,
+        targets.len()
+    );
+    match launch.run() {
+        Ok(()) => None,
+        Err(err) => Some(format!("cannot open the hub window: {err}")),
+    }
+}
+
+/// The window value `hydra gui` builds, split out so the tests can assert the
+/// recovered plan without ever launching it.
+fn gui_launch(targets: &[String]) -> hydra_gui::app::Launch {
+    let data_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let character = targets.first().cloned().unwrap_or_default();
+    let start = hydra_gui::app::Start::new(character, data_dir);
+    hydra_gui::app::build(&start, false)
+}
+
 /// Why a recognised subcommand does not run in this phase.
 fn not_wired(command: &Command) -> String {
     let needs = match command {
-        Command::Hub | Command::Gui { .. } => {
+        Command::Hub => {
             "the window (egui/eframe: hydra_gui, hydra_ui, hydra_board, gs_render)"
         }
         Command::Play { .. } | Command::Login { .. } => {
@@ -196,7 +238,6 @@ mod tests {
     fn every_unwired_command_says_what_it_needs() {
         for command in [
             Command::Hub,
-            Command::Gui { targets: vec![] },
             Command::Play { targets: vec![] },
             Command::Login { targets: vec![] },
             Command::Serve { args: vec![] },
@@ -209,6 +250,20 @@ mod tests {
         }
         assert!(not_wired(&Command::Hub).contains("eframe"));
         assert!(not_wired(&Command::LookoutSeed).contains("hydra_table"));
+    }
+
+    #[test]
+    fn the_gui_subcommand_builds_the_recovered_hub_window() {
+        // `gui_launch` is the half of `gui` that builds the value; it must never
+        // start an event loop, so this test can assert the recovered plan.
+        let launch = gui_launch(&["Aelith".into()]);
+        assert_eq!(launch.title, "Hydra");
+        assert_eq!(launch.size(), (660.0, 520.0));
+        assert_eq!(launch.options.renderer, eframe::Renderer::Wgpu);
+        assert_eq!(launch.options.viewport.title.as_deref(), Some("Hydra"));
+        let icon = launch.options.viewport.icon.as_ref().expect("the badge icon");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 
     #[test]

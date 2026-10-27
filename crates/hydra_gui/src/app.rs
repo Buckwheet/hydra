@@ -453,6 +453,28 @@ pub struct Launch {
     pub app: Box<dyn eframe::App>,
 }
 
+impl Launch {
+    /// The viewport size the launch was built with, as `(width, height)`.
+    ///
+    /// `NativeOptions::viewport.inner_size` is the recovered 660 × 520 pair
+    /// (`app::RunPlan::size`); this accessor keeps a caller from having to name
+    /// an `egui` type to read it.
+    pub fn size(&self) -> (f32, f32) {
+        match self.options.viewport.inner_size {
+            Some(size) => (size.x, size.y),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// Hand this launch to eframe's native event loop.
+    ///
+    /// This is one of only two functions in the crate (with [`run`]) that start
+    /// the platform event loop, i.e. the only ones that open a window.
+    pub fn run(self) -> eframe::Result {
+        eframe::run_native(&self.title, self.options, Box::new(move |_cc| Ok(self.app)))
+    }
+}
+
 /// Build the recovered `eframe` launch value: [`RunPlan`] → `NativeOptions` +
 /// the boxed [`Hub`].
 pub fn build(start: &Start, logged_on: bool) -> Launch {
@@ -489,12 +511,7 @@ pub fn build(start: &Start, logged_on: bool) -> Launch {
 /// This starts the platform event loop and opens the window, so nothing in this
 /// crate's test suite calls it.
 pub fn run(start: &Start, logged_on: bool) -> eframe::Result {
-    let launch = build(start, logged_on);
-    eframe::run_native(
-        &launch.title,
-        launch.options,
-        Box::new(move |_cc| Ok(launch.app)),
-    )
+    build(start, logged_on).run()
 }
 
 #[cfg(test)]

@@ -789,3 +789,28 @@ seam without a GPU.)
   `epaint::TextureHandle` cache seam (`disk::Disk::kept_at`) is unchanged.
 * `crates/hydra_ui/NOTES.md` → the "egui drawing" row stays true until drawing
   returns to `hydra_ui` (§3.6: no egui call edges survive).
+
+---
+
+## 6. Phase 4 outcome (addendum, 2026-10-27)
+
+The §4.1 lines are in the root `Cargo.toml` and all five GUI crates build and
+test `cargo --offline` against them. The fetch materialised the checkout at
+`~/.cargo/git/checkouts/egui-9c90d2f9798966b7/3da022d`, **not** the
+`egui-5b6373fea415a27f` that §5.1 predicts for `https://github.com/emilk/egui`.
+Two facts hold independently:
+
+* the rev is the one §2.1 identified — `Context::{set_viewport_zoom_factor,
+  viewport_zoom_factor}`, `Frame::{set_key_capture, set_numpad_capture_keys}`
+  and `epi::App::ui` all exist in the checkout, the workspace's `version` is
+  `0.35.0`, and every API discriminator of §2.4 is present;
+* the ident hash differs from the binary's. Either the reference build used a
+  fork/mirror at the same rev, or cargo's checkout hash changed between the two
+  toolchains (this machine has cargo 1.95.0, 2026-03-21; the reference build is
+  from 2026-10). Nothing in the recovered API surface discriminates the two, so
+  the pin stays on `emilk/egui` at `3da022d`.
+
+Everything else in this document was confirmed by building: version label
+`0.35.0`, wgpu-only renderer, `default_fonts` on, `accesskit`/`persistence`/`glow`
+off. Phase 4's evidence tables (§3) are what the crate NOTES.md updates cite.
+

@@ -27,12 +27,13 @@ depends on `hydra_protocol`, `hydra_session`, `hydra_lich`, `hydra_net`,
 `hydra_table`, `hydra_model`, `hydra_board`, `hydra_lookout`, `hydra_import`,
 `hydra_update`, `hydra_gui`, `hydra_ui` and `eframe`/`tokio`.
 
-**Phase 2 scope.** The crate is recreated with path dependencies on
-`hydra_protocol`, `hydra_session` and `hydra_lich` plus the workspace-pinned
-`tokio`. Everything that needs the GUI (`eframe`, `winit`, `egui`), the game
-connection (`hydra_net`, `hydra_table`) or the ledger (`hydra_import`,
-`hydra_ledger`) is *recognised and reported*, never faked — see
-[Wired vs not](#wired-vs-not).
+**Phase 2 scope, updated by Phase 4.** The crate is recreated with path
+dependencies on `hydra_protocol`, `hydra_session` and `hydra_lich` plus the
+workspace-pinned `tokio`, and — since Phase 4 — on `hydra_gui` and `eframe`
+(see §5.1). `hydra gui …` now *builds and opens* the hub window; everything that
+needs the game connection (`hydra_net`, `hydra_table`) or the ledger
+(`hydra_import`, `hydra_ledger`) is still *recognised and reported*, never faked —
+see [Wired vs not](#wired-vs-not).
 
 ---
 
@@ -192,9 +193,29 @@ From `main`, `gui::run` is reached two ways: no arguments at all
 (`0x10021dd14`, the hub) and `hydra gui …` after `connect::Target::many`
 (`0x10021e144`). `hydra::serve` (`0x10021e6d0`) reaches it a third time.
 
-**Not linked here.** No `eframe`, `egui` or `winit` in `Cargo.toml`; the hub,
-`gui`, `serve` and `play`/`login` are reported as unwired (below) instead of
-being faked. The eframe/egui version research is the parallel `p2/egui` job.
+**Phase 4: linked.** `Cargo.toml` now names `hydra_gui` (path) and `eframe`
+(workspace pin, the same git rev `3da022d`), and the `gui` word is wired to
+[`crate::gui`]:
+
+* `crate::gui_launch(targets)` builds the window as a value —
+  `hydra_gui::app::Start::new(first target, cwd)` → `hydra_gui::app::build`,
+  which is `hydra_gui::app::plan` (the recovered `RunPlan`: title `"Hydra"`,
+  placement `"hub"`, 660 × 520, the graphics folder, the logged-on flag) →
+  `eframe::NativeOptions` with `Renderer::Wgpu`,
+  `egui_wgpu::WgpuConfiguration::default()`, the 256 × 256 badge icon and the
+  boxed `hydra_gui::app::Hub`. Building it touches no device and no event
+  loop.
+* `crate::gui(targets)` prints one line and calls
+  `hydra_gui::app::Launch::run` (`eframe::run_native("Hydra", options, app)`),
+  i.e. the recovered `gui::run` boundary (`0x1001103f4`) at its last step.
+* The bare hub (`hydra` with no arguments, `0x10021dd40`) reaches the same
+  `gui::run` in the binary but still reports instead of opening a window here;
+  it is the same one-arm change when wanted.
+* The unit test `the_gui_subcommand_builds_the_recovered_hub_window` asserts the
+  built plan (`"Hydra"`, 660 × 520, `Renderer::Wgpu`, 256 × 256 RGBA icon)
+  **without** launching: `gui_launch` is split out of `gui` for exactly that.
+  `serve` and `play`/`login` remain unwired (they need the connection, not the
+  window).
 
 ### 5.3 `hydra::instance::claim` (`0x1001142d4`) — the single-instance protocol
 
@@ -329,7 +350,8 @@ Facts, for a later pass:
 |---|---|---|
 | `hydra --replay FILE` / `hydra replay FILE` | **runs** | the phase gate; parser + report + footer |
 | `hydra --help`, `--version` | **runs** | additions (§4) |
-| `hydra`, `hydra gui …` | recognised, exit 1 | needs eframe/egui (`hydra_gui`, `hydra_ui`, `hydra_board`, `gs_render`) |
+| `hydra gui …` | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe; §5.1 |
+| `hydra` (bare hub) | recognised, exit 1 | the same `gui::run` in the binary; deliberately left reporting here (§5.1) |
 | `hydra play …`, `hydra login …` | recognised, exit 1 | needs the connector (`hydra_table`), the login (`hydra_net`) and Lich's keyed accept (§6.3) |
 | `hydra serve …` | recognised, exit 1 | needs `hydra_web` + `hydra_table` + the same relay |
 | `hydra import …` | recognised, exit 1 | needs `hydra_import` + `hydra_ledger` |
@@ -354,12 +376,14 @@ reports (`0x10021dffc`).
 5. The `<prompt>`/`<settings>` and `client_region` (`<!-- ENDCLIENT -->`) rules
    inherited from `hydra_protocol`'s own UNKNOWN list — the replay feeds them
    through unchanged, so whatever the parser decides is what the report shows.
-6. The `hydra_table`/`hydra_net`/`hydra_gui` halves of `play`/`gui`/`serve`:
-   out of this crate's dependency set by instruction, not by evidence.
+6. The `hydra_table`/`hydra_net` halves of `play`/`serve`, and the rest of
+   `gui::run` beyond the window itself (`sessions`, `Who`, `Resume`, the
+   single-instance claim, the login pacing): out of this crate's dependency set
+   by instruction, not by evidence. The window build is wired (§5.1).
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **60 passing** (48 unit + 12 integration).
+`cargo test -p hydra --offline` → **61 passing** (49 unit + 12 integration).
 
 Unit tests (in the modules):
 
@@ -383,8 +407,9 @@ Unit tests (in the modules):
   missing `HOME`, the Application Support path, the cached executable;
 * `started` — `begin` idempotence and `elapsed`;
 * `main` — the usage path, help/version, a replay failure as a message, every
-  unwired command's text, and that `enable_all()` really turned the time driver
-  on.
+  unwired command's text, the built hub window (`"Hydra"`, 660 × 520,
+  `Renderer::Wgpu`, 256 × 256 RGBA badge icon — built, not launched), and that
+  `enable_all()` really turned the time driver on.
 
 Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
 `crates/hydra/tests/fixtures/`):

@@ -121,7 +121,7 @@ impl Parser {
                     } else if let Some(link) = link {
                         // Self-closing / unterminated link: keep the tag text
                         // so information is not lost.
-                        self.push_text(&mut runs, tag, Some(&link));
+                        self.push_literal(&mut runs, tag, Some(&link));
                     }
                 }
                 "prompt" if !closing => {

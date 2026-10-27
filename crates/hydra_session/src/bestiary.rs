@@ -70,6 +70,17 @@ pub enum Asked {
 /// The recovered refusal for an argument that is not a level or a band.
 pub const NOT_A_LEVEL: &str = "`{}` is not a level: 29, or a band, 25-33.";
 
+/// The recovered free-function entry point for `.bestiary`.
+///
+/// `hydra_session::bestiary::asked` (`0x101a7aaf8`) takes the command's
+/// argument as `&str` and classifies it.  **UNKNOWN**: the original also
+/// produces the formatted answer list in the same inlined body (the huge
+/// 20 KB function); this entry point exposes the recovered classification,
+/// and [`answered`] renders the answer once creatures are known.
+pub fn asked(word: &str) -> Result<Asked, String> {
+    Asked::parse(word)
+}
+
 impl Asked {
     /// Parse the argument of a `.bestiary` command.
     ///
@@ -308,6 +319,15 @@ pub fn room_uid(title: &str, description: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_free_entry_point_parses_the_query() {
+        assert_eq!(asked("29"), Ok(Asked::Level(29)));
+        assert_eq!(
+            asked("25-33"),
+            Ok(Asked::Band(Band { low: 25, high: 33 }))
+        );
+    }
 
     #[test]
     fn parsing_levels_bands_and_names() {

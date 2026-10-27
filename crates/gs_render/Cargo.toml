@@ -11,8 +11,16 @@ edition = "2021"
 # `gs_puppet` supplies `splat::SplatParams`, the parameter type of the binary's
 # `<SplatKey as From<gs_puppet::splat::SplatParams>>::from`.  See `NOTES.md`
 # section "Integration gap".
+#
+# `egui`, `epaint`, `egui-wgpu` and `wgpu` are the real dependencies the binary
+# was built with (docs/EGUI.md §3.4, §4.2).  `egui-wgpu` supplies
+# `renderer::{Callback, CallbackTrait}` (the `field_gpu` paint callback) and
+# `wgpu` the `Device`/`Queue`/`CommandEncoder`/`RenderPass` types whose trait
+# methods the binary's `FieldCallback` impl names.
 [dependencies]
 gs_base = { path = "../gs_base" }
 gs_puppet = { path = "../gs_puppet" }
 egui = { workspace = true }
 epaint = { workspace = true }
+egui-wgpu = { workspace = true }
+wgpu = { workspace = true }

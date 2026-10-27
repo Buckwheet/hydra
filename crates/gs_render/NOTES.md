@@ -18,15 +18,22 @@ the global list but is 576 bytes in the local one).
 | **INFERRED** | behaviour constrained by evidence (offsets, constants, call shapes) but a source-level detail was chosen. |
 | **UNKNOWN** | the binary does not pin it down; a safe non-invented default was used and is marked in the code with `// UNKNOWN:`. |
 
-## Standard-library departure
+## Dependency reality (Phase 4)
 
-The original used `wgpu`, `egui`/`egui_wgpu`, `image`, `tracing`, `parking_lot`,
+~~The original used `wgpu`, `egui`/`egui_wgpu`, `image`, `tracing`, `parking_lot`,
 `toml_edit` and `gs_puppet` (mesh/pose/splat/uv model). None are available here
-(no network, no vendored cache), so:
+(no network, no vendored cache), so all GPU calls go through the no-op seam
+`gs_render::gpu::Gpu`.~~
 
-* all GPU calls go through the no-op seam `gs_render::gpu::Gpu` with the
-  reconstructed descriptors `TextureUpload` / `DrawCall` (`NullGpu` is the
-  default implementation);
+**Struck in Phase 4.** `egui`, `epaint`, `egui-wgpu` and `wgpu` are now real
+dependencies at the binary's own git rev (`docs/EGUI.md` §4.2) and both draw
+seams are egui code — see § "Phase 4: real egui" below. What remains departed:
+
+* the *pipelines* (vertex/index buffers, bind groups, render targets, shader
+  modules) still only exist as the descriptor seam `gs_render::gpu::Gpu` with
+  the reconstructed descriptors `TextureUpload` / `DrawCall` (`NullGpu` is the
+  default implementation): creating any of them needs a live `wgpu::Device`,
+  which neither this crate nor its headless tests create;
 * `std::collections::HashMap`/`std::sync::Mutex` replace `hashbrown`/`parking_lot`;
 * `thread_local` `OnceLock`+`OnceBox` statics became plain `static … = Mutex::new(Vec::new())`
   (the binary's `skin_gpu::jobs::JOBS` / `puppet_cache::marked_jobs::JOBS` are
@@ -74,7 +81,8 @@ Local-symbol extents (start..end, size in bytes) and status.
 | `nerve_twitch` | `0x1008fe3c4` | 532 | **established** |
 | `flinch_region` | `0x1008fe5d8` | 988 | **established** |
 | `body_size_step` | `0x1008fe9b4` | 268 | **established** |
-| `PuppetPlacement::paint_figure` | `0x1008feac0` | 220 | **established** (quad math) |
+| `PuppetPlacement::paint_figure` | `0x1008feac0` | 220 | **established** (quad math + both egui paths) |
+| `PuppetPlacement::paint_figure_in` | `0x1008feac0` | (same) | **established** (`Painter::image` / `Painter::extend`) |
 | `PuppetKey::with_fresh` | `0x100901f2c` | 132 | established + 1 UNKNOWN |
 | `PuppetKey::with_scars` | `0x100901fb0` | 208 | **established** |
 | `PuppetKey::breath_pace` | `0x100902080` | 216 | **established** |
@@ -88,8 +96,13 @@ Local-symbol extents (start..end, size in bytes) and status.
 | `figure_image::skin_image` | `0x1009647a8` | 2276 | partly (basis UNKNOWN) |
 | `figure_image::with_glow` | `0x10096508c` | 556 | **established** |
 | `field_gpu::FieldLight::moon` | `0x1009652b8` | 220 | **established** |
-| `field_gpu::paint_view` | `0x100965394` | 568 | partly (lerp established) |
-| `field_gpu::init` | `0x100969f78` | 620 | partly (wgpu) |
+| `field_gpu::paint_view` | `0x100965394` | 568 | **established** (quad lerp, clip test, paint callback) |
+| `field_gpu::paint_view_quad` / `paint_view_ui` | (same) | (same) | **established** (see Phase 4 §) |
+| `field_gpu::init` | `0x100969f78` | 620 | partly (`Context::write` established, `Gpu::new` needs a device) |
+| `field_gpu::init_ctx` / `field_state` | (same) | (same) | INFERRED (`IdTypeMap` key) |
+| `<FieldCallback as CallbackTrait>::prepare` | `0x100963924` | 1684 | partly (resource lookup + view maintenance established) |
+| `<FieldCallback as CallbackTrait>::finish_prepare` | `0x1009635bc` | 308 | **established** (`+0x509 = 1`) |
+| `<FieldCallback as CallbackTrait>::paint` | `0x1009636f0` | 560 | partly (bail rules + `set_viewport` established) |
 | `field_gpu::available` | `0x10096a990` | 4 | established (a single `b`) |
 | `skin_gpu::job` | `0x10091d8fc` | 292 | **established** |
 | `skin_gpu::submit` | `0x10091da20` | 520 | **established** |
@@ -200,10 +213,15 @@ Helpers recovered alongside (local symbols, `t`):
 3. `figure_image::skin_image` — the 3×3 light basis at `0x100964898..0x100964990`
    was not decoded lane by lane (the arithmetic is listed below); a documented
    `N·L` clamp stands in for it.
-4. `field_gpu::paint_view` — only the pan lerp is recovered; the rest of the
-   function locks the field state and records draws (seam).
-5. `field_gpu::init`, `skin_gpu::upload_mipped`, `SkinGpu::*`, `Gpu::*`,
-   `RelightGpu::*` — `wgpu` pipelines; only descriptors are reconstructed.
+4. `field_gpu::paint_view` — the quad lerp, the clip test and the
+   `new_paint_callback` call are recovered; **what the callback draws**
+   (`Gpu::{upload_frame, bounce_pass, prepare_piece, paint_piece}`) is not: those
+   build and bind wgpu pipelines. `paint` always bails for a `paint_view`
+   callback anyway (`+0x3c == -1`, see the Phase 4 §), so on this path all the
+   drawing happens in `prepare`.
+5. `field_gpu::init`'s `Gpu::new` (1296 bytes of pipelines/targets),
+   `skin_gpu::upload_mipped`, `SkinGpu::*`, `Gpu::*`, `RelightGpu::*` — `wgpu`
+   pipelines; only descriptors are reconstructed.
 6. The `+0x08` "`== 1`" equality rule for `PuppetKey` (and the same rule for
    `+0x6f`): implemented exactly, but what the field *means* is unknown.
 7. `LastHit` field names (`at`, `part`, `strength`) are INFERRED from use;
@@ -222,6 +240,163 @@ a = t3/len; b = t1/len; c = t0/len
 row_a = (l.y*a - l.z*b, l.z*b - l.y*c, -l.x/len)
 row_b = (l.y*a, 0.0, -len)
 ```
+
+## Phase 4: real egui
+
+The two no-op draw seams are gone; `egui`, `epaint`, `egui-wgpu` and `wgpu` are
+real dependencies (`Cargo.toml`, the binary's git rev per `docs/EGUI.md` §4.2).
+
+### What replaced what
+
+| removed seam | replaced by | evidence |
+|---|---|---|
+| `field_gpu::paint_view` returning data and calling `gpu.draw(..)` | [`paint_view_ui`] / [`paint_view_ui_keyed`]: recovered quad maths → clip test → `Painter::add(egui_wgpu::Callback::new_paint_callback(rect, FieldCallback))` | `0x100965394`, calls at `0x10096557c` (`new_paint_callback`) and `0x100965588` (`Painter::add`) |
+| nothing (no `CallbackTrait` impl existed) | `FieldCallback` + `impl egui_wgpu::renderer::CallbackTrait` (`prepare`, `finish_prepare`, `paint`) | `0x100963924`, `0x1009635bc`, `0x1009636f0` |
+| `field_gpu::init(gpu, w, h)` only creating descriptors | `init_ctx(&egui::Context, FieldState)` storing the state in the context + `field_state(&ctx)` reader | `init`'s tail: `bl egui::Context::write` (`0x10096a108`) |
+| `PuppetPlacement::paint_figure` returning a `FigureQuad` | `paint_figure_in(&Painter, &FigureCtx, TextureId, &[Shape])`: `Painter::image(texture_id, rect, uv, Color32::WHITE)` or, on the three `cbz` guards, `Painter::extend(cached)` | `0x1008feac0`; `bl egui::painter::Painter::image` at `0x1008feb44`, `bl …::extend` at `0x1008feb68`, uv literal `0x102073df0`, tint `mov w5, #-1` |
+
+The seam types themselves (`gpu::{Gpu, NullGpu, TextureUpload, DrawCall,
+TexFormat}`) are kept — they are recovered evidence for the *pipeline* half, and
+the existing tests assert them. `paint_view` and `paint_figure` keep their old
+signatures and now delegate to the recovered maths.
+
+### The recovered `field_gpu::paint_view` body (newly decoded)
+
+`0x100965394` is a free function, not a method:
+`paint_view(painter: &Painter /*x0*/, field: &Arc<Field> /*x1*/, at /*x2*/,
+mode: u64 /*x3*/, index: usize /*x4*/, view_key: u64 /*x5*/)`, called from
+`injury_doll::view::paint_in_view` (`bl 0x100965394` at `0x1008d11ac`, with
+`mode = 0` and `x5` = the caller's entity id). The instruction stream:
+
+```text
+if mode == 2 {                                   // cmp x22, #0x2; b.ne
+    if index >= max(len, 0x20) { unlock; return }// cmp x21, x9; b.hs
+    (off, size) = (entry[2..4], entry[4..6])     // ldp d1, d2, [x9, #0x8]
+} else {
+    min = pos; max = pos + fallback_pan * t      // fmul s1, s0, s1 with a zeroed s1
+}
+min  = pos + off  * t                            // fmul.2s / fadd.2s
+max  = min + size * t
+if !(max.x >= clip.min.x && max.y >= clip.min.y
+     && min.x <= clip.max.x && min.y <= clip.max.y) { return }   // Rect::intersects
+painter.add(Callback::new_paint_callback(Rect { min, max }, FieldCallback { .. }))
+```
+
+Two corrections to the first-pass reconstruction, both now pinned by tests:
+
+* the 32-byte pan entry is read at **`+0x08` and `+0x10`** (floats 2,3 = offset
+  and 4,5 = size), not at `+0x00`. `ldp d1, d2, [x9, #0x8]` loads the offset
+  into `d1` and the size into `d2`;
+* the lerp produces a **rect**, not a point: `max = min + size * t`. The value
+  `paint_view` used to return was `min`; the fallback pan is a *size*, so for
+  `mode != 2` the pan is exactly `at.pos`.
+
+### Exact new public API
+
+```rust
+// field_gpu
+pub fn paint_view_quad(state: &FieldState, mode: u64, at: &PanAt, index: usize) -> Option<egui::Rect>;
+pub fn paint_view_ui(painter: &Painter, rect: Rect, state: &FieldState, mode: u64,
+                     at: &PanAt, index: usize) -> Option<[f32; 2]>;
+pub fn paint_view_ui_keyed(painter: &Painter, rect: Rect, state: &FieldState, mode: u64,
+                           at: &PanAt, index: usize, key: u64) -> Option<[f32; 2]>;
+pub fn init_ctx(ctx: &egui::Context, state: FieldState);
+pub fn field_state(ctx: &egui::Context) -> Option<FieldState>;
+pub fn field_state_id() -> egui::Id;
+pub const FIELD_STATE_KEY: &str;      // = FIELD_TINT ("#c9d4ff")
+pub const NO_PIECE: u32;              // = u32::MAX, the `+0x3c` "no piece" word
+pub struct FieldCallback { pub mode: u64, pub index: usize, pub quad: Rect, pub key: u64,
+                           pub at: PanAt, pub piece: Option<u32>, pub state: FieldState }
+impl FieldCallback { pub fn new(..) -> Self; pub fn piece_word(&self) -> u32;
+                     pub fn piece_parts(&self) -> Option<(u32, u32)>; }
+impl egui_wgpu::renderer::CallbackTrait for FieldCallback { prepare, finish_prepare, paint }
+pub struct FieldGpu { pub textures: Textures }         // the CallbackResources value
+impl FieldGpu { pub fn new(Textures) -> Self; pub fn frame(&self) -> MutexGuard<FieldFrame>;
+                pub fn record_view(&self, &FieldCallback, &ScreenDescriptor) -> u64;
+                pub fn end_frame(&self); pub fn paint_piece(&self, &FieldCallback, u32, u32); }
+pub struct FieldFrame { pub views: Vec<FieldView>, pub frame: u64,
+                        pub flush_pending: bool, pub draws: Vec<PieceDraw> }
+pub struct FieldView { key, screen_px, pixels_per_point, quad, at, mode, index, frame }
+pub struct PieceDraw { key, magnitude, sign, mode, quad: Option<Rect> }
+impl FieldState { pub fn pan_entry(&self, usize) -> [f32; 8];
+                  pub fn pan_offset(&self, usize) -> [f32; 2];
+                  pub fn pan_size(&self, usize) -> [f32; 2]; }
+
+// puppet_cache
+impl FigureQuad { pub fn rect(&self) -> egui::Rect; pub fn uv_rect(&self) -> egui::Rect;
+                  pub fn color(&self) -> egui::Color32; }
+impl PuppetPlacement {
+    pub fn paint_figure_in(&self, painter: &egui::Painter, ctx: &FigureCtx,
+                           texture: egui::TextureId, cached: &[epaint::Shape]) -> Option<FigureQuad>;
+}
+```
+
+Everything that existed before still compiles unchanged (`paint_view`,
+`paint_figure`, `init`, `available`, the `gpu::*` descriptors).
+
+### `FieldCallback` — the recovered 64-byte layout
+
+`new_paint_callback` allocates `0x40` bytes and copies four 16-byte vectors out of
+its argument (`0x1009602fc..0x10096031c`), so the binary's `FieldCallback` is 64
+bytes; the three trait methods read that copy back at
+`+0x00` mode, `+0x08` index, `+0x10` the field handle (`&Arc<Field>`, locked with
+`Mutex::lock` in `prepare`), `+0x18` the lerped quad, `+0x28` the view key
+(`hash_one(self + 0x28)` keys `HashMap<u64, View>`), `+0x30`/`+0x38` `at.pos` /
+`at.t`, `+0x3c` the piece word.
+
+`paint` bails on `+0x3c == 0xffff_ffff` (`cmn w24, #0x1; b.eq`), and `paint_view`
+always stores `-1` there — so a `paint_view` callback never draws in `paint`; all
+of that path's GPU work is in `prepare`. Anything else at `+0x3c` is split into
+`(w24 & 0x7fff_ffff, w24 >> 31)` and handed to `Gpu::paint_piece` together with
+`self.mode`; what those two numbers *mean* is not recoverable
+(`// UNKNOWN:` — modelled as `Option<u32>` = `[piece word | sign bit]`).
+
+The three methods all start with `callback_resources.get::<Gpu>()` and return an
+empty `Vec` when the resource is absent (`0x100963a50`/`0x100963a98`,
+`0x100963650`, `0x1009637fc`) — `FieldGpu` is that resource here.
+
+### Remaining UNKNOWNs (this phase)
+
+1. **No pipeline is created.** `Gpu::{new, upload_frame, bounce_pass,
+   prepare_piece, paint_piece}` need a `wgpu::Device`/`Queue`; the crate still has
+   no device and the tests never open a window. `FieldGpu` records exactly what
+   those calls are *given* (`FieldView`, `PieceDraw`) and `paint` still issues the
+   recovered `RenderPass::set_viewport(0, 0, screen_px.x, screen_px.y, 0, 1)`.
+2. **`View`'s 864 bytes.** Only the fields `prepare` visibly writes are modelled
+   (`FieldView`); the `kind` at `+0x324` (compared with `3`) and the rest are not.
+3. **The `+0x3c` piece word's meaning** (index? reverse flag?) — see above.
+4. **The `egui::Context` data key.** `init`'s `Context::write` closure captures
+   nothing; the `Id` used here is `Id::new(FIELD_TINT)`, `// INFERRED:`.
+5. **`FieldCallback` holds a `FieldState` snapshot**, not the binary's
+   `&Arc<Field>` handle: the struct is therefore bigger than 64 bytes and
+   `prepare` does not lock a mutex. `// INFERRED:`, chosen so the type is
+   `'static + Send + Sync` and the headless tests can inspect what was handed
+   over.
+6. **`paint_view_ui`'s `rect` parameter.** The binary passes the *lerped quad*
+   to `new_paint_callback`. Here the caller supplies the field view's rect (as
+   the Phase-4 task asks) and the lerped quad travels inside the callback, where
+   the binary also keeps it (`+0x18`) before handing it to `prepare_piece`. With
+   `rect = paint_view_quad(..)` the two are identical.
+
+### Tests added (all headless, `egui::Context` frames only)
+
+67 tests total (57 before). New:
+
+| test | values pinned |
+|---|---|
+| `paint_view_quad_is_min_plus_size_times_t` | `min = pos + off*t`, `max = min + size*t`; entry floats 2..6 (mutating 0/1 changes nothing); `mode != 2` → `min = pos`, `size = fallback_pan`; `pan_slots().max(0x20)` boundary at 0x1f/0x20 and a 0x21-entry table |
+| `paint_view_ui_adds_one_paint_callback_for_the_rect` | one frame, two `Shape::Callback`s, each `PaintCallback::rect == the rect passed`; returns `Some([12,24])` (table) / `Some([10,20])` (fallback); out-of-range index adds nothing and returns `None` |
+| `paint_view_ui_skips_a_quad_outside_the_clip_rect` | an off-screen quad returns `None` and produces no callback (one callback for the on-screen one) |
+| `paint_view_ui_keyed_uses_the_view_key` | keyed entry adds one callback with the given rect, returns the lerp; `FieldCallback::new` keeps `key = 0xfeed`, `piece_word() == NO_PIECE`, `piece_parts() == None` |
+| `field_callback_is_send_sync_and_piece_split` | `FieldCallback: Send + Sync`; `-1` → `None`; `0x8000_0005` → `(5, 1)`; `9` → `(9, 0)` |
+| `init_ctx_round_trips_through_the_context` | `field_state` is `None` before, equals what `init_ctx` stored after (pans/fallback included), `field_state_id() == Id::new("#c9d4ff")`, overwrite replaces |
+| `field_gpu_records_views_per_key_and_flushes` | frame id 0 for two keys, view carries `screen_px`/`pixels_per_point`/quad/`at.t`; same key replaces instead of appending; `end_frame` sets `flush_pending`, the next `record_view` clears it, bumps to frame 1 and drops the old views; `paint_piece` records `(magnitude, sign, mode, quad)` |
+| `figure_quad_converts_to_egui_types` | `FigureQuad::rect() == (12,18)-(72,98)`, `uv_rect() == (0,0)-(1,1)`, `color() == Color32::WHITE`, `FIGURE_UV` / `FIGURE_TINT` literals |
+| `paint_figure_in_paints_one_textured_quad` | **one** `Shape::Mesh`, `Mesh::texture_id == the loaded handle's id`, 4 vertices, indices `[0,1,2,2,1,3]`, `calc_bounds() == (12,18)-(72,98)`, vertex order `left_top/right_top/left_bottom/right_bottom` with the matching uv corners `(0,0)/(1,0)/(0,1)/(1,1)`, all vertex colours white, and the texture upload present in `textures_delta.set` |
+| `paint_figure_in_falls_back_to_the_cached_shapes` | `width == 0` → `None`, **no** mesh, the two cached circles replayed at their centres/radii |
+
+`paint_view_lerps_the_pan` was adapted to the corrected entry offsets (same
+expected values).
 
 ## Integration gap — `gs_puppet::splat::SplatParams`
 
@@ -274,7 +449,7 @@ Hollows}`, `layers::{LayerCloud, Hollows}`, `uv::{UvLayout, Texture}`,
 
 ## Test coverage
 
-`cargo test -p gs_render` → **57** unit tests (plus one `ignore`d doc example that
+`cargo test -p gs_render` → **67** unit tests (plus one `ignore`d doc example that
 shows the future `From` impl). They assert the recovered literals, not
 tautologies: the `size_step`/`body_size_step` tables and their NaN/inf handling,
 the `PuppetKey` byte layout via `mem::offset_of!`, the recovered equality rules
@@ -287,5 +462,11 @@ for every table row, `creature_of`, the FNV-1a + mix vectors, the `nerve_twitch`
 window, `ground_geo`'s depth math and uv fallback, `with_glow` (including the
 empty and over-long cases), the skin sheet slicing, the vertex strides and the
 96-entry job table, `depth_span` for all three payloads, `FieldLight::moon`'s
-derived ramp, `paint_view`'s lerp, `paint_figure`'s quad and the cache's
+derived ramp, `paint_view`'s lerp and quad, `paint_figure`'s quad and the cache's
 generation/retain behaviour.
+
+The ten Phase-4 tests (§ "Tests added") drive real headless `egui::Context`
+frames: they assert on the `Shape::Callback` / `Shape::Mesh` values that come out
+of `Context::run_ui` (counts, rect coordinates, uv corners, texture ids, vertex
+colours) and on the state `FieldGpu` keeps, never merely that a frame ran.
+

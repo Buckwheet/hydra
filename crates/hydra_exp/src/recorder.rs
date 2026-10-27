@@ -53,6 +53,9 @@ pub trait Sink {
 /// `latest_snapshots()` (stride `0x90`), cloning the `Option<String>` at `+0x60`
 /// and reading the kind byte at `+0x88` for every row.
 ///
+/// It finishes by handing the loop to `tokio` — see [`spawn`], which is that
+/// part on its own — and returns without waiting for it.
+///
 /// `// UNKNOWN:` the exact write. The 45 KB body contains the SQL of several
 /// other crates' tables (`attacks`, `hits`, `flares`, `creatures`), so the
 /// `INSERT` this function itself uses could not be isolated; this build records
@@ -78,6 +81,46 @@ pub fn start(sink: &mut dyn Sink, who: &Who, at: i64) -> Result<usize, String> {
         written += 1;
     }
     Ok(written)
+}
+
+/// Hand the recording loop to the runtime, exactly as the original did.
+///
+/// **ESTABLISHED** from `0x1012fb4b4` itself, not from a type name alone:
+/// after building the `Tracker` and the ledger `Reader`, `recorder::start`
+/// reaches
+///
+/// ```text
+/// 1012fb7e8  bl  0x1012dccf0   tokio::task::spawn::spawn
+/// 1012fb7ec  mov x19, x0       ; the JoinHandle
+/// 1012fb7f0  bl  0x101e69b90   tokio::runtime::task::state::State::drop_join_handle_fast
+/// 1012fb7f8  bl  0x101e6b85c   tokio::runtime::task::raw::RawTask::drop_join_handle_slow
+/// ```
+///
+/// so the spawned future is fire-and-forget: the handle is dropped
+/// immediately and nothing is awaited.  The future's own type name,
+/// `hydra_exp::recorder::start::{{closure}}`, is the async block, and
+/// `hydra_exp::recorder::run::{{closure}}` is the `async fn run` it drives.
+///
+/// This reconstruction keeps [`start`] — the synchronous, `&mut dyn Sink`
+/// core, which is this crate's public API — and exposes the spawn here so the
+/// tokio dependency is real rather than a comment.  `who` and `at` are owned
+/// because a spawned future must be `'static`; the original cloned the
+/// character's two strings for the same reason.
+pub fn spawn(sink: Box<dyn Sink + Send>, who: Who, at: i64) {
+    let handle = tokio::spawn(async move {
+        run(sink, who, at).await;
+    });
+    drop(handle);
+}
+
+/// The body of the spawned task (`hydra_exp::recorder::run::{{closure}}`).
+///
+/// `// UNKNOWN:` the loop itself — the binary's `run` is not isolatable (its
+/// CGU holds the surrounding `INSERT`s), so this performs one [`start`] pass
+/// and discards the result, which is what dropping the `JoinHandle` does with
+/// it in the original.
+async fn run(mut sink: Box<dyn Sink + Send>, who: Who, at: i64) {
+    let _ = start(&mut *sink, &who, at);
 }
 
 #[cfg(test)]
@@ -145,5 +188,68 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].0.value, Some(1_234));
         assert_eq!(written[0].1, "Sindar");
+    }
+
+    /// `tokio` is a real dependency of this crate: the binary's
+    /// `recorder::start` calls `tokio::task::spawn::spawn` and drops the
+    /// handle.  This pins that the spawn actually runs the recording pass on
+    /// the runtime, and that nothing is awaited.
+    #[test]
+    fn spawn_hands_the_pass_to_the_runtime_and_drops_the_handle() {
+        use std::sync::{Arc, Mutex};
+
+        struct Shared(Arc<Mutex<Vec<(String, Option<i64>)>>>);
+
+        impl Sink for Shared {
+            fn latest_snapshots(&self) -> Result<Vec<Snapshot>, String> {
+                Ok(vec![
+                    Snapshot {
+                        value: Some(4_242),
+                        label: Some("Voln Favor: 4242".to_string()),
+                        at: 7,
+                        kind: 0,
+                        ..Snapshot::default()
+                    },
+                    Snapshot {
+                        label: Some("Health".to_string()),
+                        at: 7,
+                        kind: 2,
+                        ..Snapshot::default()
+                    },
+                ])
+            }
+            fn record(&mut self, snap: &Snapshot, who: &Who) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((who.name.clone(), snap.value));
+                Ok(())
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(Shared(Arc::clone(&seen)));
+        let watch = Arc::clone(&seen);
+        rt.block_on(async move {
+            spawn(sink, Who::new("Sindar"), 1_784_567_152);
+            // The handle was dropped, so nothing awaits the task; a
+            // single-threaded runtime runs it as soon as this task yields.
+            for _ in 0..10_000 {
+                if !watch.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the spawned recorder task never ran");
+        });
+        // Only the snapshot `names_a_snapshot` accepts is recorded.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("Sindar".to_string(), Some(4_242))]
+        );
     }
 }

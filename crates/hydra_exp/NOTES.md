@@ -7,9 +7,12 @@ what the game says about experience, keeps per-creature/per-hunt rows, computes
 levels and rates, and prints the `exp …` reports.
 
 Status: `cargo check -p hydra_exp --offline` and `cargo test -p hydra_exp
---offline` pass (**46 tests**); `grep -rn 'todo!()\|unimplemented!()'
+--offline` pass (**47 tests**); `grep -rn 'todo!()\|unimplemented!()'
 crates/hydra_exp/src` is empty. Phase 1 (Layer 2) reconnected `hydra_ledger`
-behind the crate's row/report seam — see “the `hydra_ledger` seam” below.
+behind the crate's row/report seam — see “the `hydra_ledger` seam” below. Phase 2
+(audit-core) reconnected **`tokio`** — the crate's second real dependency, which
+Phase 1 missed — see [Dependency
+verdict](#dependency-verdict-tokio--a-real-missed-dependency).
 
 ---
 
@@ -104,7 +107,147 @@ offset arithmetic, not from drop glue.
 
 ---
 
-## Function table
+## Symbol inventory (BOTH sources: `symbols_demangled.txt` + `nm -a | rustfilt`)
+
+`symbols_demangled.txt` lists **27** global symbols for this crate. `nm -a |
+rustfilt` over the whole binary yields **41** lines naming `hydra_exp`, which
+collapse to 30 distinct `hydra_exp::`-prefixed names — the 27 globals plus
+**three symbols the global-only table cannot see**:
+
+* `hydra_exp::tracker::Tracker::take` at `0x1012dda80` (1152 B) — a private
+  method that the previous pass's function table **missed entirely**;
+* `hydra_exp::command::read::{{closure}}` (2 addresses, `0x1012cbc70`,
+  `0x1012cbd3c`);
+* `hydra_exp::command::parse::{{closure}}` (`0x1012cc930`).
+
+Five further types exist only as *type arguments* of `core`/`tokio` symbols, so
+they have no `hydra_exp::` name of their own:
+
+| type | where it appears |
+|---|---|
+| `hydra_exp::recorder::start::{{closure}}` | `tokio::task::spawn::spawn_inner<Pin<Box<…>>>`, `tokio::runtime::task::core::{Cell, Stage, CoreStage}<…>`, `with_current<…, JoinHandle<()>>` (3 `drop_in_place` sites) |
+| `hydra_exp::recorder::run::{{closure}}` | `drop_in_place<hydra_exp::recorder::run::{{closure}}>` — the future type of an `async fn run` |
+| `hydra_exp::tracker::Tracker` | 12 `drop_in_place<Tracker>` (`BTreeMap`/`Ring`/`HashMap` fields) |
+| `hydra_exp::row::{Pulse, Snapshot, Who, Source}` | no glue of its own — the rows are `Copy`-ish and typed only through `hydra_ledger` |
+
+That the crate has an `async fn run` and an async block inside `start`, and that
+the block is `Box::pin`ned and handed to `tokio::task::spawn`, is the whole of
+the dependency evidence below.
+
+---
+
+## Coverage table (all 30 `hydra_exp::` symbols)
+
+Sizes are exact extents from `nm -a` (distance to the next symbol of any kind).
+Where this file previously recorded a smaller "real body" size, both are given:
+the difference is cold blocks and outlined generic code that `nm -a` attributes
+to the same symbol.
+
+| symbol | addr | size | status | notes |
+|---|---|---|---|---|
+| `levels::label` | `0x1012ec07c` | 272 | implemented | `[u64; 101]` table at `0x10240d7c0` re-read this pass: `0,2500,…,7460000,7572500`, strictly increasing; cap literal `0x10240db06` = `"level 100 (cap)"` |
+| `catalog::Entry::command` | `0x1012ec18c` | 496 | implemented | |
+| `catalog::Entry::matches` | `0x1012ec37c` | 2872 | implemented | body ends at `0x1012ecdf4` (2680 B); the rest is outlined code |
+| `report::hour` | `0x1012b0280` | 592 | implemented | |
+| `report::last` | `0x1012b04d0` | 1256 | implemented | |
+| `report::daily` | `0x1012b09b8` | 2372 | implemented | |
+| `report::level` | `0x1012b12fc` | 1448 | implemented | |
+| `report::range` | `0x1012b18a4` | 8644 | partial | the two "fullness" lines are still not printed — the row offsets of the `0..=99` columns are not readable; body is `0x1012b18a4..0x1012b34ec` (7240 B) |
+| `report::stamp` | `0x1012b3a68` | 396 | implemented | |
+| `report::today` | `0x1012b3bf4` | 428 | implemented | |
+| `report::Totals::said` | `0x1012b3da0` | 1104 | implemented | |
+| `report::timing` | `0x1012b41f0` | 1564 | implemented | `TIMING_GAP_LIMIT` re-read this pass: the `i64` at `0x10240cf28` is exactly `90` |
+| `report::bonuses` | `0x1012b480c` | 724 | implemented | |
+| `report::session` | `0x1012b4ae0` | 692 | implemented | |
+| `report::snapshots` | `0x1012b4d94` | 1852 | implemented | |
+| `command::parse_time` | `0x1012ca8f4` | 2060 | partial | three spellings recovered |
+| `command::run` | `0x1012cb100` | 812 | partial | prefix parse full, dispatch partly |
+| `command::read` | `0x1012cb42c` | 2116 | partial | jump table + windows recovered, `Parsed` enum partly |
+| `command::read::{{closure}}` | `0x1012cbc70` | 204 | unknown | **not in the previous table**; 2 instantiations |
+| `command::parse` | `0x1012cbe60` | 2768 | partial | word split + quoted argument recovered |
+| `command::parse::{{closure}}` | `0x1012cc930` | 96 | unknown | **not in the previous table** |
+| `command::answer` | `0x1012cc990` | 2300 | implemented | body `0x1012cc990..0x1012cce7c` (1260 B) + cold block |
+| `tracker::Tracker::new` | `0x1012dcf60` | 380 | partial | field offsets established, labels not |
+| `tracker::Tracker::look` | `0x1012dd0dc` | 1676 | partial | |
+| `tracker::Tracker::seed` | `0x1012dd768` | 792 | partial | |
+| `tracker::Tracker::take` | `0x1012dda80` | 1152 | unknown | **newly found this pass.** Signature shape: `fn take(&mut self, name: &str, kind: u8, label: &Option<String>) -> …` — `(x1,x2)` is a `&str`, `and w22, w26, #0xff` makes `x3` the kind byte, `ldr x24,[x4]` vs `isize::MIN` makes `x4` the `Option<String>` niche. It hashes into the `HashMap` at `Tracker+0x1e8` (`RawTable` probe over `+0x208`, `dup.8b`/`cmeq.8b` control-byte scan) and moves a 0x30-byte value out. Not implemented: `crate::tracker` has no map-taking method and no caller needs one. |
+| `tracker::Tracker::heard` | `0x1012ddf00` | 100 | implemented | |
+| `tracker::Tracker::knows` | `0x1012ddf64` | 192 | implemented | `ret` at `0x1012de020` |
+| `recorder::names_a_snapshot` | `0x1012fb41c` | 152 | implemented | |
+| `recorder::start` | `0x1012fb4b4` | 992 | partial | see the tokio section; the spawn half is now implemented as `recorder::spawn` |
+
+30 rows: **16 implemented, 10 partial, 4 unknown**.
+
+### `report::range`'s fullness lines — still not recoverable
+
+The task asked for these "only if the two row offsets can be read". They cannot,
+this pass either. What *is* established is unchanged: two `{:.1}` percentages,
+the first over an `f64` mean of an integer column filtered by `cmp x10, #0x63`
+(`< 100`), the second a count divided by a count (`ucvtf`/`fdiv` at
+`0x1012b2b48`). The pulses row is 208 bytes and the reports read `+0x30`,
+`+0x68`, `+0x80`, `+0x88`, `+0x90`, `+0xa0`, `+0xa8`, `+0xb0`, `+0xb8`,
+`+0xc0`, `+0xc8`; the two remaining `u8` columns are somewhere in
+`+0x00..+0x30`, `+0x38..+0x68`, `+0x70..+0x80`, `+0x98..+0xa0` or
+`+0xc9..0xd0`, and nothing in the 7.2 KB straight-line block names them. Printing
+a number we cannot back is worse than printing neither line, so this build
+prints neither. The two literals stay registered in [`crate::report`]'s docs.
+
+---
+
+## Dependency verdict: **`tokio` — a real, missed dependency**
+
+This corrects the previous pass's "no `tokio` use in `crates/hydra_exp/src`".
+The evidence is in `recorder::start` itself (`0x1012fb4b4`), not in a type name:
+
+```text
+1012fb7e8  bl  0x1012dccf0   tokio::task::spawn::spawn
+1012fb7ec  mov x19, x0       ; the JoinHandle
+1012fb7f0  bl  0x101e69b90   tokio::runtime::task::state::State::drop_join_handle_fast
+1012fb7f8  bl  0x101e6b85c   tokio::runtime::task::raw::RawTask::drop_join_handle_slow
+```
+
+and the monomorphised type names confirm the future comes from this crate:
+
+```text
+tokio::task::spawn::spawn_inner<Pin<Box<hydra_exp::recorder::start::{{closure}}>>>
+tokio::runtime::task::core::Cell<Pin<Box<hydra_exp::recorder::start::{{closure}}>>, Arc<…Handle>>
+core::ptr::drop_in_place<hydra_exp::recorder::run::{{closure}}>
+```
+
+So the original's `recorder::start` **spawns** the recording loop on the tokio
+runtime and drops the handle: fire-and-forget, nothing is awaited. (The same
+shape appears in `hydra_rewards::recorder::start`, `0x1014e1ea8`, which is
+another crate's business but corroborates the pattern.)
+
+**Reconnected**: `crates/hydra_exp/Cargo.toml` now has
+`tokio = { workspace = true }` (workspace pin `=1.53.1`, `features = ["full"]`,
+already in the root pins and pre-fetched — the build runs with `--offline`).
+`recorder::spawn` is the recovered half:
+
+```rust
+pub fn spawn(sink: Box<dyn Sink + Send>, who: Who, at: i64) {
+    let handle = tokio::spawn(async move { run(sink, who, at).await });
+    drop(handle);
+}
+```
+
+with `async fn run(..)` standing in for `hydra_exp::recorder::run::{{closure}}`.
+`recorder::start` keeps its existing synchronous `&mut dyn Sink` signature — it
+is the extracted core, and changing it would break the sibling-facing API — so
+the observable difference is the new additive `spawn`. A test drives a
+`current_thread` runtime and asserts the spawned pass actually runs and records
+the one snapshot `names_a_snapshot` accepts.
+
+| candidate | verdict | evidence |
+|---|---|---|
+| **`tokio`** (workspace pin `1.53.1`) | **used — reconnected** | 15 `tokio`-naming symbols over `hydra_exp` future types, plus the `bl` sites above |
+| `rusqlite` (workspace pin `0.37`) | **not a direct dependency** | `drop_in_place<rusqlite::error::Error>` is instantiated inside `recorder::start` (`0x1012fa470`), but only because the crate drops the `Err` arm of `hydra_ledger::Ledger::reader()` (`0x10168e934`); no `rusqlite` type is named anywhere in this crate and no `Connection`/`Statement`/`Row` glue exists for it. Reached through `hydra_ledger`, as before. |
+| `serde`, `serde_json`, `regex`, `jiff`, `toml`, `chrono` | **not used** | no symbol naming one of them references a `hydra_exp` type, and no such call target appears in the crate's `.text` |
+| `hydra_ledger`, `hydra_net`, `hydra_model` | **path deps** | `drop_in_place<hydra_ledger::{reader::Reader, writer::Writer, row::Snapshot}>` in `recorder::start`; `hydra_net::eastern`; `hydra_model::…::Experience` |
+
+---
+
+## Function table (from the previous pass — superseded by the coverage table above)
 
 | module | function | address | status |
 |---|---|---|---|
@@ -364,12 +507,12 @@ Note also that the ledger keys pulses *and* snapshots by (instance, character),
 so a caller must know the instance; the reports only ever needed the name, which
 is why the adapter takes the pair at construction.
 
-Nothing else in this crate's departure table is a workspace pin: there is no
-`serde`, `regex`, `toml`, `jiff`, `tokio` or `rusqlite` use in
-`crates/hydra_exp/src` (`grep` confirms the only imports from outside the crate
-are `hydra_net::eastern` and `hydra_model`'s `Experience`), so there is nothing
-to reconnect there — `rusqlite` is reached through `hydra_ledger`'s `Display`
-text, and never named here.
+**Corrected in the audit pass:** this paragraph used to claim there was no
+`tokio` use either. That was wrong — see [Dependency
+verdict](#dependency-verdict-tokio--a-real-missed-dependency) above: `tokio` is
+a real dependency of this crate and has been reconnected. `rusqlite` is still
+reached only through `hydra_ledger`'s `Display` text and is never named here;
+`serde`, `regex`, `toml`, `jiff` and `chrono` appear nowhere.
 
 ### Evidence conflicts / things that could not be established
 
@@ -432,7 +575,7 @@ src/report.rs     Totals + the twelve reports
 src/catalog.rs    Entry, command(), matches(), REPORTS
 src/command.rs    Source trait, Parsed, Reply, HELP, parse/parse_time/run/read/answer
 src/tracker.rs    Tracker, Bar, Watch, Known
-src/recorder.rs   names_a_snapshot, Sink trait, start
+src/recorder.rs   names_a_snapshot, Sink trait, start, spawn / run (tokio)
 src/ledger.rs     LedgerSource / LedgerSink — the real hydra_ledger behind the two traits
 ```
 
@@ -445,3 +588,36 @@ ledger directory under `std::env::temp_dir()` (removed by each test), and cover
 the oldest-first ordering, the closed windows, the instance/character filter,
 `prune_pulses`, `command::answer`'s manual gain, `recorder::start` over a real
 sink, and the `Display` text of a failed connection.
+
+---
+
+## What changed in audit-core (Phase 2)
+
+1. **`tokio` reconnected.** `crates/hydra_exp/Cargo.toml` gained
+   `tokio = { workspace = true }`; `recorder::spawn` + `async fn run` reproduce
+   the binary's `tokio::task::spawn` + immediate `JoinHandle` drop. This was the
+   only dependency the previous pass got wrong: it recorded "there is nothing to
+   reconnect" and the binary disagrees. `recorder::start` keeps its signature.
+2. **Symbol inventory redone from `nm -a`, not just the global list.** One
+   previously-missed function (`tracker::Tracker::take`, 1152 B) and two closure
+   symbols (`command::read::{{closure}}` ×2, `command::parse::{{closure}}`) are
+   now in the inventory; the coverage table lists all 30.
+3. **Four symbols re-measured to exact `nm -a` extents** — `report::range`
+   (8644, not 7240), `command::answer` (2300, not 1260), `catalog::Entry::matches`
+   (2872, not 2680) and `tracker::Tracker::knows` (192). The smaller numbers were
+   the real body up to the first `ret`; the difference is cold blocks and
+   outlined generic code that `nm -a` attributes to the same symbol.
+4. **Two data tables re-read** from `__const` and confirmed verbatim in this
+   crate: the 101-entry `LEVELS` table at `0x10240d7c0` (`0, 2500, 5000, …,
+   7460000, 7572500`, strictly increasing) and the timing gap limit `90` at
+   `0x10240cf28`. Neither needed a change.
+5. **`report::range`'s fullness lines were re-attempted and are still out of
+   reach** — see [that section](#reportranges-fullness-lines--still-not-recoverable).
+   Nothing was invented to close them.
+6. **Tests 46 → 47**: one new test
+   (`recorder::tests::spawn_hands_the_pass_to_the_runtime_and_drops_the_handle`)
+   which drives a `current_thread` tokio runtime and asserts the spawned pass
+   runs and records exactly the snapshot `names_a_snapshot` accepts.
+
+Nothing in this crate's public API was removed or renamed; `recorder::spawn`
+and `recorder::run` are additive, and `recorder::start` is unchanged.

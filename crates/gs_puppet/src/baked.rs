@@ -24,6 +24,10 @@
 
 use crate::math::Vec3;
 use crate::model::{Puppet, PuppetError, Segment};
+/// Re-export: the recovered `baked` functions are `impl`s on
+/// [`crate::model::Puppet`].
+#[allow(unused_imports)]
+pub use crate::model::Puppet as BakedPuppetRig;
 use crate::toml::{self, Value};
 
 /// One baked bone.

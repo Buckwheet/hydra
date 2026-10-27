@@ -8,8 +8,10 @@
 //! descendants that actually swing *downwards* at a given pose.
 
 use crate::math::Vec3;
-use crate::model::Puppet;
 use crate::pose::Pose;
+/// The rig — the recovered `hang` functions are `impl`s on it, so the module path
+/// resolves as it did in the binary.
+pub use crate::model::Puppet;
 
 impl Puppet {
     /// The bones that hang from `from`, in rig order, without `from` itself.

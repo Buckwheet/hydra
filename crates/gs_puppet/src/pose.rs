@@ -24,7 +24,10 @@
 //!   immediate is `0x40c90fdb` in `Pose::breathe` @ `0x100a47a94`).
 
 use crate::math::{slerp, Vec3, Xf, Quat};
-use crate::model::{Puppet, PuppetError};
+use crate::model::PuppetError;
+/// The rig [`crate::model::Puppet`], re-exported so `gs_puppet::pose::Puppet`
+/// resolves the way the original module layout did (its `impl` blocks live here).
+pub use crate::model::Puppet;
 use crate::toml::{self, Table, Value};
 use std::collections::BTreeMap;
 

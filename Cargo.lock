@@ -92,6 +92,12 @@ version = "0.0.0"
 [[package]]
 name = "hydra_table"
 version = "0.0.0"
+dependencies = [
+ "hydra_model",
+ "hydra_net",
+ "hydra_protocol",
+ "hydra_session",
+]
 
 [[package]]
 name = "hydra_travel"

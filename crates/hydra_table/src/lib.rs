@@ -2,12 +2,14 @@
 pub mod account;
 pub mod commands;
 pub mod inventory_command;
+pub mod json;
 pub mod ledger;
 pub mod lich_command;
 pub mod pages;
 pub mod relay;
 pub mod reward_claim;
 pub mod roster;
+pub mod seat;
 pub mod session;
 pub mod store_claim;
 pub mod table;

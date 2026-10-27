@@ -14,7 +14,7 @@
 //! The original crate used `serde`/`serde_json`; this module writes and reads
 //! the same documents through [`crate::json`].
 
-use crate::json::{self, Value};
+use crate::json::Value;
 
 // ---------------------------------------------------------------------------
 // Leaf types
@@ -26,6 +26,7 @@ use crate::json::{self, Value};
 /// (`0x100270cd4`): `text, token, color, named, background, bold, mono, link,
 /// prompt`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Run {
     pub text: String,
     /// Theme token name (`hydra_ui::theme::Token::name`).
@@ -110,6 +111,7 @@ fn opt_int(v: Option<u32>) -> Value {
 /// A vitals gauge.  Recovered order (`0x1002714b0`):
 /// `label, token, percent, current, max`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Gauge {
     pub label: String,
     pub token: Option<String>,
@@ -132,6 +134,7 @@ impl Gauge {
 
 /// An effect row (`0x1002723ec`): `text, left, percent`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct EffectOut {
     pub text: String,
     pub left: Option<String>,
@@ -150,6 +153,7 @@ impl EffectOut {
 
 /// A group of effects (`0x1002728ec`): `effects, list`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct EffectList {
     pub effects: Vec<EffectOut>,
     pub list: String,
@@ -166,6 +170,7 @@ impl EffectList {
 
 /// A spell row (`0x100272028`): `name, circle, number`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SpellOut {
     pub name: String,
     pub circle: u32,
@@ -185,6 +190,7 @@ impl SpellOut {
 /// A target row (`0x100272640`): `name, bare, noun, statuses, hint, health,
 /// current`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TargetOut {
     pub name: String,
     pub bare: String,
@@ -211,6 +217,7 @@ impl TargetOut {
 
 /// The known-targets panel (`0x100272c5c`): `look, targets, arms, known`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TargetsOut {
     pub look: String,
     pub targets: Vec<TargetOut>,
@@ -232,6 +239,7 @@ impl TargetsOut {
 /// One chip/tag row (`0x10027183c`): `name, mark, words, rows, color, level,
 /// shown`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChipOut {
     pub name: String,
     pub mark: String,
@@ -258,6 +266,7 @@ impl ChipOut {
 
 /// A sub-row of a chip (`0x1002727d0`): `name, list, left, up`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChipRowOut {
     pub name: String,
     pub list: String,
@@ -279,6 +288,7 @@ impl ChipRowOut {
 /// A merchant row (`0x100272d78`): `name, room, status, left, announcement,
 /// said, rules`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MerchantOut {
     pub name: String,
     pub room: Option<String>,
@@ -306,6 +316,7 @@ impl MerchantOut {
 /// A room description (`0x100271db8`): `description, creatures, objects,
 /// players, title, exits`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RoomOut {
     pub description: Vec<Run>,
     pub creatures: Vec<Run>,
@@ -330,6 +341,7 @@ impl RoomOut {
 
 /// A team/party row (`0x100271f0c`): `name, members`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TeamOut {
     pub name: String,
     pub members: Vec<Run>,
@@ -346,6 +358,7 @@ impl TeamOut {
 
 /// A scroll banner (`0x100272160`): `text, key, left_ms`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BannerOut {
     pub text: String,
     pub key: String,
@@ -364,6 +377,7 @@ impl BannerOut {
 
 /// A hotbar button (`0x100272298`): `id, label, fg, bg, countdown, dim`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ButtonOut {
     pub id: String,
     pub label: String,
@@ -388,6 +402,7 @@ impl ButtonOut {
 
 /// A hotbar (`0x1002715e8`): `name, slots, title, columns`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BarOut {
     pub name: String,
     pub slots: Vec<ButtonOut>,
@@ -408,6 +423,7 @@ impl BarOut {
 
 /// A stream tab (`0x100272524`): `id, name`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StreamOut {
     pub id: String,
     pub name: String,
@@ -424,6 +440,7 @@ impl StreamOut {
 
 /// A help row for the command hints (`0x1002719ac`): `command, says`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct HelpOut {
     pub command: String,
     pub says: Vec<Run>,
@@ -440,6 +457,7 @@ impl HelpOut {
 
 /// An inline picture (`0x100272b40`): `src, alt, width, height`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PictureOut {
     pub src: String,
     pub alt: String,
@@ -460,6 +478,7 @@ impl PictureOut {
 
 /// A menu entry (`0x100272ee8`): `label, command`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MenuEntryOut {
     pub label: String,
     pub command: String,
@@ -476,6 +495,7 @@ impl MenuEntryOut {
 
 /// A menu group (`0x100273004`): `under, entries`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MenuGroupOut {
     pub under: String,
     pub entries: Vec<MenuEntryOut>,
@@ -492,6 +512,7 @@ impl MenuGroupOut {
 
 /// The game-login offer (`0x100272a08`): `account, game, characters`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ListingOut {
     pub account: String,
     pub game: String,
@@ -511,6 +532,7 @@ impl ListingOut {
 /// One character card on the hub (`0x100270f4c`): `name, game, vitals, room,
 /// state, state_token, id, closed`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize)]
 pub struct Card {
     pub name: String,
     pub game: String,
@@ -546,6 +568,7 @@ impl Card {
 
 /// The hub panel (`0x100271704`): `cards, offered, teams, said, listing`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize)]
 pub struct HubOut {
     pub cards: Vec<Card>,
     pub offered: Vec<Card>,
@@ -568,6 +591,7 @@ impl HubOut {
 
 /// A line of story text (`0x1002710d8`): `runs, stream, kind, picture, help`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Line {
     pub runs: Vec<Run>,
     pub stream: String,
@@ -595,6 +619,7 @@ impl Line {
 /// casttime, left, right, prepared, room, effects, conditions, injuries,
 /// spells, merchants, targets, chips`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct View {
     pub state: String,
     pub state_token: String,
@@ -645,7 +670,10 @@ impl View {
 ///
 /// The original is `#[serde(tag = "t")]`; the variants and payload field names
 /// below are recovered from `Serialize for wire::Out` (`0x10026f844`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+// The recovered representation: an internally tagged enum whose tag key is
+// the one-byte string `"t"` and whose payload fields are spliced next to it.
+#[serde(tag = "t", rename_all = "snake_case")]
 pub enum Out {
     /// `{"t":"welcome","login":..}`
     Welcome { login: String },
@@ -879,14 +907,22 @@ impl Out {
     }
 
     /// Serialize the way `client::message` did (`serde_json::to_string`).
+    ///
+    /// The document comes out of the derived `Serialize` impl, so the tag is
+    /// written first and every payload field follows in declaration order —
+    /// exactly the bytes the recovered `Serialize for wire::Out` produced.
+    /// A non-finite `f32` (`Out::Banners`) is the one value `serde_json` refuses;
+    /// it is written as `null` instead of panicking.
     pub fn to_json(&self) -> String {
-        let mut pairs: Vec<(String, Value)> = vec![("t".to_string(), Value::str(self.tag()))];
-        pairs.extend(self.fields().into_iter().map(|(k, v)| (k.to_string(), v)));
-        Value::Obj(pairs).to_json()
+        match serde_json::to_string(self) {
+            Ok(text) => text,
+            Err(_) => "null".to_string(),
+        }
     }
 
     /// The websocket text frame body (`client::message` returned
-    /// `bytes::Bytes`; std-only here).
+    /// `bytes::Bytes`; `bytes` is not a workspace pin, so this is a `Vec<u8>`
+    /// and [`crate::client::frame`] builds the `tungstenite` message).
     pub fn to_frame(&self) -> Vec<u8> {
         self.to_json().into_bytes()
     }
@@ -904,97 +940,131 @@ impl Out {
 /// `// UNKNOWN:` only `In::Login`'s fields are recovered from the binary
 /// (`account`, `password`, `game`, `character`, `remember`).  The other
 /// payloads carry the fields their handler needs; each is marked where guessed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
 pub enum In {
     Login {
+        #[serde(default)]
         account: String,
+        #[serde(default)]
         password: String,
+        #[serde(default)]
         game: String,
+        #[serde(default)]
         character: String,
+        #[serde(default)]
         remember: bool,
     },
     Hello,
     Attach,
     Send {
+        #[serde(default)]
         text: String,
     },
     Wheel {
+        #[serde(default)]
         direction: String,
     },
     Button {
+        #[serde(default)]
         id: String,
     },
     Link {
+        #[serde(default)]
         noun: String,
     },
     Clip {
+        #[serde(default)]
         text: String,
     },
     Characters,
     Launch {
+        #[serde(default)]
         character: String,
     },
     LaunchTeam {
+        #[serde(default)]
         character: String,
     },
     Choose {
+        #[serde(default)]
         game: String,
     },
     Reconnect,
     Streams,
     Stream {
+        #[serde(default)]
         id: String,
+        #[serde(default)]
         text: String,
     },
     Tasks,
     Trainer,
     TrainerProfile {
+        #[serde(default)]
         name: String,
     },
     TrainerStep {
+        #[serde(default)]
         skill: String,
+        #[serde(default)]
         step: i32,
     },
     Inventory,
     InventoryAct {
+        #[serde(default)]
         act: String,
+        #[serde(default)]
         item: String,
     },
     Notes,
     NoteNew {
+        #[serde(default)]
         text: String,
     },
     NoteWrite {
+        #[serde(default)]
         key: String,
+        #[serde(default)]
         text: String,
     },
     NoteForget {
+        #[serde(default)]
         key: String,
     },
     Highlights,
     HighlightsMerge {
+        #[serde(default)]
         text: String,
     },
     HighlightSave {
+        #[serde(flatten)]
         form: crate::highlights::Form,
     },
     HighlightRemove {
+        #[serde(default)]
         name: String,
     },
     HighlightSwitch {
+        #[serde(default)]
         name: String,
+        #[serde(default)]
         on: bool,
     },
     Theme,
     Hotbar {
+        #[serde(default)]
         bar: String,
     },
     PhoneGet,
     PhonePut {
+        #[serde(default)]
         kind: String,
+        #[serde(default)]
         text: String,
     },
     PushPair {
+        #[serde(default)]
         token: String,
     },
     PushForget,
@@ -1092,98 +1162,23 @@ impl In {
     ];
 
     /// Parse a page message.
+    ///
+    /// `serde_json` is the parser (the original's engine); the derived
+    /// `Deserialize` impl is the one the recovered `Deserialize for wire::In`
+    /// describes.  Unknown tags and malformed documents are errors; a missing
+    /// payload field is not (every field carries `#[serde(default)]`, which is
+    /// how the page's sparse messages parse).
     pub fn from_json(text: &str) -> Result<In, String> {
-        let v = json::parse(text)?;
-        In::from_value(&v)
+        serde_json::from_str(text).map_err(|e| e.to_string())
     }
 
     /// Parse an already-parsed value.
+    ///
+    /// Kept for the `crate::json::Value` callers; the value is written back out
+    /// through `serde_json` and handed to [`In::from_json`], so there is only
+    /// one parser.
     pub fn from_value(v: &Value) -> Result<In, String> {
-        let tag = v
-            .get("t")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "message has no \"t\" tag".to_string())?;
-        let s = |key: &str| {
-            v.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        let b = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
-        let n = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
-        Ok(match tag {
-            "login" => In::Login {
-                account: s("account"),
-                password: s("password"),
-                game: s("game"),
-                character: s("character"),
-                remember: b("remember"),
-            },
-            "hello" => In::Hello,
-            "attach" => In::Attach,
-            "send" => In::Send { text: s("text") },
-            "wheel" => In::Wheel {
-                direction: s("direction"),
-            },
-            "button" => In::Button { id: s("id") },
-            "link" => In::Link { noun: s("noun") },
-            "clip" => In::Clip { text: s("text") },
-            "characters" => In::Characters,
-            "launch" => In::Launch {
-                character: s("character"),
-            },
-            "launch_team" => In::LaunchTeam {
-                character: s("character"),
-            },
-            "choose" => In::Choose { game: s("game") },
-            "reconnect" => In::Reconnect,
-            "streams" => In::Streams,
-            "stream" => In::Stream {
-                id: s("id"),
-                text: s("text"),
-            },
-            "tasks" => In::Tasks,
-            "trainer" => In::Trainer,
-            "trainer_profile" => In::TrainerProfile { name: s("name") },
-            "trainer_step" => In::TrainerStep {
-                skill: s("skill"),
-                step: n("step") as i32,
-            },
-            "inventory" => In::Inventory,
-            "inventory_act" => In::InventoryAct {
-                act: s("act"),
-                item: s("item"),
-            },
-            "notes" => In::Notes,
-            "note_new" => In::NoteNew { text: s("text") },
-            "note_write" => In::NoteWrite {
-                key: s("key"),
-                text: s("text"),
-            },
-            "note_forget" => In::NoteForget { key: s("key") },
-            "highlights" => In::Highlights,
-            "highlights_merge" => In::HighlightsMerge { text: s("text") },
-            "highlight_save" => In::HighlightSave {
-                form: crate::highlights::Form::from_value(v)?,
-            },
-            "highlight_remove" => In::HighlightRemove { name: s("name") },
-            "highlight_switch" => In::HighlightSwitch {
-                name: s("name"),
-                on: b("on"),
-            },
-            "theme" => In::Theme,
-            "hotbar" => In::Hotbar { bar: s("bar") },
-            "phone_get" => In::PhoneGet,
-            "phone_put" => In::PhonePut {
-                kind: s("kind"),
-                text: s("text"),
-            },
-            "push_pair" => In::PushPair { token: s("token") },
-            "push_forget" => In::PushForget,
-            "workspace" => In::Workspace,
-            "remove" => In::Remove,
-            other => return Err(format!("unknown message tag `{other}`")),
-        })
+        In::from_json(&v.to_json())
     }
 }
 
@@ -1394,6 +1389,568 @@ mod tests {
             r#"{"text":"Dusk is falling.","key":"dusk","left_ms":4000}"#
         );
         assert_eq!(hand(Some("sword"), None), (Some("sword".to_string()), None));
+    }
+
+    // -- serde: the derived impls are the recovered documents ---------------
+
+    /// The JSON `serde` writes for `value`, as an order-preserving `Value`.
+    fn serde_value<T: serde::Serialize>(value: &T) -> crate::json::Value {
+        let text = serde_json::to_string(value).expect("serializes");
+        crate::json::parse(&text).expect("parses")
+    }
+
+    /// A leaf's serde document is exactly the recovered field list, and the
+    /// document survives a serde round trip.
+    fn same<T>(value: T, fields: Vec<(&'static str, crate::json::Value)>)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(serde_value(&value), object(fields));
+        let text = serde_json::to_string(&value).expect("serializes");
+        let back: T = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn serde_matches_fields_for_every_wire_leaf() {
+        let run = Run {
+            text: "a kobold".into(),
+            token: Some("creature".into()),
+            color: Some("#ff0000".into()),
+            named: None,
+            background: Some("#000000".into()),
+            bold: true,
+            mono: false,
+            link: Some(".look kobold".into()),
+            prompt: false,
+        };
+        same(run.clone(), run.fields());
+
+        let gauge = Gauge {
+            label: "Health".into(),
+            token: Some("health".into()),
+            percent: 92,
+            current: 46,
+            max: 50,
+        };
+        same(gauge.clone(), gauge.fields());
+
+        let effect = EffectOut {
+            text: "Blessed".into(),
+            left: None,
+            percent: Some(40),
+        };
+        same(effect.clone(), effect.fields());
+        let effects = EffectList {
+            effects: vec![effect],
+            list: "blessings".into(),
+        };
+        same(effects.clone(), effects.fields());
+
+        let spell = SpellOut {
+            name: "Minor Shock".into(),
+            circle: 1,
+            number: 901,
+        };
+        same(spell.clone(), spell.fields());
+
+        let target = TargetOut {
+            name: "a kobold".into(),
+            bare: "kobold".into(),
+            noun: "kobold".into(),
+            statuses: vec!["stunned".into()],
+            hint: "tired".into(),
+            health: None,
+            current: true,
+        };
+        same(target.clone(), target.fields());
+        let targets = TargetsOut {
+            look: "You see nothing.".into(),
+            targets: vec![target],
+            arms: "sword".into(),
+            known: true,
+        };
+        same(targets.clone(), targets.fields());
+
+        let row = ChipRowOut {
+            name: "left".into(),
+            list: "hands".into(),
+            left: "sword".into(),
+            up: true,
+        };
+        same(row.clone(), row.fields());
+        let chip = ChipOut {
+            name: "effects".into(),
+            mark: "E".into(),
+            words: vec!["blessed".into()],
+            rows: vec![row],
+            color: "#00ff00".into(),
+            level: 2,
+            shown: true,
+        };
+        same(chip.clone(), chip.fields());
+
+        let merchant = MerchantOut {
+            name: "the peddler".into(),
+            room: Some("Town Square".into()),
+            status: "open".into(),
+            left: "5 minutes".into(),
+            announcement: None,
+            said: Some("silver only".into()),
+            rules: vec!["no haggling".into()],
+        };
+        same(merchant.clone(), merchant.fields());
+
+        let room = RoomOut {
+            description: vec![run.clone()],
+            creatures: vec![],
+            objects: vec![],
+            players: vec![],
+            title: vec![run.clone()],
+            exits: vec![run.clone()],
+        };
+        same(room.clone(), room.fields());
+        let team = TeamOut {
+            name: "the pack".into(),
+            members: vec![run.clone()],
+        };
+        same(team.clone(), team.fields());
+
+        let banner = BannerOut {
+            text: "Dusk is falling.".into(),
+            key: "dusk".into(),
+            left_ms: 4000,
+        };
+        same(banner.clone(), banner.fields());
+        let button = ButtonOut {
+            id: "look".into(),
+            label: "Look".into(),
+            fg: Some("#ffffff".into()),
+            bg: None,
+            countdown: "3".into(),
+            dim: false,
+        };
+        same(button.clone(), button.fields());
+        let bar = BarOut {
+            name: "main".into(),
+            slots: vec![button],
+            title: "Hotbar".into(),
+            columns: 8,
+        };
+        same(bar.clone(), bar.fields());
+
+        let stream = StreamOut {
+            id: "main".into(),
+            name: "Story".into(),
+        };
+        same(stream.clone(), stream.fields());
+        let help = HelpOut {
+            command: "look".into(),
+            says: vec![run.clone()],
+        };
+        same(help.clone(), help.fields());
+        let picture = PictureOut {
+            src: "/pictures/kobold.png".into(),
+            alt: "a kobold".into(),
+            width: 64,
+            height: 64,
+        };
+        same(picture.clone(), picture.fields());
+
+        let entry = MenuEntryOut {
+            label: "Look".into(),
+            command: "look".into(),
+        };
+        same(entry.clone(), entry.fields());
+        let group = MenuGroupOut {
+            under: "actions".into(),
+            entries: vec![entry],
+        };
+        same(group.clone(), group.fields());
+
+        let listing = ListingOut {
+            account: "IMAGINE".into(),
+            game: "GS4".into(),
+            characters: vec!["Ima".into()],
+        };
+        same(listing.clone(), listing.fields());
+
+        let card = card(
+            7,
+            "Ima",
+            "GS4",
+            "Connected",
+            "ok",
+            vec![gauge.clone()],
+            Some(vec![TextRun {
+                text: "Town Square".into(),
+                ..TextRun::default()
+            }]),
+            false,
+        );
+        // `Card` carries two `&'static str` state slots, so it is
+        // serialize-only; compare the document instead of round-tripping it.
+        assert_eq!(serde_value(&card), object(card.fields()));
+        let hub = HubOut {
+            cards: vec![card.clone()],
+            offered: vec![],
+            teams: vec![team],
+            said: vec![run.clone()],
+            listing: Some(listing),
+        };
+        assert_eq!(serde_value(&hub), object(hub.fields()));
+
+        let line = Line {
+            runs: vec![run.clone()],
+            stream: "main".into(),
+            kind: "story".into(),
+            picture: Some(picture),
+            help: Some(help),
+        };
+        same(line.clone(), line.fields());
+
+        let view = View {
+            state: "Connected".into(),
+            state_token: "ok".into(),
+            vitals: vec![gauge],
+            roundtime: Some(3),
+            casttime: None,
+            left: Some("sword".into()),
+            right: None,
+            prepared: Some("Minor Shock".into()),
+            room: Some(room),
+            effects: vec![effects],
+            conditions: vec!["stunned".into()],
+            injuries: Some(crate::injuries::doll()),
+            spells: vec![spell],
+            merchants: vec![merchant],
+            targets,
+            chips: vec![chip],
+        };
+        same(view.clone(), view.fields());
+    }
+
+    #[test]
+    fn serde_matches_fields_for_every_payload_leaf() {
+        let objective = crate::tasks::ObjectiveOut {
+            name: "kobolds".into(),
+            kind: "kill".into(),
+            location: "Wehnimer's Landing".into(),
+            state: "2/10".into(),
+            description: "kobolds slain".into(),
+        };
+        same(objective.clone(), objective.fields());
+        let tasks = crate::tasks::TasksOut {
+            brief: "Kill ten kobolds".into(),
+            bounty: "kobold".into(),
+            objectives: vec![objective],
+        };
+        same(tasks.clone(), tasks.fields());
+
+        let skill = crate::trainer::SkillOut {
+            section: "Weapon".into(),
+            name: "Edged Weapons".into(),
+            cost: "3".into(),
+            has: "5".into(),
+            goal: "10".into(),
+            id: "edged-weapons".into(),
+        };
+        same(skill.clone(), skill.fields());
+        let sheet = crate::trainer::SheetOut {
+            title: "The skill manager".into(),
+            physical: "2".into(),
+            mental: "1".into(),
+            skills: vec![skill],
+            changed: "now".into(),
+        };
+        same(sheet.clone(), sheet.fields());
+        let trainer = crate::trainer::TrainerOut {
+            profiles: vec!["hunter".into()],
+            said: "Applying…".into(),
+            sheet: Some(sheet),
+            busy: true,
+        };
+        same(trainer.clone(), trainer.fields());
+
+        let note = crate::notes::NoteOut {
+            who: "room:12345".into(),
+            character: "Ima".into(),
+            name: "Town Square".into(),
+            changed: "2024-05-01 10:00".into(),
+            text: "a\nb".into(),
+            lines: vec!["a".into(), "b".into()],
+        };
+        same(note.clone(), note.fields());
+        // `NotesOut` is the untagged enum: one shape per variant.
+        same(
+            crate::notes::NotesOut::Notes(vec![note.clone()]),
+            crate::notes::NotesOut::Notes(vec![note.clone()]).fields(),
+        );
+        same(
+            crate::notes::NotesOut::Problem("boom".into()),
+            crate::notes::NotesOut::Problem("boom".into()).fields(),
+        );
+
+        let act = crate::inventory::ActOut {
+            act: "wear".into(),
+            label: "Wear".into(),
+        };
+        same(act.clone(), act.fields());
+        let item = crate::inventory::ItemOut {
+            within: "Worn".into(),
+            id: "a rusty sword".into(),
+            parent: "".into(),
+            noun: "sword".into(),
+            name: "a rusty sword".into(),
+            pounds: "8".into(),
+            acts: vec![act],
+            count: 1,
+            fill: "filling".into(),
+            container: false,
+            locked: true,
+        };
+        same(item.clone(), item.fields());
+        let group = crate::inventory::GroupOut {
+            ids: vec!["a rusty sword".into()],
+            heading: "Worn".into(),
+            tab: "items".into(),
+        };
+        same(group.clone(), group.fields());
+        let detail = crate::inventory::DetailOut {
+            id: "a rusty sword".into(),
+            name: "a rusty sword".into(),
+            sections: vec![group.clone()],
+        };
+        same(detail.clone(), detail.fields());
+        let inventory = crate::inventory::InventoryOut {
+            summary: "You are carrying 1 item.".into(),
+            groups: vec![group],
+            items: vec![item],
+            item: Some(detail),
+            known: true,
+            room_left: false,
+        };
+        same(inventory.clone(), inventory.fields());
+
+        for shape in [
+            crate::injuries::ShapeOut::Circle { c: 50, r: 12 },
+            crate::injuries::ShapeOut::Line { a: 1, b: 2, w: 3 },
+            crate::injuries::ShapeOut::Block { min: 4, max: 5 },
+            crate::injuries::ShapeOut::Letter {
+                c: 6,
+                letter: "H".into(),
+            },
+        ] {
+            same(shape.clone(), shape.fields());
+        }
+        let part = crate::injuries::PartOut {
+            shape: crate::injuries::ShapeOut::Circle { c: 5, r: 6 },
+            id: 1,
+            name: "head".into(),
+            anchor: "head".into(),
+        };
+        same(part.clone(), part.fields());
+        let doll = crate::injuries::DollOut {
+            parts: vec![part, crate::injuries::table()[1].clone()],
+            aspect: 0.75,
+        };
+        same(doll.clone(), doll.fields());
+        let injury = crate::injuries::InjuryOut {
+            id: "leftArm".into(),
+            name: "left arm".into(),
+            token: "wound".into(),
+            rank: 2,
+        };
+        same(injury.clone(), injury.fields());
+
+        let category = crate::highlights::CategoryOut {
+            name: "Combat".into(),
+            on: 1,
+        };
+        same(category.clone(), category.fields());
+        let mark = crate::highlights::MarkForm {
+            name: "watch".into(),
+            seconds: 30,
+            clear: false,
+        };
+        same(mark.clone(), mark.fields());
+        let form = crate::highlights::Form {
+            category: "Combat".into(),
+            find: "kobold".into(),
+            pattern: true,
+            squelch: true,
+            seconds: 12,
+            volume: 7,
+            ..crate::highlights::Form::default()
+        };
+        same(form.clone(), form.fields());
+        let rule = crate::highlights::RuleOut {
+            name: "kobold".into(),
+            form,
+            problem: None,
+        };
+        same(rule.clone(), rule.fields());
+    }
+
+    /// The recovered `"t"` tag is the serde tag, for every variant.
+    #[test]
+    fn out_documents_are_the_serde_documents() {
+        let out = vec![
+            Out::Welcome {
+                login: "Ima".into(),
+            },
+            Out::Workspace {
+                ask: 2,
+                status: 200,
+            },
+            Out::Banners {
+                banners: vec![BannerOut {
+                    text: "Dusk is falling.".into(),
+                    key: "dusk".into(),
+                    left_ms: 4000,
+                }],
+                ground: "#000".into(),
+                across: "1".into(),
+                down: "2".into(),
+                width: 1.5,
+                opacity: 0.5,
+            },
+            Out::Offer {
+                text: "GS4".into(),
+            },
+            Out::Theme {
+                colors: vec!["#fff".into()],
+                names: vec!["text".into()],
+                prompt: ">".into(),
+            },
+            Out::Said {
+                text: "hello".into(),
+            },
+            Out::View(View::default()),
+            Out::PushPaired,
+            Out::Phone {
+                kind: "ui".into(),
+                text: "{}".into(),
+            },
+            Out::Hotbars {
+                bars: vec![],
+                problems: vec!["bar".into()],
+            },
+            Out::Stream {
+                id: "main".into(),
+                from: "Game".into(),
+            },
+            Out::Themes {
+                names: vec!["dark".into()],
+            },
+            Out::Detached,
+            Out::Refused {
+                why: "no".into(),
+            },
+            Out::Highlights {
+                categories: vec![crate::highlights::CategoryOut {
+                    name: "Combat".into(),
+                    on: 1,
+                }],
+                rules: vec![],
+                sounds: vec!["a.ogg".into()],
+            },
+            Out::Tasks(crate::tasks::TasksOut::default()),
+            Out::Hub(HubOut::default()),
+            Out::Trainer(crate::trainer::TrainerOut::default()),
+            Out::Wheel { wheel: "n".into() },
+            Out::Injuries(crate::injuries::doll()),
+            Out::Menu {
+                noun: "sword".into(),
+                groups: vec![],
+            },
+            Out::Lines {
+                lines: vec![],
+                from: "story".into(),
+            },
+            Out::Note(crate::notes::NoteOut::default()),
+            Out::Inventory(crate::inventory::InventoryOut::default()),
+            Out::HighlightsText {
+                changed: Some(17),
+                text: "Combat|kobold\n".into(),
+            },
+            Out::Highlighted {
+                text: "Combat|kobold\n".into(),
+                kept: vec!["kobold".into()],
+                done: true,
+            },
+        ];
+        // Every variant is covered by the list above.
+        assert_eq!(out.len(), 26);
+        for out in &out {
+            let mut pairs = vec![("t".to_string(), crate::json::Value::str(out.tag()))];
+            pairs.extend(out.fields().into_iter().map(|(k, v)| (k.to_string(), v)));
+            assert_eq!(
+                crate::json::parse(&out.to_json()).unwrap(),
+                crate::json::Value::Obj(pairs),
+                "{}",
+                out.tag()
+            );
+            // The tag the serde derive writes is the recovered one.
+            assert!(out.to_json().starts_with(&format!(r#"{{"t":"{}""#, out.tag())));
+        }
+        // `Out::Attached` needs a scrollback, so it is checked separately.
+        let attached = Out::Attached {
+            name: "Ima".into(),
+            game: "GS4".into(),
+            streams: vec![],
+            story_lines: vec![],
+            stream_lines: vec![vec![]],
+            id: 3,
+        };
+        assert_eq!(
+            attached.to_json(),
+            r#"{"t":"attached","name":"Ima","game":"GS4","streams":[],"story_lines":[],"stream_lines":[[]],"id":3}"#
+        );
+    }
+
+    #[test]
+    fn in_documents_are_the_serde_documents() {
+        for tag in In::TAGS {
+            let text = format!(r#"{{"t":"{tag}"}}"#);
+            let msg = In::from_json(&text).unwrap_or_else(|e| panic!("{tag}: {e}"));
+            assert_eq!(msg.tag(), *tag);
+            let back = serde_json::to_string(&msg).unwrap();
+            assert!(back.starts_with(&format!(r#"{{"t":"{tag}""#)), "{back}");
+            // And the message round trips through serde.
+            assert_eq!(In::from_json(&back).unwrap(), msg);
+        }
+
+        // A fully populated `login`: the one payload whose field names the
+        // binary pins down.
+        let login = In::from_json(
+            r#"{"t":"login","account":"A","password":"P","game":"GS4","character":"Ima","remember":true,"extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&login).unwrap(),
+            r#"{"t":"login","account":"A","password":"P","game":"GS4","character":"Ima","remember":true}"#
+        );
+
+        // `highlight_save` splices the 33 form fields next to the tag.
+        let save = In::from_json(
+            r#"{"t":"highlight_save","category":"Combat","find":"kobold","pattern":true,"squelch":true,"volume":7}"#,
+        )
+        .unwrap();
+        let In::HighlightSave { form } = &save else {
+            panic!("{save:?}");
+        };
+        assert_eq!(form.category, "Combat");
+        assert_eq!(form.find, "kobold");
+        assert!(form.pattern);
+        assert!(form.squelch);
+        assert_eq!(form.volume, 7);
+        assert_eq!(form.color, "", "the other form fields default");
+        // A message with no form fields at all still parses.
+        assert!(matches!(
+            In::from_json(r#"{"t":"highlight_save"}"#).unwrap(),
+            In::HighlightSave { .. }
+        ));
     }
 
     #[test]

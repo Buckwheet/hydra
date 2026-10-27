@@ -28,15 +28,23 @@ pub fn path(root: &Path, account: &str, character: &str) -> PathBuf {
     ))
 }
 
-/// The `revision` field of a workspace document.
+/// The only part of a workspace document this crate reads.
 ///
-/// **ESTABLISHED**: `workspace::revision` deserializes the text as JSON and
-/// reads the object's `revision` key (the pool holds `revision` right next to
-/// the workspace literals).
+/// **ESTABLISHED**: `workspace::revision` deserializes the text with
+/// `serde_json` and reads the object's `revision` key (the pool holds `revision`
+/// right next to the workspace literals).  Every other field is the page's and
+/// is ignored.
+#[derive(serde::Deserialize)]
+struct Revision {
+    revision: u32,
+}
+
+/// The `revision` field of a workspace document, or `None` when the text is not
+/// a document or carries no usable revision.
 pub fn revision(text: &str) -> Option<u32> {
-    let v = crate::json::parse(text).ok()?;
-    let n = v.get("revision")?.as_u64()?;
-    u32::try_from(n).ok()
+    serde_json::from_str::<Revision>(text)
+        .ok()
+        .map(|document| document.revision)
 }
 
 /// The answer to a workspace HTTP request.

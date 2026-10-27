@@ -8,6 +8,7 @@ use crate::json::Value;
 
 /// One objective (`ObjectiveOut`): `name, kind, location, state, description`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ObjectiveOut {
     pub name: String,
     pub kind: String,
@@ -30,6 +31,7 @@ impl ObjectiveOut {
 
 /// The panel payload (`TasksOut`): `brief, bounty, objectives`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TasksOut {
     pub brief: String,
     pub bounty: String,

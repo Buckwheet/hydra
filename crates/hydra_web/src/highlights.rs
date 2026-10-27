@@ -66,6 +66,7 @@ pub struct Rule {
 
 /// The category list entry (`CategoryOut`): `name, on`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CategoryOut {
     pub name: String,
     /// How many rules the category has enabled (`on`).
@@ -83,6 +84,7 @@ impl CategoryOut {
 
 /// One rule row (`RuleOut`): `name, form, problem`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RuleOut {
     pub name: String,
     pub form: Form,
@@ -108,6 +110,7 @@ impl RuleOut {
 
 /// The mark part of a highlight (`MarkForm`): `name, seconds, clear`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MarkForm {
     pub name: String,
     pub seconds: u32,
@@ -145,47 +148,54 @@ impl MarkForm {
 /// The whole highlight editor form (`Form`).
 ///
 /// The 33 field names **and** the serialization order are recovered from
-/// `Serialize for highlights::Form`; the declaration order below follows the
-/// original's memory layout (offsets in the comments).
+/// `Serialize for highlights::Form` (`0x1002c6140`).  The fields are declared in
+/// that serialization order — `serde` writes struct fields in declaration order
+/// and [`Form::fields`] lists the same order — so the wire document is the
+/// recovered one.  The original's *memory* layout was different; the offsets in
+/// the comments are that layout.
 ///
 /// `// UNKNOWN:` the field types of the recovered 16-byte slots (`rearm`,
 /// `cooldown`).  They are modelled as `String`; everything at a 24-byte offset is
 /// a `String`, the tail flags are `bool`s and `seconds`/`times`/`volume` are
 /// numbers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
+// The page sends the form's fields next to the `"t"` tag (`In::HighlightSave`
+// flattens it), so a missing field must default rather than fail the parse.
+#[serde(default)]
 pub struct Form {
-    pub rearm: String,        // +0x00
-    pub cooldown: String,     // +0x10
     pub category: String,     // +0x20
     pub find: String,         // +0x38
-    pub color: String,        // +0x50
-    pub background: String,   // +0x68
-    pub substitute: String,   // +0x80
-    pub sound: String,        // +0x98
-    pub send: String,         // +0xb0
-    pub timer: String,        // +0xc8
-    pub caught: String,       // +0xe0
-    pub down: String,         // +0xf8
-    pub list: String,         // +0x110
-    pub rumble: String,       // +0x128
-    pub picture: String,      // +0x140
-    pub characters: String,   // +0x158
-    pub stream: String,       // +0x170
-    pub alert: String,        // +0x188
-    pub notify: String,       // +0x1a0
-    pub push: String,         // +0x1b8
-    pub flag: String,         // +0x1d0
-    pub status: String,       // +0x1f8
-    pub speak: String,        // +0x220
-    pub when: String,         // +0x238
-    pub seconds: u32,         // +0x270
-    pub times: u32,           // +0x278
-    pub volume: u16,          // +0x280
     pub pattern: bool,        // +0x282
     pub case_sensitive: bool, // +0x283
     pub whole_word: bool,     // +0x284
+    pub color: String,        // +0x50
+    pub background: String,   // +0x68
     pub line: bool,           // +0x285
     pub squelch: bool,        // +0x286
+    pub substitute: String,   // +0x80
+    pub sound: String,        // +0x98
+    pub alert: String,        // +0x188
+    pub notify: String,       // +0x1a0
+    pub push: String,         // +0x1b8
+    pub send: String,         // +0xb0
+    pub when: String,         // +0x238
+    pub rearm: String,        // +0x00
+    pub timer: String,        // +0xc8
+    pub seconds: u32,         // +0x270
+    pub caught: String,       // +0xe0
+    pub times: u32,           // +0x278
+    pub down: String,         // +0xf8
+    pub list: String,         // +0x110
+    pub flag: String,         // +0x1d0
+    pub status: String,       // +0x1f8
+    pub rumble: String,       // +0x128
+    pub picture: String,      // +0x140
+    pub cooldown: String,     // +0x10
+    pub volume: u16,          // +0x280
+    pub speak: String,        // +0x220
+    pub characters: String,   // +0x158
+    pub stream: String,       // +0x170
     pub off: bool,            // +0x287
 }
 
@@ -230,50 +240,12 @@ impl Form {
     }
 
     /// Read a `Form` out of an `In::HighlightSave` message.
+    ///
+    /// The page splices the form's fields next to the `"t"` tag, so the message
+    /// *is* a form document apart from that tag (which the derived
+    /// `Deserialize` ignores).  Missing fields default (`#[serde(default)]`).
     pub fn from_value(v: &Value) -> Result<Form, String> {
-        let s = |key: &str| {
-            v.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        let b = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
-        let n = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
-        Ok(Form {
-            rearm: s("rearm"),
-            cooldown: s("cooldown"),
-            category: s("category"),
-            find: s("find"),
-            color: s("color"),
-            background: s("background"),
-            substitute: s("substitute"),
-            sound: s("sound"),
-            send: s("send"),
-            timer: s("timer"),
-            caught: s("caught"),
-            down: s("down"),
-            list: s("list"),
-            rumble: s("rumble"),
-            picture: s("picture"),
-            characters: s("characters"),
-            stream: s("stream"),
-            alert: s("alert"),
-            notify: s("notify"),
-            push: s("push"),
-            flag: s("flag"),
-            status: s("status"),
-            speak: s("speak"),
-            when: s("when"),
-            seconds: n("seconds") as u32,
-            times: n("times") as u32,
-            volume: n("volume") as u16,
-            pattern: b("pattern"),
-            case_sensitive: b("case_sensitive"),
-            whole_word: b("whole_word"),
-            line: b("line"),
-            squelch: b("squelch"),
-            off: b("off"),
-        })
+        serde_json::from_str(&v.to_json()).map_err(|e| e.to_string())
     }
 
     /// Build the form for a stored rule (`0x1002c6914`).
@@ -411,6 +383,32 @@ impl HighlightFile {
             .get(category)
             .map(|rules| rules.iter().filter(|r| !r.off).count() as u32)
             .unwrap_or(0)
+    }
+}
+
+impl HighlightFile {
+    /// Remove a rule by pattern (`HighlightFile::remove` / `In::HighlightRemove`).
+    pub fn remove(&mut self, name: &str) -> bool {
+        for rules in self.categories.values_mut() {
+            if let Some(at) = rules.iter().position(|r| r.pattern == name) {
+                rules.remove(at);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Switch a rule on or off (`HighlightFile::switch` / `In::HighlightSwitch`).
+    ///
+    /// `on` is the page's word: `false` sets the rule's `off` flag.
+    pub fn switch(&mut self, name: &str, on: bool) -> bool {
+        for rules in self.categories.values_mut() {
+            if let Some(rule) = rules.iter_mut().find(|r| r.pattern == name) {
+                rule.off = !on;
+                return true;
+            }
+        }
+        false
     }
 }
 

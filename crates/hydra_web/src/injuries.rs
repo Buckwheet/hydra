@@ -16,7 +16,8 @@ use crate::wire::object;
 /// `// UNKNOWN:` the numeric field types.  The original stored them 4, 8, 12 and
 /// 16 bytes apart, so they are modelled as `u32` except `letter`, which needs a
 /// string.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShapeOut {
     Circle { c: u32, r: u32 },
     Line { a: u32, b: u32, w: u32 },
@@ -63,6 +64,7 @@ impl ShapeOut {
 
 /// One body part: `shape, id, name, anchor` (recovered order).
 #[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PartOut {
     pub shape: ShapeOut,
     pub id: u32,
@@ -85,6 +87,7 @@ impl PartOut {
 ///
 /// `aspect` is the recovered `f32` `0.75` stored at `+0x18` of `DollOut`.
 #[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DollOut {
     pub parts: Vec<PartOut>,
     pub aspect: f32,
@@ -104,6 +107,7 @@ impl DollOut {
 
 /// One injury row: `id, name, token, rank`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct InjuryOut {
     pub id: String,
     pub name: String,

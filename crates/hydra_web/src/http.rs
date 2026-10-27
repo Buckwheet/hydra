@@ -3,9 +3,16 @@
 //!
 //! The original used `tokio` to read the request head off the accepted socket,
 //! upgraded to a websocket (via `tokio-tungstenite`) when the request asked for
-//! it, and otherwise served one asset.  This is the `std`-only model of that:
-//! the request head is parsed from a `&str`, and the response bytes are built
-//! exactly as the binary's format strings described them.
+//! it, and otherwise served one asset.  Both halves are here:
+//!
+//! * the *bytes* are recovered from the binary's format strings and stay
+//!   [`switching`]/[`respond`], and [`request`]/[`read_head`] are the same
+//!   synchronous parsers as before;
+//! * the *I/O* is real: [`read_head_async`] reads the head off a tokio stream
+//!   and [`handshake`] answers it with exactly those bytes, while
+//!   [`accept_websocket`] hands the stream to `tokio-tungstenite` for the
+//!   protocol layer.  The accept key is `tungstenite`'s own
+//!   (`handshake::derive_accept_key`), which is the crate the original linked.
 //!
 //! Recovered literals (`__cstring`):
 //!
@@ -107,15 +114,109 @@ pub fn read_head(bytes: &[u8]) -> Option<usize> {
         .map(|at| at + 4)
 }
 
+// ---------------------------------------------------------------------------
+// The async side (tokio + tokio-tungstenite)
+// ---------------------------------------------------------------------------
+
+/// Largest request head [`read_head_async`] buffers before giving up.
+pub const MAX_HEAD: usize = 16 * 1024;
+
+/// Read one request head off an async stream.
+///
+/// This is the recovered `http::read_head` (a `tokio::time::timeout` around a
+/// socket reader) with the timeout left to the caller: the answer is everything
+/// up to **and including** the blank line.  `Ok(None)` means the peer closed
+/// before the head was complete; `Err` means the socket failed or the head grew
+/// past [`MAX_HEAD`].
+///
+/// As in the original, bytes after the head are not kept: a websocket client
+/// waits for the `101` before it sends its first frame.
+pub async fn read_head_async<S>(stream: &mut S) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if let Some(end) = read_head(&head) {
+            head.truncate(end);
+            return Ok(Some(head));
+        }
+        if head.len() > MAX_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the request head is longer than {MAX_HEAD} bytes"),
+            ));
+        }
+    }
+}
+
+/// Answer a websocket handshake on an accepted stream.
+///
+/// The recovered flow (`http::read_head` → `http::request` → `http::answer`):
+/// read the head, parse it with [`request`], and — when the page asked for the
+/// upgrade — write [`switching`] carrying [`accept_key`]'s answer.  Returns the
+/// `Sec-WebSocket-Accept` value that was sent; `Ok(None)` means the request was
+/// not a websocket handshake (a plain `GET`, so the caller serves an asset) or
+/// the peer hung up first.
+pub async fn handshake<S>(stream: &mut S) -> std::io::Result<Option<String>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let Some(head) = read_head_async(stream).await? else {
+        return Ok(None);
+    };
+    // The head is ASCII by definition (`request` only looks for `\r\n`, `':'`,
+    // `' '` and ASCII header names), so a lossy decode cannot change the parse.
+    let text = String::from_utf8_lossy(&head);
+    let Some(request) = request(&text) else {
+        return Ok(None);
+    };
+    let Some(key) = request.key.as_deref() else {
+        return Ok(None);
+    };
+    let accept = accept_key(key);
+    stream.write_all(&switching(&accept)).await?;
+    stream.flush().await?;
+    Ok(Some(accept))
+}
+
+/// Hand an accepted stream to `tokio-tungstenite` for the protocol layer.
+///
+/// The original upgraded through `tokio_tungstenite::accept_async`; that is what
+/// this is, with the recovered types kept on this side (the stream itself is the
+/// caller's).  The relay that drives the resulting socket is
+/// [`crate::client::relay`].
+pub async fn accept_websocket<S>(
+    stream: S,
+) -> Result<tokio_tungstenite::WebSocketStream<S>, tungstenite::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio_tungstenite::accept_async(stream).await
+}
+
 /// The websocket GUID from RFC 6455, as used by the original's handshake.
 pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// `base64(sha1(key + WS_GUID))` — the `Sec-WebSocket-Accept` value.
+///
+/// The recovered handshake is exactly RFC 6455's; `tungstenite` — the crate the
+/// original linked — computes it as `handshake::derive_accept_key`, which is
+/// what this calls.  [`sha1`] + [`base64()`] are kept because the recovered
+/// template spells the computation out and the tests pin both halves; a test
+/// asserts the two agree for the RFC 6455 vector.
 pub fn accept_key(key: &str) -> String {
-    let mut buf = String::with_capacity(key.len() + WS_GUID.len());
-    buf.push_str(key);
-    buf.push_str(WS_GUID);
-    base64(&sha1(buf.as_bytes()))
+    tungstenite::handshake::derive_accept_key(key.as_bytes())
 }
 
 /// The `101 Switching Protocols` handshake response, byte for byte the
@@ -205,32 +306,9 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
-/// Standard (padded) base64, the alphabet the original's `base64` crate used.
+/// Standard (padded) base64 — the `base64` crate the original linked.
 pub fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
 }
 
 #[cfg(test)]
@@ -323,5 +401,115 @@ mod tests {
     fn read_head_finds_the_blank_line() {
         assert_eq!(read_head(HEAD.as_bytes()), Some(HEAD.len()));
         assert_eq!(read_head(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    /// The hand-rolled accept key and `tungstenite`'s must agree on the RFC 6455
+    /// vector (the recovered template's value).
+    #[test]
+    fn accept_key_agrees_with_tungstenite() {
+        let mut buf = String::new();
+        buf.push_str("dGhlIHNhbXBsZSBub25jZQ==");
+        buf.push_str(WS_GUID);
+        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), base64(&sha1(buf.as_bytes())));
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            tungstenite::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_head_async_waits_for_the_blank_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut client) = tokio::io::duplex(4096);
+        let head = HEAD.to_string();
+        tokio::spawn(async move {
+            // Two writes: the reader must not answer on a partial head.
+            let (first, second) = head.split_at(head.len() / 2);
+            client.write_all(first.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            client.write_all(second.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+        });
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_head_async(&mut server),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a head");
+        assert_eq!(String::from_utf8(bytes).unwrap(), HEAD);
+    }
+
+    #[tokio::test]
+    async fn read_head_async_reports_a_closed_peer() {
+        let (mut server, client) = tokio::io::duplex(64);
+        drop(client);
+        assert_eq!(read_head_async(&mut server).await.unwrap(), None);
+    }
+
+    /// The recovered `101` bytes, on the wire, accepted by a real websocket
+    /// client (`tokio-tungstenite`): the client verifies the accept key itself,
+    /// so a wrong key or a wrong header name fails the handshake.
+    #[tokio::test]
+    async fn handshake_bytes_are_accepted_by_tungstenites_client() {
+        use tungstenite::client::IntoClientRequest;
+
+        let (mut server, client) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let request = "ws://localhost/".into_client_request().unwrap();
+            tokio_tungstenite::client_async(request, client).await
+        });
+        let accept = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handshake(&mut server),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let accept = accept.expect("the handshake was answered");
+        // 28 base64 characters for the 20-byte SHA-1 digest.
+        assert_eq!(accept.len(), 28, "{accept}");
+        // `client_async` verifies `Sec-WebSocket-Accept` against its own key, so
+        // reaching here means our recovered bytes were accepted.
+        let (socket, response) = peer.await.unwrap().expect("the client accepted our 101");
+        assert_eq!(response.status(), 101);
+        drop(socket);
+    }
+
+    #[tokio::test]
+    async fn a_plain_get_gets_no_101() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(handshake(&mut server).await.unwrap(), None);
+    }
+
+    /// `tokio-tungstenite`'s own handshake over a local TCP pair.
+    #[tokio::test]
+    async fn accept_websocket_over_a_local_tcp_pair() {
+        use tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = "ws://localhost/".into_client_request().unwrap();
+            tokio_tungstenite::client_async(request, stream).await
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let server = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accept_websocket(stream),
+        )
+        .await
+        .unwrap();
+        assert!(server.is_ok(), "{:?}", server.err());
+        assert!(peer.await.unwrap().is_ok());
     }
 }

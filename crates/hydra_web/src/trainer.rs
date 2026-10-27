@@ -8,6 +8,7 @@ use crate::json::Value;
 
 /// One trainable skill (`SkillOut`): `section, name, cost, has, goal, id`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SkillOut {
     pub section: String,
     pub name: String,
@@ -33,6 +34,7 @@ impl SkillOut {
 /// The skill sheet header (`SheetOut`): `title, physical, mental, skills,
 /// changed`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SheetOut {
     pub title: String,
     pub physical: String,
@@ -55,6 +57,7 @@ impl SheetOut {
 
 /// The whole trainer panel (`TrainerOut`): `profiles, said, sheet, busy`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TrainerOut {
     pub profiles: Vec<String>,
     pub said: String,

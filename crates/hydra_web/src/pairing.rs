@@ -71,8 +71,8 @@ pub fn pairing(root: &Path) -> Result<String, String> {
 
 /// 32 random bytes, lowercase hex — the token generator.
 ///
-/// The original called `getrandom`; this reads `/dev/urandom` and falls back to
-/// a clock/pid seeded xorshift so the crate stays `std`-only.
+/// The original called `getrandom`, which is **not** a workspace pin, so this
+/// reads `/dev/urandom` and falls back to a clock/pid seeded xorshift.
 pub fn fresh_token() -> Result<String, String> {
     let bytes = random_bytes()?;
     let mut out = String::with_capacity(TOKEN_LEN);

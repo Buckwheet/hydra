@@ -66,8 +66,14 @@ impl Parser {
             }
             return Vec::new();
         }
-        if trimmed.starts_with("<settings") {
-            if !trimmed.contains("</settings") {
+        // Only the exact `<settings ...>` / `<settings>` forms start a
+        // settings block; `<settingsInfo>` is a different tag.
+        if trimmed.starts_with("<settings ") || trimmed.starts_with("<settings>") {
+            let self_closing = trimmed
+                .find('>')
+                .map(|end| trimmed[..end].trim_end().ends_with('/'))
+                .unwrap_or(false);
+            if !self_closing && !trimmed.contains("</settings") {
                 self.in_settings = true;
             }
             return Vec::new();
@@ -353,6 +359,8 @@ mod tests {
     fn settings_lines_are_suppressed() {
         let mut parser = Parser::new();
         assert!(parser.parse_line("<settingsInfo/>").is_empty());
+        // `<settingsInfo/>` must not poison the following line.
+        assert_eq!(first_text(&parser.parse_line("visible")).plain(), "visible");
         assert!(parser.parse_line("<settings>").is_empty());
         assert!(parser.parse_line("{\"still\":\"settings\"}").is_empty());
         assert!(parser.parse_line("</settings>").is_empty());

@@ -7,7 +7,8 @@
 //! part of this reconstruction.  What *is* recovered here is the wording — every
 //! message below was read out of `__TEXT` at the address in its doc comment,
 //! together with the argument count and order the original's `format_inner`
-//! calls pass — plus the shape of the global walk registry.
+//! calls pass — plus the shape of the global walk registry, whose cancellation
+//! is the original's real `tokio_util::sync::CancellationToken`.
 //!
 //! So this module is the command's **answer builder**: the callers hand it the
 //! resolved route data and get back the line Hydra types into the game.
@@ -16,6 +17,8 @@ pub mod sea;
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::pages;
 
@@ -476,9 +479,18 @@ impl Claim {
     /// **ESTABLISHED** (`travel_command::stop_walk`, `0x101223c80`): the same
     /// registry statics as [`Claim::take`], and the answer text comes from
     /// `travel_command::ended`.
+    ///
+    /// The cancellation itself is the real thing the original did: the walk's
+    /// [`CancellationToken`] (see [`claim_token`]) is cancelled first, so a walk
+    /// that is awaiting `token.cancelled()` stops, and the claim is then marked
+    /// `cancelled` for the recovered answer text.
     pub fn stop_walk(who: &str) -> Option<Claim> {
+        let key = claim_key(who);
+        if let Some(token) = tokens().lock().unwrap().get(&key) {
+            token.cancel();
+        }
         let mut claims = claims().lock().unwrap();
-        match claims.get_mut(&claim_key(who)) {
+        match claims.get_mut(&key) {
             None => None,
             Some(claim) => {
                 claim.cancelled = true;
@@ -499,6 +511,54 @@ pub fn claim_key(who: &str) -> String {
 fn claims() -> &'static Mutex<BTreeMap<String, Claim>> {
     static CLAIMS: LazyLock<Mutex<BTreeMap<String, Claim>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
     &CLAIMS
+}
+
+/// The live cancellation token of `who`'s walk, creating it on first use.
+///
+/// **ESTABLISHED**: the claim registry is a `Mutex<HashMap>` sitting next to a
+/// `CancellationToken` (`0x104586b90`, `0x104586b98`, `0x104586bd8`), and
+/// `set_sail` (`0x101223430`) clones that token (`0x101d378b4`) when it replaces
+/// the claim.  [`Claim`] keeps the recovered *value* shape (`cancelled`,
+/// `token`); the token a walk actually awaits is this
+/// `tokio_util::sync::CancellationToken`, which [`Claim::stop_walk`] cancels.
+///
+/// A token that has already been cancelled is replaced by a fresh one, so the
+/// next walk for the same character starts live.
+///
+/// A walk loop waits on it with
+/// `claim_token(who).cancelled().await` inside its `select!`.
+pub fn claim_token(who: &str) -> CancellationToken {
+    let mut tokens = tokens().lock().unwrap();
+    let token = tokens.entry(claim_key(who)).or_default();
+    if token.is_cancelled() {
+        *token = CancellationToken::new();
+    }
+    token.clone()
+}
+
+/// Whether `who`'s walk has been stopped.
+///
+/// True once [`Claim::stop_walk`] has cancelled the walk's real token (or once
+/// the claim itself is marked `cancelled`).
+pub fn stopped(who: &str) -> bool {
+    let key = claim_key(who);
+    if let Some(token) = tokens().lock().unwrap().get(&key) {
+        if token.is_cancelled() {
+            return true;
+        }
+    }
+    claims()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|claim| claim.cancelled)
+        .unwrap_or(false)
+}
+
+fn tokens() -> &'static Mutex<BTreeMap<String, CancellationToken>> {
+    static TOKENS: LazyLock<Mutex<BTreeMap<String, CancellationToken>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    &TOKENS
 }
 
 /// What the game said about the gigas way.
@@ -743,6 +803,40 @@ mod tests {
         let taken = Claim::take("aelith").expect("still there");
         assert!(taken.cancelled);
         assert_eq!(Claim::take("aelith"), None);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_walk_cancels_the_real_cancellation_token() {
+        let who = "Tokenwalker";
+        let _ = Claim::take(who);
+        Claim::set_out(Claim {
+            who: who.to_string(),
+            cancelled: false,
+            token: 0,
+        });
+        assert!(!stopped(who));
+        let token = claim_token(who);
+        assert!(!token.is_cancelled(), "a fresh walk starts live");
+        let waiting = token.clone();
+        let walking = tokio::spawn(async move {
+            waiting.cancelled().await;
+        });
+        assert!(!walking.is_finished(), "nothing has cancelled it yet");
+
+        let stopped_claim = stop_walk(who).expect("claim");
+        assert!(stopped_claim.cancelled);
+        // The walk that was awaiting the token finishes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), walking)
+            .await
+            .expect("the token is cancelled")
+            .expect("the walking task finished");
+        assert!(token.is_cancelled());
+        assert!(stopped(who));
+
+        // The next walk for the same character gets a live token again.
+        let _ = Claim::take(who);
+        assert!(!claim_token(who).is_cancelled());
+        assert!(!stopped(who));
     }
 
     #[test]

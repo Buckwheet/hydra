@@ -2,7 +2,6 @@
 pub mod account;
 pub mod commands;
 pub mod inventory_command;
-pub mod json;
 pub mod ledger;
 pub mod lich_command;
 pub mod pages;
@@ -16,7 +15,9 @@ pub mod table;
 pub mod teams;
 pub mod travel_command;
 
-/* unresolved symbols (trait impls, closures, generics):
+/* Unresolved symbols in the binary (trait impls, closures, generics) — these four
+   are the `serde` visitors of the two files, which are real `derive`s again now
+   that `serde`/`serde_json` are reconnected (Phase 1, see NOTES.md §5):
  <hydra_table::teams::_::<impl serde_core::de::Deserialize for hydra_table::teams::File>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001012148dc
  <hydra_table::teams::_::<impl serde_core::de::Deserialize for hydra_table::teams::Team>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001012148f0
  <hydra_table::roster::_::<impl serde_core::de::Deserialize for hydra_table::roster::File>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x00000001012a7218

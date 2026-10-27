@@ -1,8 +1,8 @@
 //! `teams.json` — the teams of accounts that play together.
 //!
 //! Recovered from `hydra_table::teams` (`0x101212e34` … `0x1012148dc`).  Same
-//! shape as `roster.json`: `{"schema_version":1,"teams":{…}}`, with the key
-//! `name.trim().to_lowercase()`.
+//! shape as `roster.json`, and the same real `serde`/`serde_json` document:
+//! `{"schema_version":1,"teams":{…}}`, with the key `name.trim().to_lowercase()`.
 //!
 //! A team is a **set of accounts**, each of which brings one character, and no
 //! two members may share an account — "… are on one account, which plays one at
@@ -13,7 +13,8 @@ use std::io;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
-use crate::json;
+use serde::{Deserialize, Serialize};
+
 use crate::roster;
 
 /// The file name inside the data directory.
@@ -43,17 +44,24 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The serde name `members` survives in the `expecting` string at
 /// `0x102407440`; `name` and `favourite` are read from the same declaration
 /// order `roster::Entry` uses.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Team {
     pub name: String,
+    /// Written in list order; a file without it reads as an empty team.
+    #[serde(default)]
     pub members: Vec<String>,
+    #[serde(default)]
     pub favourite: bool,
 }
 
 /// The whole `teams.json`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct File {
+    /// Written first, and stamped to [`SCHEMA_VERSION`] by [`save`].
+    #[serde(default)]
     pub schema_version: u32,
+    /// Written second, in `BTreeMap` (key) order.
+    #[serde(default)]
     pub teams: BTreeMap<String, Team>,
 }
 
@@ -64,60 +72,6 @@ impl Team {
     /// `<str>::to_lowercase` before the map lookup.
     pub fn key(&self) -> String {
         key(&self.name)
-    }
-
-    fn write_json(&self, out: &mut String) {
-        out.push('{');
-        out.push_str("\"name\":");
-        json::write_text(out, &self.name);
-        out.push_str(",\"members\":[");
-        for (at, member) in self.members.iter().enumerate() {
-            if at > 0 {
-                out.push(',');
-            }
-            json::write_text(out, member);
-        }
-        out.push(']');
-        out.push_str(",\"favourite\":");
-        out.push_str(if self.favourite { "true" } else { "false" });
-        out.push('}');
-    }
-
-    fn from_json(value: &json::Value) -> Option<Team> {
-        let map = value.object()?;
-        let mut members = Vec::new();
-        if let Some(json::Value::Array(items)) = map.get("members") {
-            for item in items {
-                members.push(item.text()?.to_string());
-            }
-        }
-        Some(Team {
-            name: map.get("name")?.text()?.to_string(),
-            members,
-            favourite: map
-                .get("favourite")
-                .and_then(|v| v.bool())
-                .unwrap_or(false),
-        })
-    }
-}
-
-impl File {
-    fn from_json(value: &json::Value) -> Option<File> {
-        let map = value.object()?;
-        let mut teams = BTreeMap::new();
-        if let Some(items) = map.get("teams").and_then(|v| v.object()) {
-            for (name, team) in items {
-                teams.insert(name.clone(), Team::from_json(team)?);
-            }
-        }
-        Some(File {
-            schema_version: map
-                .get("schema_version")
-                .and_then(|v| v.u32())
-                .unwrap_or(0),
-            teams,
-        })
     }
 }
 
@@ -145,38 +99,36 @@ pub fn load(dir: &Path) -> Result<File, io::Error> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(File::default()),
         Err(error) => return Err(error),
     };
-    match json::parse(&text) {
-        Ok(value) => File::from_json(&value).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: bad teams"))
-        }),
-        Err(error) => Err(io::Error::new(
+    serde_json::from_str::<File>(&text).map_err(|error| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: {}", path.display(), error),
-        )),
-    }
+        )
+    })
 }
 
 /// Write `dir/teams.json`, creating the directory first.
 pub fn save(dir: &Path, file: &mut File) -> Result<(), io::Error> {
     file.schema_version = SCHEMA_VERSION;
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(FILE_NAME), to_json(file))
+    let path = dir.join(FILE_NAME);
+    let text = serde_json::to_string(file).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {}", path.display(), error),
+        )
+    })?;
+    std::fs::write(path, text)
 }
 
 /// The serialised form of `file`.
+///
+/// **ESTABLISHED**: the recovered writer is `serde_json::to_string(&file)` —
+/// `{"schema_version":N,"teams":{…}}`, teams in `BTreeMap` order, `serde_json`'s
+/// escapes.  `File` is plain data, so the serialisation cannot fail; the
+/// `Result` is flattened rather than panicking.
 pub fn to_json(file: &File) -> String {
-    let mut out = String::new();
-    json::write_file(&mut out, SCHEMA_VERSION, "teams", |out| {
-        for (at, (name, team)) in file.teams.iter().enumerate() {
-            if at > 0 {
-                out.push(',');
-            }
-            json::write_text(out, name);
-            out.push(':');
-            team.write_json(out);
-        }
-    });
-    out
+    serde_json::to_string(file).unwrap_or_default()
 }
 
 /// Every team, ordered by key.
@@ -391,6 +343,68 @@ mod tests {
     fn a_missing_file_is_an_empty_file() {
         let file = load(&dir("missing")).expect("load");
         assert_eq!(file, File::default());
+    }
+
+    #[test]
+    fn the_file_round_trips_through_serde() {
+        let mut file = File {
+            schema_version: SCHEMA_VERSION,
+            teams: BTreeMap::new(),
+        };
+        for crew in [
+            Team {
+                name: "Crew".to_string(),
+                members: vec!["alpha".to_string(), "beta".to_string()],
+                favourite: true,
+            },
+            Team {
+                name: "Alts \"and\" mains".to_string(),
+                members: Vec::new(),
+                favourite: false,
+            },
+        ] {
+            file.teams.insert(crew.key(), crew);
+        }
+        let text = to_json(&file);
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"schema_version":1,"teams":{"#,
+                r#""alts \"and\" mains":{"name":"Alts \"and\" mains","members":[],"favourite":false},"#,
+                r#""crew":{"name":"Crew","members":["alpha","beta"],"favourite":true}}}"#,
+            )
+        );
+        // `BTreeMap` key order, whatever the insertion order was.
+        let alts = text.find("alts").expect("alts");
+        let crew = text.find("crew").expect("crew");
+        assert!(alts < crew);
+        let back: File = serde_json::from_str(&text).expect("read back");
+        assert_eq!(back, file);
+    }
+
+    #[test]
+    fn a_saved_file_is_the_recovered_document() {
+        let dir = dir("serde_save");
+        roster::record(&dir, &roster_entry("Aelith", "alpha")).expect("record");
+        let mut file = File {
+            schema_version: 0,
+            teams: BTreeMap::new(),
+        };
+        file.teams
+            .insert("crew".to_string(), team("Crew", &["alpha", "beta"]));
+        save(&dir, &mut file).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE_NAME)).expect("file"),
+            r#"{"schema_version":1,"teams":{"crew":{"name":"Crew","members":["alpha","beta"],"favourite":false}}}"#
+        );
+        // A broken file is an `InvalidData` error naming the path, exactly as
+        // `roster::load` does.
+        std::fs::write(dir.join(FILE_NAME), "{\"teams\": 3}").expect("write");
+        let error = load(&dir).expect_err("bad shape");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .starts_with(&format!("{}: ", dir.join(FILE_NAME).display())));
     }
 
     #[test]

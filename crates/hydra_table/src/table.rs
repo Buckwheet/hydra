@@ -185,8 +185,10 @@ impl Table {
     /// calls `hydra_host::Host::on` (`0x1013b054c`) before `Table::with_host`
     /// (`0x101293f78`).
     ///
-    /// **Departure**: the runtime handle is `hydra_host::Handle`, since `tokio` is
-    /// not available.
+    /// **Departure**: the runtime handle is the `hydra_host::Handle` seam
+    /// (`hydra_host` is L3b and not linked here), not a `tokio` value — `tokio`
+    /// itself is back (`session::spawn_supervised_with` is the real spawn), it is
+    /// the host crate that is still missing.
     pub fn with_game_runtime(sessions: Sessions, account: &str) -> Table {
         Table {
             sessions,
@@ -412,6 +414,30 @@ mod tests {
         });
         assert!(table.seated(" aelith "));
         assert!(!table.running("aelith"), "no session is live in this build");
+    }
+
+    #[test]
+    fn a_password_is_forgotten_under_its_environment_name() {
+        let _keychain = crate::account::test_keychain::install();
+        account::keep("Aelith", "hunter2").expect("keep");
+        assert_eq!(
+            account::test_keychain::password(account::KEYCHAIN_SERVICE, "aelith").as_deref(),
+            Some("hunter2")
+        );
+        assert_eq!(
+            forget_password("Aelith"),
+            "HYDRA_PASSWORD_AELITH is forgotten."
+        );
+        assert!(!account::saved("Aelith"));
+        // UNKNOWN wording: the answer names the variable, and the reason is the
+        // keyring's own `NoEntry` message.
+        assert_eq!(
+            forget_password("Aelith"),
+            format!(
+                "HYDRA_PASSWORD_AELITH is not forgotten: {}",
+                keyring::Error::NoEntry
+            )
+        );
     }
 
     #[test]

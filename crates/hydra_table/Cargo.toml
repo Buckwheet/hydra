@@ -8,3 +8,25 @@ hydra_protocol = { path = "../hydra_protocol" }
 hydra_session = { path = "../hydra_session" }
 hydra_net = { path = "../hydra_net" }
 hydra_model = { path = "../hydra_model" }
+
+# Phase 1 reconnection: the crates the original linked, all pinned in the
+# workspace root and used through `cargo --offline`.
+#
+# * `serde`/`serde_json` replace the hand-written `src/json.rs`: `roster.json`
+#   and `teams.json` are the real `Serialize`/`Deserialize` documents the
+#   binary wrote (`serde_core::ser::SerializeMap::serialize_entry` at
+#   `0x10129c9b4` and `0x10129d000`).
+# * `keyring` is the OS keychain `account::{keep,kept,forget}` used (service
+#   `hydra`, user `account.trim().to_lowercase()`).  The binary is an arm64
+#   Mach-O macOS program, so `apple-native` is the store it linked; without
+#   that feature `keyring` 3.6.3 falls back to its `mock` store, which keeps
+#   nothing between two `Entry::new` calls.
+# * `rpassword` is `account::password`'s no-echo prompt.
+# * `tokio` is the spawn in `session` (and the runtime `#[tokio::test]` needs);
+#   `tokio-util` is the `CancellationToken` the travel walk claims hold.
+serde = { workspace = true }
+serde_json = { workspace = true }
+keyring = { workspace = true, features = ["apple-native"] }
+rpassword = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

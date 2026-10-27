@@ -7,6 +7,11 @@
 //! connection (`hydra_net::behind::Live::new`) and the combat tracker, then spawns
 //! a `tokio` task — none of which survives as one call.  What is recovered here is
 //! the order of the steps and the two player-log messages.
+//!
+//! The last step's **spawn is real again**: [`spawn_supervised_with`] runs
+//! [`supervised_with`] on a `tokio` task and [`supervised_with_async`] awaits it,
+//! while the synchronous entry point stays exactly as it was for the callers that
+//! have no runtime.  See `NOTES.md` §5 for what is still missing from the body.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -96,10 +101,13 @@ pub struct Supervised {
 /// 5. `hydra_net::sink::writer::SessionSink::create`, `player_log::channel::
 ///    PlayerLog::new`, `hydra_net::behind::Live::new` and a `tokio` spawn.
 ///
-/// **Departure**: steps 3–5 are not performed.  The four arguments the original
-/// takes (`&String`, `&String`, `&str` and an `Arc` out of the table at `+0x50`)
-/// identify the seat; this takes the account and the character and reports the
-/// directories and the crit-table state the caller needs to continue.
+/// **Departure**: steps 3 and 5 are not performed.  The four arguments the
+/// original takes (`&String`, `&String`, `&str` and an `Arc` out of the table at
+/// `+0x50`) identify the seat; this takes the account and the character and
+/// reports the directories and the crit-table state the caller needs to
+/// continue.  The `tokio` spawn of step 5 is available separately — see
+/// [`spawn_supervised_with`] — because this function is the synchronous entry
+/// point the other crates call.
 pub fn supervised_with(account: &str, character: &str) -> Supervised {
     let data_dir = crate::account::data_dir();
     let log_dir = hydra_net::sink::config::log_dir();
@@ -120,6 +128,43 @@ pub fn supervised_with(account: &str, character: &str) -> Supervised {
         crit: crit_tables().is_some(),
         notices,
     }
+}
+
+/// Run [`supervised_with`] on a `tokio` task — the recovered step 5's spawn.
+///
+/// **ESTABLISHED** (`session::supervised_with`, `0x1011cbb90`): the last thing
+/// the original did was spawn a `tokio` task to run the session.  That spawn is
+/// real again: this returns the task's handle, and the body runs on the blocking
+/// pool because the reconstruction of the bootstrap is synchronous.
+///
+/// What the task still does *not* do is what the original's task did after the
+/// directories were built — `hydra_net::sink::writer::SessionSink::create`,
+/// `hydra_session::player_log::channel::PlayerLog::new`,
+/// `hydra_net::behind::Live::new` and the relay.  Those are the parts of
+/// `hydra_net`/`hydra_session` that have no runnable form yet.
+///
+/// # Panics
+///
+/// The returned handle reports a panic in the body, as any `JoinHandle` does.
+pub fn spawn_supervised_with(
+    account: &str,
+    character: &str,
+) -> tokio::task::JoinHandle<Supervised> {
+    let account = account.to_string();
+    let character = character.to_string();
+    tokio::task::spawn_blocking(move || supervised_with(&account, &character))
+}
+
+/// [`spawn_supervised_with`], awaited.
+///
+/// # Panics
+///
+/// Panics if the spawned body panicked; the panic is re-raised with the task's
+/// own message rather than swallowed.
+pub async fn supervised_with_async(account: &str, character: &str) -> Supervised {
+    spawn_supervised_with(account, character)
+        .await
+        .expect("the supervised task ran to completion")
 }
 
 /// The account a sink belongs to, as the redactions module reports it.
@@ -151,6 +196,18 @@ mod tests {
         assert!(!supervised.date.is_empty());
         assert_eq!(supervised.stamp.len(), 19, "YYYY-MM-DD_HH-MM-SS");
         assert!(supervised.crit);
+    }
+
+    #[tokio::test]
+    async fn the_session_bootstrap_runs_on_a_tokio_task() {
+        let supervised = supervised_with_async("main", "Aelith").await;
+        let handle = spawn_supervised_with("main", "Aelith");
+        let from_task = handle.await.expect("the spawned session");
+        // The spawn is real, and the answer is the same either way.
+        assert_eq!(from_task.data_dir, supervised.data_dir);
+        assert_eq!(from_task.log_dir, supervised.log_dir);
+        assert_eq!(from_task.stamp.len(), 19, "YYYY-MM-DD_HH-MM-SS");
+        assert!(from_task.crit);
     }
 
     #[test]

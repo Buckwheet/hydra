@@ -2,3 +2,21 @@
 name = "hydra_host"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Phase 1 reconnection: the crates the original linked, pinned in the workspace
+# root and used through `cargo --offline`.
+#
+# * `tokio` is the runtime seam: `Host+0x00` is `Option<tokio::runtime::Handle>`,
+#   `Hosted+0xa0` is a `tokio::task::JoinHandle`, and `Hosted::stop` is the
+#   recovered `async fn` over `tokio::time::timeout` + `AbortHandle::abort`.
+# * `tokio-util` is the `CancellationToken` at `Hosted+0x98`
+#   (`CancellationToken::cancel` @0x10006c180).
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` (the abort test) needs tokio's
+# `test-util` feature; it is not part of the workspace's `full` pin, so it is
+# added here rather than in the root manifest (which this crate must not edit).
+tokio = { workspace = true, features = ["test-util"] }

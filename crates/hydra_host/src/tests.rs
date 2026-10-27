@@ -1,40 +1,49 @@
 //! Tests for the recovered `hydra_host` API.
 //!
 //! Every expected value is either read out of the binary (layout, message text,
-//! ordering) or follows from the recovered control flow.  The two "still
-//! running" tests use a channel to hold a thread open, so they are
-//! deterministic; every wait is bounded and asserts its bound.
+//! ordering) or follows from the recovered control flow.  Phase 1 runs them on a
+//! real `tokio` runtime: the "still running" tests hold a session future open on
+//! a `oneshot` channel (so no runtime thread is ever blocked), and every wait is
+//! bounded by [`until`], which yields to the runtime instead of sleeping.
 
 use super::*;
 use std::mem::{offset_of, size_of};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// A task body that blocks until the returned `Sender` is dropped or written to.
-fn blocked() -> (Sender<()>, impl FnOnce() + Send + 'static) {
-    let (tx, rx) = channel::<()>();
-    let body = move || {
-        let _ = rx.recv();
+use tokio::runtime::{Builder, RuntimeFlavor};
+use tokio::sync::oneshot;
+
+/// A session future that stays pending until the returned `Sender` fires (or is
+/// dropped, which also releases the waiter).
+fn blocked() -> (
+    oneshot::Sender<()>,
+    impl Future<Output = ()> + Send + 'static,
+) {
+    let (tx, rx) = oneshot::channel::<()>();
+    let body = async move {
+        let _ = rx.await;
     };
     (tx, body)
 }
 
-/// Spin (bounded) until `f` is true, returning whether it became true.
-fn until(mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+/// Yield to the runtime (bounded) until `f` is true, returning whether it became
+/// true.  The helper never blocks the runtime thread it runs on, so the task it
+/// is waiting for can still be polled; the loop gives up after 5 000 yields and
+/// answers `false` instead of hanging.
+async fn until(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..5_000 {
         if f() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     f()
 }
 
 // ---------------------------------------------------------------------------
-// Layouts (read from the binary)
+// Layouts (read from the binary, then measured on the real types)
 // ---------------------------------------------------------------------------
 
 /// `Who` is three `String`s: `drop_in_place<Who>` @0x100012dc0 frees the buffers
@@ -85,39 +94,61 @@ fn result_of_add_is_thirty_bytes() {
     assert_eq!(bytes[1] as u32, 7);
 }
 
-/// `Hosted` is 0xa8 bytes with the `Who` at +0x00, the session's handles at
-/// +0x48 and the task at +0xa0 (`is_running` @0x1013b0978 loads `[self+0xa0]`,
-/// `Host::take` copies 0xa8 bytes out of the map).
+/// `Hosted` is 0xa8 bytes with the `Who` at +0x00, the ten session handles at
+/// +0x48, the `CancellationToken` at +0x98 and the task at +0xa0
+/// (`is_running` @0x1013b0978 loads `[self+0xa0]`, `Host::take` copies 0xa8 bytes
+/// out of the map).
+///
+/// Phase 1 keeps every recovered offset because the three real fields that
+/// replace the stand-ins are all one word: `JoinHandle<()>` (`NonNull<RawTask>`)
+/// and `CancellationToken` (`Arc<TreeNode>`).
 #[test]
 fn hosted_layout() {
     assert_eq!(size_of::<Hosted>(), 0xa8);
     assert_eq!(offset_of!(Hosted, who), 0x00);
+    assert_eq!(offset_of!(Hosted, handles), 0x48);
+    assert_eq!(offset_of!(Hosted, token), 0x98);
     assert_eq!(offset_of!(Hosted, task), 0xa0);
+    // The recovered slot widths: 0x50 of session handles, 8 + 8 for the token and
+    // the task.
+    assert_eq!(size_of::<Handles>(), 0x50);
+    assert_eq!(size_of::<CancellationToken>(), 0x08);
     // `take` answers `Option<Hosted>` in 0xa8 bytes, `None` = `isize::MIN`.
     assert_eq!(size_of::<Option<Hosted>>(), 0xa8);
+    let none = None::<Hosted>;
+    // SAFETY: `Option<Hosted>` is 0xa8 bytes of readable memory; this only reads
+    // the niche `Host::take` writes at 0x1013b0674.
+    let bytes: [u64; 0x15] = unsafe { std::mem::transmute_copy(&none) };
+    assert_eq!(bytes[0] as i64, isize::MIN as i64);
     // The task is one word, as a tokio `JoinHandle` is.
     assert_eq!(size_of::<Task>(), 0x08);
+    assert_eq!(size_of::<Option<Task>>(), 0x08);
 }
 
 /// `Host` is 0x30 bytes: the runtime at +0x00, the map at +0x10, `next` at +0x28
 /// (`Host::on` writes `[x8+0x28]`, `[x8+0x8]`, `[x8+0x20]`, `[x8]`).
+///
+/// The recovered 16-byte `Option<Handle>` is measured, not assumed: tokio
+/// 1.53.1's `Handle` wraps a two-variant `scheduler::Handle` enum, and the
+/// `Option` around it gets no niche (the enum's tag word is a full word), so the
+/// real type matches the original's build exactly.  See `NOTES.md` §4a.
 #[test]
 fn host_layout() {
-    assert_eq!(size_of::<Host>(), 0x30);
+    assert_eq!(size_of::<Option<Handle>>(), 0x10);
+    assert_eq!(size_of::<Handle>(), 0x10);
+    assert_eq!(size_of::<BTreeMap<SessionId, Hosted>>(), 0x18);
     assert_eq!(offset_of!(Host, rt), 0x00);
     assert_eq!(offset_of!(Host, sessions), 0x10);
     assert_eq!(offset_of!(Host, next), 0x28);
-    // The original's `Option<tokio::runtime::Handle>` is 16 bytes (tag + Arc); a
-    // fat `Arc<dyn Fn …>` with a niche gives the same 16.
-    assert_eq!(size_of::<Option<Handle>>(), 0x10);
+    assert_eq!(size_of::<Host>(), 0x30);
 }
 
 // ---------------------------------------------------------------------------
 // Host::on — a host with no sessions and the next id at 0
 // ---------------------------------------------------------------------------
 
-#[test]
-fn on_starts_empty() {
+#[tokio::test]
+async fn on_starts_empty() {
     let mut host = Host::on(None);
     assert!(host.get(0).is_none());
     assert!(host.take(0).is_none());
@@ -125,16 +156,16 @@ fn on_starts_empty() {
     assert_eq!(host.may_add("alice"), None);
 
     // `next` starts at 0: the first session is id 0, the second id 1.
-    assert_eq!(host.add(Who::new("alice", "MAIN", ""), || {}), Ok(0));
-    assert_eq!(host.add(Who::new("bob", "MAIN", ""), || {}), Ok(1));
+    assert_eq!(host.add(Who::new("alice", "MAIN", ""), async {}), Ok(0));
+    assert_eq!(host.add(Who::new("bob", "MAIN", ""), async {}), Ok(1));
 }
 
 // ---------------------------------------------------------------------------
 // get / take
 // ---------------------------------------------------------------------------
 
-#[test]
-fn get_and_take_by_id() {
+#[tokio::test]
+async fn get_and_take_by_id() {
     let (_a_tx, a) = blocked();
     let (_b_tx, b) = blocked();
     let mut host = Host::on(None);
@@ -155,8 +186,8 @@ fn get_and_take_by_id() {
     assert!(host.take(0).is_none());
 }
 
-#[test]
-fn take_all_drains_in_id_order() {
+#[tokio::test]
+async fn take_all_drains_in_id_order() {
     let (_a_tx, a) = blocked();
     let (_b_tx, b) = blocked();
     let (_c_tx, c) = blocked();
@@ -176,15 +207,15 @@ fn take_all_drains_in_id_order() {
     // The map is empty again, and ids restart where they left off.
     assert!(host.get(0).is_none() && host.get(1).is_none() && host.get(2).is_none());
     assert!(host.take_all().is_empty());
-    assert_eq!(host.add(Who::new("dave", "MAIN", ""), || {}), Ok(3));
+    assert_eq!(host.add(Who::new("dave", "MAIN", ""), async {}), Ok(3));
 }
 
 // ---------------------------------------------------------------------------
 // may_add / add
 // ---------------------------------------------------------------------------
 
-#[test]
-fn may_add_rejects_a_running_duplicate_ignoring_ascii_case() {
+#[tokio::test]
+async fn may_add_rejects_a_running_duplicate_ignoring_ascii_case() {
     let (tx, body) = blocked();
     let mut host = Host::on(None);
     assert_eq!(host.add(Who::new("Alice", "MAIN", ""), body), Ok(0));
@@ -207,26 +238,26 @@ fn may_add_rejects_a_running_duplicate_ignoring_ascii_case() {
 
     // `add` runs the same guard and spawns nothing on a refusal.
     let err = host
-        .add(Who::new("ALICE", "ALT", ""), || {})
+        .add(Who::new("ALICE", "ALT", ""), async {})
         .expect_err("duplicate refused");
     assert_eq!(err.name, "ALICE");
     assert_eq!(err.account, "MAIN");
-    assert_eq!(host.add(Who::new("bob", "MAIN", ""), || {}), Ok(1));
+    assert_eq!(host.add(Who::new("bob", "MAIN", ""), async {}), Ok(1));
 
     tx.send(()).unwrap();
 }
 
-#[test]
-fn may_add_ignores_a_finished_session() {
+#[tokio::test]
+async fn may_add_ignores_a_finished_session() {
     let mut host = Host::on(None);
-    assert_eq!(host.add(Who::new("Alice", "MAIN", ""), || {}), Ok(0));
+    assert_eq!(host.add(Who::new("Alice", "MAIN", ""), async {}), Ok(0));
     assert!(
-        until(|| !host.get(0).unwrap().is_running()),
+        until(|| !host.get(0).unwrap().is_running()).await,
         "the empty body must finish"
     );
 
     assert!(host.may_add("alice").is_none());
-    assert_eq!(host.add(Who::new("alice", "MAIN", ""), || {}), Ok(1));
+    assert_eq!(host.add(Who::new("alice", "MAIN", ""), async {}), Ok(1));
 }
 
 #[test]
@@ -235,25 +266,88 @@ fn may_add_answers_none_for_an_empty_table() {
     assert_eq!(host.may_add("anything"), None);
 }
 
-#[test]
-fn add_uses_the_supplied_runtime_handle() {
-    let spawned = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&spawned);
-    let handle = Handle::new(move |body: Box<dyn FnOnce() + Send>| {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Task::spawn(move || body())
+/// `Host::add`'s `Some(handle)` arm (`Handle::spawn` @0x1001c7f78) spawns on the
+/// handle it was given, not on the ambient runtime.
+///
+/// The test runtime is `current_thread` and the supplied one is `multi_thread`,
+/// so the session body can tell the two apart through
+/// `Handle::current().runtime_flavor()`.
+#[tokio::test]
+async fn add_uses_the_supplied_runtime_handle() {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a multi-thread runtime");
+    let (tx, rx) = oneshot::channel::<RuntimeFlavor>();
+    let mut host = Host::on(Some(rt.handle().clone()));
+
+    let spawned = host.add(Who::new("carol", "MAIN", ""), async move {
+        let _ = tx.send(Handle::current().runtime_flavor());
     });
-    let mut host = Host::on(Some(handle));
-    assert_eq!(host.add(Who::new("carol", "MAIN", ""), || {}), Ok(0));
-    assert_eq!(spawned.load(Ordering::SeqCst), 1);
+    assert_eq!(spawned, Ok(0));
+    assert_eq!(
+        Handle::current().runtime_flavor(),
+        RuntimeFlavor::CurrentThread,
+        "the test's own runtime is the current_thread one"
+    );
+    assert_eq!(
+        rx.await.expect("the body runs"),
+        RuntimeFlavor::MultiThread,
+        "the session task ran on the supplied handle"
+    );
+
+    // Dropping a `Runtime` inside another runtime's context panics, so hand the
+    // workers back without blocking.
+    rt.shutdown_background();
+}
+
+/// `Host::add`'s `None` arm (`tokio::task::spawn::spawn` @0x1001c7ea8) uses the
+/// ambient runtime.
+#[tokio::test]
+async fn add_without_a_handle_spawns_on_the_ambient_runtime() {
+    let (tx, rx) = oneshot::channel::<RuntimeFlavor>();
+    let mut host = Host::on(None);
+    assert_eq!(
+        host.add(Who::new("dave", "MAIN", ""), async move {
+            let _ = tx.send(Handle::current().runtime_flavor());
+        }),
+        Ok(0)
+    );
+    assert_eq!(
+        rx.await.expect("the body runs"),
+        RuntimeFlavor::CurrentThread,
+        "the ambient (this test's) runtime spawned it"
+    );
+    assert!(until(|| !host.get(0).unwrap().is_running()).await);
+}
+
+/// With no runtime at all the ambient arm panics, as the real `tokio::spawn`
+/// does — the port does not hide that behind a std thread any more.
+#[test]
+fn add_without_a_runtime_panics() {
+    let mut host = Host::on(None);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        host.add(Who::new("erin", "MAIN", ""), async {})
+    }));
+    let panic = outcome.expect_err("tokio::spawn needs an ambient runtime");
+    let text = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        text.contains("no reactor running"),
+        "tokio's own message, not a port-specific one: {text:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Hosted::is_running
 // ---------------------------------------------------------------------------
 
-#[test]
-fn is_running_until_the_sleeping_task_ends() {
+#[tokio::test]
+async fn is_running_until_the_sleeping_task_ends() {
     let (tx, body) = blocked();
     let mut host = Host::on(None);
     assert_eq!(host.add(Who::new("alice", "MAIN", ""), body), Ok(0));
@@ -261,14 +355,14 @@ fn is_running_until_the_sleeping_task_ends() {
     assert!(host.get(0).unwrap().is_running(), "still blocked");
 
     tx.send(()).unwrap();
-    assert!(until(|| !host.get(0).unwrap().is_running()));
+    assert!(until(|| !host.get(0).unwrap().is_running()).await);
 }
 
-#[test]
-fn is_running_is_false_once_the_task_has_finished() {
+#[tokio::test]
+async fn is_running_is_false_once_the_task_has_finished() {
     let mut host = Host::on(None);
-    assert_eq!(host.add(Who::new("bob", "MAIN", ""), || {}), Ok(0));
-    assert!(until(|| !host.get(0).unwrap().is_running()));
+    assert_eq!(host.add(Who::new("bob", "MAIN", ""), async {}), Ok(0));
+    assert!(until(|| !host.get(0).unwrap().is_running()).await);
     assert!(!host.get(0).unwrap().is_running());
 }
 
@@ -276,8 +370,8 @@ fn is_running_is_false_once_the_task_has_finished() {
 // Hosted::stop
 // ---------------------------------------------------------------------------
 
-#[test]
-fn stop_quits_the_session_and_waits_for_the_task() {
+#[tokio::test]
+async fn stop_quits_the_session_and_waits_for_the_task() {
     let (tx, body) = blocked();
     let mut host = Host::on(None);
     assert_eq!(host.add(Who::new("dave", "MAIN", ""), body), Ok(0));
@@ -285,24 +379,111 @@ fn stop_quits_the_session_and_waits_for_the_task() {
     let quit = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&quit);
     let hosted = host.take(0).expect("id 0 is hosted");
-    let ended = hosted.stop(move || {
-        flag.store(true, Ordering::SeqCst);
-        tx.send(()).unwrap();
-    });
+    let ended = hosted
+        .stop(move || {
+            flag.store(true, Ordering::SeqCst);
+            tx.send(()).unwrap();
+        })
+        .await;
     assert!(quit.load(Ordering::SeqCst), "quit must reach the session");
     assert!(ended, "the released task ends well inside the timeout");
 }
 
-#[test]
-fn stop_skips_quit_when_the_task_is_already_gone() {
+#[tokio::test]
+async fn stop_skips_quit_when_the_task_is_already_gone() {
     let mut host = Host::on(None);
-    assert_eq!(host.add(Who::new("erin", "MAIN", ""), || {}), Ok(0));
-    assert!(until(|| !host.get(0).unwrap().is_running()));
+    assert_eq!(host.add(Who::new("erin", "MAIN", ""), async {}), Ok(0));
+    assert!(until(|| !host.get(0).unwrap().is_running()).await);
 
     let hosted = host.take(0).expect("id 0 is hosted");
     // `tbz w0, #0x0` @0x10006c134: a finished task never runs the quit step.
-    let ended = hosted.stop(|| panic!("quit must not run for a finished task"));
+    let ended = hosted
+        .stop(|| panic!("quit must not run for a finished task"))
+        .await;
     assert!(ended);
+}
+
+/// The timeout path: `tokio::time::timeout` @0x10006c1b4 elapses and
+/// `AbortHandle::abort` @0x10006c2ec drops the task's future.
+///
+/// The runtime is paused, so the recovered ten seconds are tokio's virtual ones
+/// and the test does not wait for them; the timeout itself is the real one.
+#[tokio::test(start_paused = true)]
+async fn stop_aborts_the_task_after_the_timeout() {
+    /// Records that the future it lives in was dropped — which is what an abort
+    /// does to a task that never returns.
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Dropped(Arc::clone(&dropped));
+    let mut host = Host::on(None);
+    assert_eq!(
+        host.add(Who::new("frank", "MAIN", ""), async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }),
+        Ok(0)
+    );
+
+    let quit = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&quit);
+    let hosted = host.take(0).expect("id 0 is hosted");
+    let ended = hosted
+        .stop(move || flag.store(true, Ordering::SeqCst))
+        .await;
+    assert!(
+        quit.load(Ordering::SeqCst),
+        "the task was running, so quit ran"
+    );
+    assert!(!ended, "a task that never ends outlives the timeout");
+    assert!(
+        until(|| dropped.load(Ordering::SeqCst)).await,
+        "the aborted task's future is dropped"
+    );
+}
+
+/// The token at `Hosted+0x98` (`CancellationToken::cancel` @0x10006c180) is
+/// tripped, and it is tripped *after* `quit` (@0x10006c158), so the session still
+/// sees an untripped token when it is asked to stop.
+#[tokio::test]
+async fn stop_trips_the_cancellation_token() {
+    let (tx, body) = blocked();
+    let mut host = Host::on(None);
+    assert_eq!(host.add(Who::new("gina", "MAIN", ""), body), Ok(0));
+
+    let token = host.get(0).expect("id 0 is hosted").stop_token();
+    assert!(!token.is_cancelled());
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&seen);
+    let watched = token.clone();
+    let hosted = host.take(0).expect("id 0 is hosted");
+    let ended = hosted
+        .stop(move || {
+            flag.store(watched.is_cancelled(), Ordering::SeqCst);
+            tx.send(()).unwrap();
+        })
+        .await;
+    assert!(ended, "the released task ends inside the timeout");
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "quit runs before the token is cancelled"
+    );
+    assert!(token.is_cancelled(), "stop trips the token after quit");
+
+    // A waiter on the token is woken by the cancel.
+    let waiter = token.clone();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), waiter.cancelled())
+            .await
+            .is_ok(),
+        "the token's waiters resolve once it is cancelled"
+    );
 }
 
 /// The timeout constant is the immediate `tokio::time::timeout` is given

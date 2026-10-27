@@ -35,8 +35,8 @@ pub struct AttackRow {
 }
 
 impl AttackRow {
-    fn of(store: &Store, a: &Attack) -> AttackRow {
-        AttackRow {
+    fn of(store: &Store, a: &Attack) -> Result<AttackRow, Error> {
+        Ok(AttackRow {
             id: a.id,
             name: a.name.clone(),
             outcome: a.outcome.clone(),
@@ -45,10 +45,10 @@ impl AttackRow {
             occurred_at: a.occurred_at,
             hunt_id: a.hunt_id,
             creature_id: a.creature_id,
-            creature_name: a
-                .creature_id
-                .and_then(|c| store.creature(c))
-                .map(|c| c.name.clone()),
+            creature_name: match a.creature_id {
+                Some(id) => store.creature_by_id(id)?.map(|c| c.name),
+                None => None,
+            },
             root_attack_id: a.root_attack_id,
             parent_attack_id: a.parent_attack_id,
             parent: a.parent.clone(),
@@ -58,7 +58,7 @@ impl AttackRow {
             attacker: a.attacker.clone(),
             aimed: a.aimed,
             ambush: a.ambush,
-        }
+        })
     }
 }
 
@@ -111,7 +111,7 @@ pub fn crit_str(hit: &Hit) -> String {
 
 /// `SELECT damage, location, crit_rank, crit_type, fatal FROM hits WHERE
 /// attack_id = ?1 AND flare_id IS NULL ORDER BY seq` (0x102411706).
-pub fn hits_of(store: &Store, attack_id: i64) -> Vec<&Hit> {
+pub fn hits_of(store: &Store, attack_id: i64) -> Result<Vec<Hit>, Error> {
     store.hits_of(attack_id)
 }
 
@@ -125,13 +125,13 @@ pub fn hits_of(store: &Store, attack_id: i64) -> Vec<&Hit> {
 /// `FLARES: NONE [damaging]`, `CRIT`, ` AMPUTATED`, `[FATAL]`,
 /// `  (this attack)`, `no outcome recorded`, `no target`.
 pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
-    let attack = match store.attacks.iter().find(|a| a.id == id) {
+    let attack = match store.attack_by_id(id)? {
         Some(a) => a,
         None => return Err(Error::new(format!("No attack #{}.", id))),
     };
-    let row = AttackRow::of(store, attack);
+    let row = AttackRow::of(store, &attack)?;
     let mut out = Vec::new();
-    let flags = flag_words(attack);
+    let flags = flag_words(&attack);
     out.push(format!(
         "=== ATTACK REPORT #{} ==={}",
         id,
@@ -142,7 +142,7 @@ pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
         }
     ));
     if let Some(weapon) = attack.weapon {
-        out.push(format!("  Weapon: {}", store.name(weapon)));
+        out.push(format!("  Weapon: {}", store.name(weapon)?));
     }
     out.push(format!(
         "Type: {}{}{}",
@@ -181,7 +181,7 @@ pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
     out.push(format!("Flags: {}", flags.join(", ")));
 
     out.push(String::from("RESOLUTION:"));
-    let hits = hits_of(store, id);
+    let hits = hits_of(store, id)?;
     if hits.is_empty() {
         out.push(String::from("RESOLUTION: NONE\tPenalty: "));
     } else {
@@ -205,7 +205,7 @@ pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
             out.push(line);
         }
     }
-    let flares = store.flares_of(id);
+    let flares = store.flares_of(id)?;
     if flares.is_empty() {
         out.push(String::from("FLARES: NONE"));
     } else {
@@ -219,7 +219,7 @@ pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
             ));
         }
     }
-    let statuses: Vec<_> = store.statuses.iter().filter(|s| s.attack_id == id).collect();
+    let statuses = store.statuses_of(id)?;
     if statuses.is_empty() {
         out.push(String::from("STATUS EFFECTS: NONE  (window)"));
     } else {
@@ -250,23 +250,18 @@ pub fn attack_by_name(
 ) -> Lines {
     const HEADS: &str = "Attacks recorded (cstats attack <name> for one):";
     let hunts = report::resolve(store, character, scope)?;
-    let mut found: Vec<&Attack> = Vec::new();
+    let mut found: Vec<Attack> = Vec::new();
     for id in &hunts.ids {
-        for a in store.attacks_of(*id) {
+        for a in store.attacks_of(*id)? {
             if a.name.eq_ignore_ascii_case(name) && a.ours {
                 found.push(a);
             }
         }
     }
     if found.is_empty() {
-        let mut names: Vec<String> = store
-            .attacks
-            .iter()
-            .filter(|a| hunts.ids.contains(&a.hunt_id) && a.ours)
-            .map(|a| a.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
+        // `SELECT DISTINCT name FROM attacks WHERE hunt_id IN (…) AND ours = 1
+        // ORDER BY name` (0x103e66ae2), run by SQLite.
+        let names = store.attack_names(&hunts.ids)?;
         let mut out = vec![format!("Unknown attack '{}'. {}", name, HEADS)];
         for n in names {
             out.push(format!("  {}", n));
@@ -283,7 +278,7 @@ pub fn attack_by_name(
             found.len()
         )]);
     }
-    let attack = found[found.len() - index];
+    let attack = &found[found.len() - index];
     attack_detail(store, attack.id, false)
 }
 
@@ -295,16 +290,13 @@ pub fn attack_by_name(
 /// attack with no children prints
 /// `SEQUENCE: single attack (no spawn tree); hit  (this attack)` (0x102411240).
 pub fn tree(store: &Store, root: i64) -> Lines {
-    let attack = match store.attacks.iter().find(|a| a.id == root) {
+    let attack = match store.attack_by_id(root)? {
         Some(a) => a,
         None => return Err(Error::new(format!("No attack #{}.", root))),
     };
-    let mut children: Vec<&Attack> = store
-        .attacks
-        .iter()
-        .filter(|a| a.parent_attack_id == Some(root))
-        .collect();
-    children.sort_by_key(|a| a.seq);
+    // `SELECT id, parent FROM attacks WHERE parent_attack_id = ?1 ORDER BY seq`
+    // (0x102410c4a), read as whole rows.
+    let children = store.children_of(root)?;
     let mut out = Vec::new();
     if children.is_empty() {
         out.push(format!(
@@ -341,15 +333,15 @@ pub fn creature(
 ) -> Lines {
     const HEADS: &str = "cstats creature <id>|<noun>: the top 20 by damage";
     let hunts = report::resolve(store, character, &Scope::Last)?;
-    let mut seen: Vec<&crate::store::Creature> = Vec::new();
+    let mut seen: Vec<crate::store::Creature> = Vec::new();
     for hunt in &hunts.ids {
-        seen.extend(store.creatures_of(*hunt));
+        seen.extend(store.creatures_of(*hunt)?);
     }
     if seen.is_empty() {
         return Ok(vec![String::from("No creatures recorded yet.")]);
     }
     let picked = match (id, noun) {
-        (Some(id), _) => match store.creature(id) {
+        (Some(id), _) => match store.creature_by_id(id)? {
             Some(c) => c,
             None => return Ok(vec![format!("No creature with id {}.", id)]),
         },
@@ -357,7 +349,7 @@ pub fn creature(
             .iter()
             .find(|c| c.noun.eq_ignore_ascii_case(noun) || c.name.eq_ignore_ascii_case(noun))
         {
-            Some(c) => *c,
+            Some(c) => c.clone(),
             None => {
                 let mut nouns: Vec<String> = seen.iter().map(|c| c.noun.clone()).collect();
                 nouns.sort();
@@ -406,22 +398,9 @@ pub fn creature(
             picked.killed_by_attack_id.unwrap_or(0)
         )),
     }
-    let attacks: Vec<&Attack> = store
-        .attacks
-        .iter()
-        .filter(|a| a.creature_id == Some(picked.id))
-        .collect();
-    let damage: i64 = store
-        .hits
-        .iter()
-        .filter(|h| attacks.iter().any(|a| a.id == h.attack_id && a.ours))
-        .map(|h| h.damage)
-        .sum();
-    let hits = store
-        .hits
-        .iter()
-        .filter(|h| attacks.iter().any(|a| a.id == h.attack_id))
-        .count();
+    let attacks: Vec<Attack> = store.attacks_of_creature(picked.id)?;
+    let damage = store.creature_damage(picked.id)?;
+    let hits = store.creature_hits(picked.id)?;
     out.push(format!(
         "  DMG: {:<18} Hits: {:<6} Alive: {}",
         damage,
@@ -439,7 +418,7 @@ pub fn creature(
             });
         }
     }
-    out.extend(wound_map(store, picked.id));
+    out.extend(wound_map(store, picked.id)?);
     out.push(format!("cstats creature {}", picked.id));
     Ok(out)
 }
@@ -457,13 +436,13 @@ pub fn creature(
 /// 0x103e674e3…0x103e67544 is not recoverable (their cells are positional and
 /// the drawings are assembled from slices), so this prints one labelled line per
 /// wounded location in the recovered order.
-pub fn wound_map(store: &Store, creature_id: i64) -> Vec<String> {
+pub fn wound_map(store: &Store, creature_id: i64) -> Result<Vec<String>, Error> {
     const ORDER: [&str; 12] = [
         "head", "neck", "back", "chest", "abdomen", "left_arm", "right_arm", "left_hand",
         "right_hand", "left_leg", "right_leg", "nsys",
     ];
     let mut worst: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for hit in store.hits.iter().filter(|h| h.creature_id == Some(creature_id)) {
+    for hit in store.hits_of_creature(creature_id)? {
         if let Some(part) = &hit.body_part {
             let rank = hit.wound_rank.unwrap_or(0);
             let slot = worst.entry(part.clone()).or_insert(0);
@@ -476,19 +455,20 @@ pub fn wound_map(store: &Store, creature_id: i64) -> Vec<String> {
             out.push(format!("    {}   {}", part, rank));
         }
     }
-    out
+    Ok(out)
 }
 
 /// `SELECT exist_id, name FROM creatures WHERE id = ?1` (0x10241166b).
-pub fn creature_exist_name(store: &Store, id: i64) -> Option<(Option<String>, String)> {
-    store
-        .creature(id)
-        .map(|c| (c.exist_id.clone(), c.name.clone()))
+pub fn creature_exist_name(
+    store: &Store,
+    id: i64,
+) -> Result<Option<(Option<String>, String)>, Error> {
+    Ok(store.creature_by_id(id)?.map(|c| (c.exist_id, c.name)))
 }
 
 /// `SELECT name FROM creatures WHERE id = ?1` (0x102411287).
-pub fn creature_name(store: &Store, id: i64) -> Option<String> {
-    store.creature(id).map(|c| c.name.clone())
+pub fn creature_name(store: &Store, id: i64) -> Result<Option<String>, Error> {
+    Ok(store.creature_by_id(id)?.map(|c| c.name))
 }
 
 /// What an attack-name search turned up.  `drop_in_place<detail::Found>`
@@ -506,8 +486,10 @@ mod tests {
 
     fn store() -> Store {
         let mut s = Store::new();
-        let a = s.hunt_started(1, "Testchar", 1_000_000);
-        let kobold = s.creature_seen(a, "kobold", "a kobold", 1_000_100);
+        let a = s.hunt_started(1, "Testchar", 1_000_000).expect("hunt");
+        let kobold = s
+            .creature_seen(a, "kobold", "a kobold", 1_000_100)
+            .expect("creature");
         let swing = s.attack(Attack {
             hunt_id: a,
             seq: 1,
@@ -520,7 +502,8 @@ mod tests {
             aimed: true,
             attack_kind: Some(String::from("attack")),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         s.hit(Hit {
             attack_id: swing,
             hunt_id: a,
@@ -535,7 +518,8 @@ mod tests {
             fatal: false,
             amputated: true,
             ..Hit::default()
-        });
+        })
+        .expect("hit");
         let child = s.attack(Attack {
             hunt_id: a,
             seq: 2,
@@ -543,7 +527,8 @@ mod tests {
             name: String::from("spawn"),
             parent_attack_id: Some(swing),
             ..Attack::default()
-        });
+        })
+        .expect("attack");
         let _ = child;
         s
     }
@@ -562,8 +547,8 @@ mod tests {
     #[test]
     fn attack_detail_prints_the_recovered_headings() {
         let s = store();
-        let id = s.attacks[0].id;
-        let creature = s.creatures[0].id;
+        let id = s.attacks_of(1).unwrap()[0].id;
+        let creature = s.creatures_of(1).unwrap()[0].id;
         let lines = attack_detail(&s, id, false).expect("runs");
         assert_eq!(lines[0], format!("=== ATTACK REPORT #{} === AIMED", id));
         assert_eq!(lines[1], "Type: attack aimed");
@@ -589,8 +574,8 @@ mod tests {
     #[test]
     fn tree_walks_the_children() {
         let s = store();
-        let root = s.attacks[0].id;
-        let child = s.attacks[1].id;
+        let root = s.attacks_of(1).unwrap()[0].id;
+        let child = s.attacks_of(1).unwrap()[1].id;
         let lines = tree(&s, root).expect("runs");
         assert_eq!(lines[0], "SEQUENCE: jab (root)");
         assert_eq!(lines[1], "  2 -> spawn");
@@ -602,7 +587,7 @@ mod tests {
     #[test]
     fn creature_detail_reports_its_numbers() {
         let s = store();
-        let id = s.creatures[0].id;
+        let id = s.creatures_of(1).unwrap()[0].id;
         let lines = creature(&s, "Testchar", Some(id), None, None, false).expect("runs");
         assert_eq!(lines[0], " Name: a kobold");
         assert_eq!(lines[1], format!(" Noun: kobold             ID: {}   Session: 1", id));

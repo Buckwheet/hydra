@@ -17,9 +17,21 @@
 //! the creature/effect/gear forms listed in [`Recorder::record`].  Everything the
 //! parser cannot place is ignored, which is what the original does for lines it
 //! does not recognise.
+//!
+//! # Phase 1: the writes are real
+//!
+//! [`Recorder`] holds a [`Store`] — a real `rusqlite` connection to the ledger
+//! (`hydra_ledger::Connection`) — so every statement quoted below is executed
+//! rather than simulated, and the recorder's errors are the SQL failures mapped
+//! into [`crate::Error`].  [`Recorder::record_gemstones`] takes the real
+//! `hydra_model::state::character::gemstones::Gemstones` the session parses, and
+//! [`Recorder::sync_gear`] interns its items through `hydra_ledger::name_id`.
 
-use crate::store::{Attack, Creature, Effect, Flare, GearRow, Hit, Status, Store, GEAR_SLOTS};
+use crate::store::{
+    Attack, Creature, Effect, Flare, GearRow, Gemstone, Hit, Status, Store, GEAR_KIND, GEAR_SLOTS,
+};
 use crate::Error;
+use hydra_model::state::character::gemstones::Gemstones;
 
 /// Who the log belongs to.
 ///
@@ -141,7 +153,7 @@ impl Recorder {
     /// unset.
     pub fn open(store: Store, who: Who, at: i64) -> Result<Recorder, Error> {
         let mut store = store;
-        let hunt_id = store.hunt_started(who.instance, &who.character.clone(), at);
+        let hunt_id = store.hunt_started(who.instance, &who.character.clone(), at)?;
         Ok(Recorder {
             store,
             who,
@@ -208,18 +220,22 @@ impl Recorder {
             .find(|w| SWING_VERBS.iter().any(|v| w.starts_with(v)));
         if outcome.is_some() || verb.is_some() {
             let outcome = outcome.unwrap_or_else(|| String::from("hit"));
-            self.record_swing(&words, &outcome, verb.as_deref(), at);
-            return Ok(());
+            return self.record_swing(&words, &outcome, verb.as_deref(), at);
         }
         if text.ends_with(" up") || text.ends_with(" down") {
-            self.record_effect(text, at);
-            return Ok(());
+            return self.record_effect(text, at);
         }
         Ok(())
     }
 
     /// A swing: an attack row, and per outcome a hit or a flare.
-    fn record_swing(&mut self, words: &[&str], outcome: &str, verb: Option<&str>, at: i64) {
+    fn record_swing(
+        &mut self,
+        words: &[&str],
+        outcome: &str,
+        verb: Option<&str>,
+        at: i64,
+    ) -> Result<(), Error> {
         let (verb_at, name) = match verb {
             Some(verb) => {
                 let at = words
@@ -270,7 +286,7 @@ impl Recorder {
         let location = location_in(words);
         let body_part = body_part_of(location.as_deref());
         let crit = crit_in(words);
-        let attack_id = self.store.attack(attack);
+        let attack_id = self.store.attack(attack)?;
         if outcome == "hit" {
             self.store.hit(Hit {
                 attack_id,
@@ -285,7 +301,7 @@ impl Recorder {
                 amputated: words.iter().any(|w| w.eq_ignore_ascii_case("amputated")),
                 line_seq: self.seq,
                 ..Hit::default()
-            });
+            })?;
         } else if crate::report::barrier_name(outcome) || words.iter().any(|w| w.eq_ignore_ascii_case("barkskin")) {
             let name = if words.iter().any(|w| w.eq_ignore_ascii_case("barkskin")) {
                 String::from("barkskin")
@@ -300,46 +316,49 @@ impl Recorder {
                 ours,
                 eligible: true,
                 ..Flare::default()
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// `up`/`down` lines become `hunt_effects` rows.
-    fn record_effect(&mut self, text: &str, at: i64) {
+    fn record_effect(&mut self, text: &str, at: i64) -> Result<(), Error> {
         let name = text
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
         if name.is_empty() {
-            return;
+            return Ok(());
         }
-        let id = self.store.name_id(&name);
-        if let Some(effect) = self
+        let id = self.store.name_id(&name)?;
+        // The open effect of the same name, if the session has one.
+        let open = self
             .store
-            .effects
-            .iter_mut()
-            .find(|e| e.hunt_id == self.hunt_id && e.name_id == id && e.ended_at.is_none())
-        {
+            .effects_of(self.hunt_id)?
+            .into_iter()
+            .find(|e| e.name_id == id && e.ended_at.is_none());
+        if let Some(effect) = open {
             if text.ends_with(" down") {
-                effect.ended_at = Some(at);
+                self.store.effect_ended(effect.id, at)?;
             }
-            return;
+            return Ok(());
         }
         if text.ends_with(" up") {
-            self.store.effects.push(Effect {
+            self.store.effect(Effect {
                 id: 0,
                 hunt_id: self.hunt_id,
                 name_id: id,
                 name,
                 began_at: at,
                 ended_at: None,
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// Note a creature seen the first time.
-    pub fn creature(&mut self, noun: &str, name: &str, at: i64) -> i64 {
+    pub fn creature(&mut self, noun: &str, name: &str, at: i64) -> Result<i64, Error> {
         self.store.creature_seen(self.hunt_id, noun, name, at)
     }
 
@@ -349,26 +368,40 @@ impl Recorder {
     /// connection is dropped (the original commits the transaction with
     /// `COMMIT`, 0x102413ab9).
     pub fn close(&mut self, at: i64) -> Result<Store, Error> {
-        self.store.hunt_ended(self.hunt_id, at);
+        self.store.hunt_ended(self.hunt_id, at)?;
+        // The recovered close drops the connection (`COMMIT`, 0x102413ab9);
+        // here the store is handed back and the recorder keeps an empty one.
         Ok(std::mem::take(&mut self.store))
     }
 
     /// Flush an effect that is still open, the way `Recorder::sync_effects`
     /// (0x1013747cc) does at the end of a session.
-    pub fn sync_effects(&mut self, at: i64) {
-        for effect in self.store.effects.iter_mut() {
-            if effect.hunt_id == self.hunt_id && effect.ended_at.is_none() {
-                effect.ended_at = Some(at);
-            }
+    pub fn sync_effects(&mut self, at: i64) -> Result<(), Error> {
+        let open: Vec<Effect> = self
+            .store
+            .effects_of(self.hunt_id)?
+            .into_iter()
+            .filter(|e| e.ended_at.is_none())
+            .collect();
+        for effect in open {
+            self.store.effect_ended(effect.id, at)?;
         }
+        Ok(())
     }
 
     /// Write the gemstones a `gem` line reported, the way
     /// `Recorder::write_gemstones` (0x101375310) does:
     /// `INSERT INTO hunt_gemstones (hunt_id, number, description, name, rank,
     /// ranks)` read back by `report::gemstones_line`.
-    pub fn write_gemstones(&mut self, number: i64, description: &str, name: &str, rank: i64, ranks: i64) {
-        self.store.gemstones.push(crate::store::Gemstone {
+    pub fn write_gemstones(
+        &mut self,
+        number: i64,
+        description: &str,
+        name: &str,
+        rank: i64,
+        ranks: i64,
+    ) -> Result<i64, Error> {
+        self.store.gemstone(Gemstone {
             id: 0,
             hunt_id: self.hunt_id,
             number,
@@ -376,7 +409,33 @@ impl Recorder {
             name: name.to_string(),
             rank,
             ranks,
-        });
+        })
+    }
+
+    /// Write a whole gemstone report, the way the `gem` lines of a session do.
+    ///
+    /// `hydra_model::state::character::gemstones::Gemstones` is the real type
+    /// the session parses those lines into (`read_chunk`, 4548 B, and
+    /// `equipped_properties`, 2504 B), so the recorder takes it directly: one
+    /// `hunt_gemstones` row per property of every equipped gemstone, `number`
+    /// counting the properties in report order. Returns how many rows it wrote.
+    pub fn record_gemstones(&mut self, gems: &Gemstones) -> Result<usize, Error> {
+        let mut number = 0;
+        let mut wrote = 0;
+        for gem in gems.equipped() {
+            for property in &gem.properties {
+                number += 1;
+                self.write_gemstones(
+                    number,
+                    &gem.name,
+                    &property.name,
+                    i64::from(property.amount),
+                    i64::from(gem.rank),
+                )?;
+                wrote += 1;
+            }
+        }
+        Ok(wrote)
     }
 
     /// Sync the hands a swing reported, the way `Recorder::sync_gear`
@@ -384,19 +443,21 @@ impl Recorder {
     /// slot, began_at)` (0x1024139df) for anything new, and
     /// `UPDATE hunt_gear SET ended_at = ?1 WHERE id = ?2` (0x102413a52) for
     /// anything that went away.
-    pub fn sync_gear(&mut self, held: &[&str], at: i64) {
+    pub fn sync_gear(&mut self, held: &[&str], at: i64) -> Result<(), Error> {
         for slot in GEAR_SLOTS {
             let present = held.iter().any(|h| h.eq_ignore_ascii_case(slot));
             let open = self
                 .store
-                .gear
-                .iter()
-                .find(|g| g.hunt_id == self.hunt_id && g.slot == *slot && g.ended_at.is_none())
+                .gear_of(self.hunt_id, slot)?
+                .into_iter()
+                .find(|g| g.ended_at.is_none())
                 .map(|g| g.id);
             match (present, open) {
                 (true, None) => {
-                    let gear_id = self.store.name_id(slot);
-                    self.store.gear.push(GearRow {
+                    // `hydra_ledger::name_id` interns the item under
+                    // `names.kind = 'gear'`, and `hunt_gear.gear_id` holds it.
+                    let gear_id = self.store.name_id_kind(GEAR_KIND, &slot.to_ascii_lowercase())?;
+                    self.store.gear(GearRow {
                         id: 0,
                         hunt_id: self.hunt_id,
                         gear_id,
@@ -405,16 +466,15 @@ impl Recorder {
                         name: slot.to_ascii_lowercase(),
                         began_at: at,
                         ended_at: None,
-                    });
+                    })?;
                 }
                 (false, Some(id)) => {
-                    if let Some(row) = self.store.gear.iter_mut().find(|g| g.id == id) {
-                        row.ended_at = Some(at);
-                    }
+                    self.store.gear_ended(id, at)?;
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -486,9 +546,17 @@ pub fn status_row(attack_id: i64, action: &str, status: &str, value: Option<i64>
 }
 
 /// The creature a noun names, creating it if this is the first sighting.
-pub fn creature_row<'a>(store: &'a mut Store, hunt_id: i64, noun: &str, name: &str, at: i64) -> &'a Creature {
-    let id = store.creature_seen(hunt_id, noun, name, at);
-    store.creature(id).expect("just inserted")
+pub fn creature_row(
+    store: &mut Store,
+    hunt_id: i64,
+    noun: &str,
+    name: &str,
+    at: i64,
+) -> Result<Creature, Error> {
+    let id = store.creature_seen(hunt_id, noun, name, at)?;
+    store
+        .creature_by_id(id)?
+        .ok_or_else(|| Error::new(format!("no creature #{}.", id)))
 }
 
 #[cfg(test)]
@@ -510,7 +578,11 @@ mod tests {
     #[test]
     fn open_starts_a_session() {
         let recorder = recorder();
-        let hunt = recorder.store.hunt(recorder.hunt_id()).expect("hunt row");
+        let hunt = recorder
+            .store
+            .hunt(recorder.hunt_id())
+            .expect("query")
+            .expect("hunt row");
         assert_eq!(hunt.character, "Testchar");
         assert_eq!(hunt.started_at, 1_000_000);
         assert_eq!(hunt.ended_at, None);
@@ -522,12 +594,18 @@ mod tests {
         recorder
             .record("Testchar jab a kobold for 25 points of damage", 1_000_010)
             .expect("records");
-        let attack = recorder.store.attacks.last().expect("attack");
+        let hunt = recorder.hunt_id();
+        let attack = recorder.store.attacks_of(hunt).expect("query").pop().expect("attack");
         assert_eq!(attack.name, "jab");
         assert_eq!(attack.outcome.as_deref(), Some("hit"));
         assert!(attack.ours);
         assert_eq!(attack.attacker.as_deref(), Some("Testchar"));
-        let hit = recorder.store.hits.last().expect("hit");
+        let hit = recorder
+            .store
+            .hits_of_hunt(hunt)
+            .expect("query")
+            .pop()
+            .expect("hit");
         assert_eq!(hit.damage, 25);
         assert_eq!(hit.attack_id, attack.id);
     }
@@ -538,7 +616,12 @@ mod tests {
         recorder
             .record("a kobold jabs you for 7 points of damage", 1_000_020)
             .expect("records");
-        let attack = recorder.store.attacks.last().expect("attack");
+        let attack = recorder
+            .store
+            .attacks_of(recorder.hunt_id())
+            .expect("query")
+            .pop()
+            .expect("attack");
         assert!(attack.inbound);
         assert!(!attack.ours);
         assert_eq!(attack.outcome.as_deref(), Some("hit"));
@@ -550,7 +633,12 @@ mod tests {
         recorder
             .record("Testchar jabs a kobold in the left leg for 3 points of damage", 1_000_030)
             .expect("records");
-        let hit = recorder.store.hits.last().expect("hit");
+        let hit = recorder
+            .store
+            .hits_of_hunt(recorder.hunt_id())
+            .expect("query")
+            .pop()
+            .expect("hit");
         assert_eq!(hit.location.as_deref(), Some("left leg"));
         assert_eq!(hit.body_part.as_deref(), Some("left_leg"));
     }
@@ -560,10 +648,68 @@ mod tests {
         let mut recorder = recorder();
         recorder.record("Strength up", 1_000_040).expect("up");
         recorder.record("Strength down", 1_000_050).expect("down");
-        let effect = recorder.store.effects.last().expect("effect");
+        let effect = recorder
+            .store
+            .effects_of(recorder.hunt_id())
+            .expect("query")
+            .pop()
+            .expect("effect");
         assert_eq!(effect.name, "strength");
         assert_eq!(effect.began_at, 1_000_040);
         assert_eq!(effect.ended_at, Some(1_000_050));
+    }
+
+    #[test]
+    fn a_hydra_model_gemstone_report_becomes_rows() {
+        // `hydra_model::state::character::gemstones::Gemstones` is the real type
+        // the session parses the gem lines into; the recorder writes one
+        // `hunt_gemstones` row per property of every equipped gemstone.
+        let mut gems = Gemstones::default();
+        gems.read_chunk("a blue sapphire (Rank 4) (greater binding) (equipped)");
+        gems.read_chunk("a fiery red ruby (Rank 2) (equipped)");
+        gems.read_chunk("a plain quartz (Rank 1)");
+        assert_eq!(gems.items.len(), 3);
+        assert_eq!(gems.equipped().count(), 2);
+        // Two properties on the equipped pair.
+        gems.items[0].properties = vec![
+            hydra_model::state::character::gemstones::Property {
+                name: String::from("Strength"),
+                amount: 2,
+            },
+            hydra_model::state::character::gemstones::Property {
+                name: String::from("Constitution"),
+                amount: 1,
+            },
+        ];
+        gems.items[1].properties = vec![hydra_model::state::character::gemstones::Property {
+            name: String::from("Agility"),
+            amount: 3,
+        }];
+
+        let mut recorder = recorder();
+        assert_eq!(recorder.record_gemstones(&gems).expect("writes"), 3);
+        let rows = recorder
+            .store
+            .gemstones_of(recorder.hunt_id())
+            .expect("query");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].description, "a blue sapphire");
+        assert_eq!(rows[0].name, "Strength");
+        assert_eq!(rows[0].rank, 2);
+        assert_eq!(rows[0].ranks, 4);
+        assert_eq!(rows[0].number, 1);
+        assert_eq!(rows[2].number, 3);
+        assert_eq!(rows[2].description, "a fiery red ruby");
+        assert_eq!(rows[2].name, "Agility");
+        // The unequipped gemstone wrote nothing.
+        assert!(!rows.iter().any(|r| r.description.contains("quartz")));
+        // And the session report prints them, as the recovered line does.
+        let lines = crate::report::gemstones_line(&recorder.store, recorder.hunt_id())
+            .expect("line");
+        assert_eq!(
+            lines[0],
+            "  Gemstones: a blue sapphire 2/4, a blue sapphire 1/4, a fiery red ruby 3/2"
+        );
     }
 
     #[test]
@@ -571,7 +717,7 @@ mod tests {
         let mut recorder = recorder();
         recorder.record("Testchar jabs a kobold for 1 point of damage", 1_000_010).expect("records");
         let store = recorder.close(1_000_600).expect("closes");
-        let hunt = store.hunt(1).expect("hunt");
+        let hunt = store.hunt(1).expect("query").expect("hunt");
         assert_eq!(hunt.ended_at, Some(1_000_600));
     }
 }

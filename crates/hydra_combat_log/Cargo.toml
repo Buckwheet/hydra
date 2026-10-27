@@ -4,4 +4,25 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# Phase 1 reconnection: the crates the original linked are back, at the
+# workspace pins (`cargo --offline`; the registry is pre-fetched).
+#
+# * `rusqlite` 0.37.0 (`bundled`) — the ledger tables really are a SQLite
+#   database again; every recovered statement runs through
+#   `Connection::prepare_cached` (rusqlite's `StatementCache`).
+# * `tokio` 1.53.1 (`full`) — the recorder loop is an async function over a
+#   `tokio::sync::mpsc` channel again, driven on a runtime `task::start` builds.
+# * `hydra_ledger` — the database's owner. `Store` holds a
+#   `hydra_ledger::Connection` (the ledger's recovered `connect`/`writing`
+#   path, `hydra_ledger::migrate` for the schema), and `name_id` is
+#   `hydra_ledger::name_id`.
+# * `hydra_session` — the recorder's event source is the real
+#   `hydra_session::command::Event` broadcast channel.
+# * `hydra_model` — `Gemstones`, the gemstone report the recorder writes.
+# * `hydra_net` — `eastern::{offset, date, format, now}` for every timestamp.
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+hydra_ledger = { path = "../hydra_ledger" }
+hydra_model = { path = "../hydra_model" }
 hydra_net = { path = "../hydra_net" }
+hydra_session = { path = "../hydra_session" }

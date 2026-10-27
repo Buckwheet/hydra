@@ -7,8 +7,16 @@ plus the **local** `t` symbols from `nm -an`, which the demangled file omits).
 local ones (helpers, closures, `drop_in_place` shims, duplicated `Recorder`
 destructors for the crates that inline it).
 
-Status: `cargo check -p hydra_combat_log` and `cargo test -p hydra_combat_log`
-pass (**55 tests**). No `todo!()`/`unimplemented!()` remains.
+Status: `cargo check -p hydra_combat_log --offline` and
+`cargo test -p hydra_combat_log --offline` pass (**67 tests**). No
+`todo!()`/`unimplemented!()` remains.
+
+**Phase 1 (dependency reconnection):** `rusqlite` 0.37.0 (`bundled`) and
+`tokio` 1.53.1 (`full`) are back, so the tables really are a SQLite database and
+the recorder loop really is async; `hydra_ledger`, `hydra_model` and
+`hydra_session` are the real path dependencies, since all three are implemented
+in this workspace now. §1 is the corrected dependency table, §1.1 the record of
+what each reconnection changed.
 
 ---
 
@@ -59,23 +67,95 @@ Tooling (throwaway, outside the repository):
 
 ---
 
-## 1. Dependency reality (`std`-only departures)
+## 1. Dependency reality
 
 The original crate depends on `rusqlite`, `tokio`, `hydra_ledger`,
-`hydra_model`, `hydra_net` and `hydra_session`:
+`hydra_model`, `hydra_net` and `hydra_session`. Every one of them is a real
+dependency of this build again:
 
-| original | recovered use | what this build does |
+| original | recovered use | what this build does now |
 |---|---|---|
-| `rusqlite` | 21 `StatementCache::get`, 86 `Connection::prepare_with_flags`, 41 `query_row`, 14 `query_map` call sites | **[`store::Store`]**: `Vec`s of the recovered row types, with every recovered statement re-implemented as a scan. The SQL text is kept as a doc-comment/`const` beside each scan so nothing is lost. |
-| `rusqlite::Error` | the `Result` payload niche (`0x8000_0000_0000_0016` for `Ok`) | [`Error`] carries the `Display` text; report text on failure is unchanged because the original printed the error with `Display`. |
-| `tokio` | `task::start` builds a runtime, `listen` is an async closure over a `broadcast::Receiver`, `Sent` travels over `mpsc` + `batch_semaphore` | `task::run` is a plain loop over `std::sync::mpsc::Receiver<Sent>`; `task::start` spawns it through `std::thread::Builder` with the recovered thread name. |
-| `hydra_ledger` | `Ledger::writing` (`Recorder::open`), `Ledger::reader` (`command::answer`), `name_id` (`sync_gear`) | `hydra_ledger` in this workspace is still all stubs, so its API cannot be used; `Store::name_id` is the intern helper and `Store` itself plays the ledger's part. |
-| `hydra_net` | `eastern::{offset, date, format}` in `report::clock`/`report::stamp` | **used as a path dependency** (`Cargo.toml`); it is implemented and its recovered formats match, so the timestamps are byte-identical. |
-| `hydra_model` | `state::combat::defs::defs`, `character::gemstones::Gemstones::equipped_properties` inside `analytics::gear`/`flare` | not used: those are on the *unrecovered* side of the seam (the gemstone property words the report looks up). The lookups are marked `// UNKNOWN:` where they would have happened. |
-| `hydra_session` | `event::Event` drop shims inside `task::start`'s closure | the event enum is replaced by the recovered [`task::Sent`] message shapes. |
+| `rusqlite` | 21 `StatementCache::get`, 86 `Connection::prepare_with_flags`, 41 `query_row`, 14 `query_map` call sites | **reconnected, `rusqlite` 0.37.0 `bundled`.** [`store::Store`] holds a `hydra_ledger::Connection` — a real `rusqlite::Connection` — and every recovered statement is executed through `prepare_cached` (rusqlite's `StatementCache`). The recovered SQL text is kept as a `const` beside each method. |
+| `rusqlite::Error` | the `Result` payload niche (`0x8000_0000_0000_0016` for `Ok`) | **reconnected as a conversion.** [`Error`] is still the text the original printed, but `rusqlite::Error` and `hydra_ledger::Error` now convert into it (`From`), so a failed statement lands there instead of unwrapping or panicking. |
+| `tokio` | `task::start` builds a runtime, `listen` is an async closure over a `broadcast::Receiver`, `Sent` travels over `mpsc` + `batch_semaphore` | **reconnected, `tokio` 1.53.1 `full`.** [`task::listen`] is the async loop over `tokio::sync::mpsc::Receiver<Sent>`; [`task::relay`] is the closure's other half, following a real `broadcast::Receiver<hydra_session::command::Event>`; [`task::start`]/[`task::run`] keep their synchronous signatures by building a current-thread runtime and writing to the recovered thread name. |
+| `hydra_ledger` | `Ledger::writing` (`Recorder::open`), `Ledger::reader` (`command::answer`), `name_id` (`sync_gear`) | **reconnected as a path dependency.** `hydra_ledger` is no longer stubs: `Store::open` is `Ledger::open` + `Ledger::writing`, `Store::open_read_only` is `Ledger::connect(true)` (`Ledger::reader`'s own connection), the schema is `hydra_ledger::migrate`, and `Store::name_id`/`sync_gear` call `hydra_ledger::name_id`. §1.1 records the places the APIs do not line up. |
+| `hydra_net` | `eastern::{offset, date, format, now}` in `report::clock`/`report::stamp`/`task::relay` | **path dependency, unchanged**; its recovered formats match, so the timestamps are byte-identical. |
+| `hydra_model` | `state::combat::defs::defs`, `character::gemstones::Gemstones::equipped_properties` inside `analytics::gear`/`flare` | **partly reconnected.** `Recorder::record_gemstones` takes the real `hydra_model::…::gemstones::Gemstones` and writes one `hunt_gemstones` row per equipped property. `defs()` stays unused: `hydra_model`'s table is *empty* in this rebuild (the generated data file is not embedded), so wiring it into `analytics::gear` would change nothing — the seam stays and is documented at the site. |
+| `hydra_session` | `event::Event` drop shims inside `task::start`'s closure | **reconnected.** The live enum is `hydra_session::command::Event` (there is no `event` module); [`task::relay`] consumes its `broadcast` channel and maps `Event::Frames` → [`task::Sent::Line`], `Event::Over` → [`task::Sent::Ended`], dropping the rest. |
 
 The one recovered *data* table that is embedded verbatim is the help block
 (§4.3).
+
+### 1.1 Phase 1 reconnection: what changed
+
+Dependencies actually added (`crates/hydra_combat_log/Cargo.toml`):
+
+```toml
+rusqlite = { workspace = true }            # 0.37.0, `bundled`
+tokio = { workspace = true }               # 1.53.1, features = ["full"]
+hydra_ledger = { path = "../hydra_ledger" }
+hydra_model = { path = "../hydra_model" }
+hydra_net = { path = "../hydra_net" }      # already there
+hydra_session = { path = "../hydra_session" }
+```
+
+`Cargo.lock` only gains those five edges for `hydra_combat_log`.
+
+**What is now backed by a real crate**
+
+* **The database.** `Store` is a `hydra_ledger::Connection` over the recovered
+  schema (`hunts`, `attacks`, `hits`, `creatures`, `flare_rows`+`flares` view,
+  `statuses`, `hunt_effects`, `hunt_gear`, `gemstone_rows`+`hunt_gemstones`
+  view, `names`). `Store::new` is `:memory:` + `hydra_ledger::migrate`;
+  `Store::open(dir)` is the file-backed ledger `Ledger::open`+`Ledger::writing`;
+  `Store::open_read_only(dir)` is the read-only reader, and it refuses writes
+  with SQLite's own `attempt to write a readonly database`. The inserts, the
+  updates and the selects quoted throughout `store.rs` are the recovered
+  statements, prepared through the statement cache. `Store` is no longer
+  `Clone` (a `Connection` is not); `Store::connection` hands the handle out and
+  `Store::open` reopens the same file.
+* **The row types are unchanged.** `Attack`, `Hit`, `Creature`, `Flare`,
+  `Status`, `Effect`, `GearRow`, `Gemstone`, `Hunt`, `Name` keep every field and
+  type; the readers return owned rows instead of `&Row` (a `Vec<Attack>` rather
+  than a `Vec<&Attack>`), and the writers return `Result<i64, Error>` because a
+  statement can now fail. Three schema columns disagree with the recovered rows
+  and are mapped at the boundary, documented on the field: `hunts.instance` is
+  `TEXT` (the row carries the `i64` the session query binds), `attacks.
+  attacker_exist_id`/`creatures.exist_id` are `INTEGER` (the rows carry text),
+  and `attacks.weapon`, `attacks.redirected_from`, `flare_rows.weapon` are `TEXT`
+  (the rows carry name ids).
+* **The recorder loop.** `task::listen` is `async` over `tokio::sync::mpsc`,
+  `task::relay` consumes `hydra_session`'s `broadcast::Receiver<Event>` and
+  stamps each frame with `hydra_net::eastern::now()`; `task::start`/`task::run`
+  are the synchronous adapters on a current-thread runtime, so the
+  `hydra-combat-log` thread name and the in-order message handling are
+  unchanged.
+* **`hydra_ledger::name_id`.** `Store::name_id` interns through the ledger's own
+  function against `names_kind_name`; `names.kind` is `name` (`GEAR_KIND`/`PROPERTY_KIND`
+  for the two tables that name one) — the kind argument is not visible at the
+  recovered call sites, marked `// UNKNOWN:`.
+* **`hydra_model`.** `Recorder::record_gemstones(&Gemstones)` writes the real
+  gemstone report into `hunt_gemstones`; `report::gemstones_line` prints it.
+
+**What could not be reconnected (and stays as it is)**
+
+* **`analytics::gear`/`flare`'s gemstone property words** — `hydra_model::state::
+  combat::defs::defs()` returns an *empty* table in this rebuild (its TSV data
+  file is not embedded), so wiring it in would change no output. The seam stays
+  and the sites keep their `// UNKNOWN:` markers.
+* **`command::answer`'s reader.** The recovered call shape is
+  `Ledger::reader() -> Reader`, but `hydra_ledger::reader::Reader` keeps its
+  connection private (`Reader::connection()` hands out a `&Connection`), so a
+  `Store` cannot take it over. `Store::open_read_only` calls `Ledger::connect
+  (true)`, which is the exact connection `Ledger::reader` wraps.
+* **`Recorder::sync_effects`' transaction.** The original closes by dropping the
+  connection and issuing `COMMIT` (0x102413ab9); every statement here runs in
+  SQLite's auto-commit mode, so the commit is implicit (`hydra_ledger::
+  Connection::commit` is a documented no-op for the same reason).
+* **The `event::Event` module name.** The original imported
+  `hydra_session::event::Event`; the implemented module is
+  `hydra_session::command::Event`. The type is the one the session actually
+  broadcasts, so the relay uses it and this is the only difference.
 
 ---
 
@@ -179,7 +259,9 @@ literals and called helpers recovered, body implements the evidenced subset;
 
 | fn | address | status | notes |
 |---|---|---|---|
-| `start` | 0x101390df4 | partly | thread name `hydra-combat-log`, `RUST_MIN_STACK`, `combat log thread: {}`; the async loop is replaced by a thread over `mpsc` |
+| `start` | 0x101390df4 | partly | thread name `hydra-combat-log`, `RUST_MIN_STACK`, `combat log thread: {}`; `start`/`run` build a current-thread runtime and drive the async loop |
+| `listen` | — | partly | the async loop: `tokio::sync::mpsc::Receiver<Sent>` in, `Recorder::record` per line, `combat log thread: {}` on failure |
+| `relay` | — | partly | `broadcast::Receiver<hydra_session::command::Event>` → `Sent` (`Frames` → `Line`, `Over` → `Ended`) |
 | helpers | — | — | `start::{{closure}}`, `listen::{{closure}}`, `task::Sent` |
 
 ---
@@ -391,7 +473,22 @@ barriers    barkskin mirror_image_def wthorns640_block sward319 edefenseiii414_l
    which is what the original does with lines it does not recognise.
 7. **`report::linked`** is a 12-byte tail call; its element type is inferred from
    the caller's `Vec<String>`.
-8. **`command::parse`'s variant numbers above 16** (`0x11`, `0x14`, …) appear as
+8. **Row types vs the schema.** Three columns of `hydra_ledger`'s recovered
+   migration do not agree with the rows this crate's statements imply, and the
+   migration wins because it is what SQLite will accept: `hunts.instance` is
+   `TEXT NOT NULL` (the ledger's own `Hunt` row says `instance: String`) while
+   the recovered `SELECT id FROM hunts WHERE instance = ?1 …` (0x102412509)
+   binds an integer, so [`store::Hunt::instance`] stays an `i64` and is stored as
+   its decimal text; `attacks.attacker_exist_id` and `creatures.exist_id` are
+   `INTEGER` while the recovered rows carry the line's text, so a non-numeric
+   value becomes `NULL`; `attacks.weapon`, `attacks.redirected_from` and
+   `flare_rows.weapon` are `TEXT` while the recovered rows carry name ids, so the
+   id's decimal text is what is stored. Nothing else in the two descriptions
+   conflicts, and all six round-trip for the values the recorder writes.
+9. **`statuses`' two required columns.** The recovered [`store::Status`] row has
+   neither `hunt_id` nor `occurred_at`, but both are `NOT NULL` in the schema, so
+   `Store::status(hunt_id, at, row)` takes them from the caller.
+10. **`command::parse`'s variant numbers above 16** (`0x11`, `0x14`, …) appear as
    immediates in the handler tails; `answer`'s jump table covers `0..=16` plus the
    `String` variant `0x15`. The mapping of `17..20` to `barkskin`/`intercepts`/
    `effects`/`gear` is inferred from the report each tail calls.

@@ -3,8 +3,13 @@
 //! The binary hashes with `sha2::sha256::compress256` (called from
 //! `hydra_update::signed::Sums::check` @0x1010a44b0–0x1010a4614 with the
 //! standard IV `6a09e667 bb67ae85 …` loaded from `__const` @0x1023fd008), and
-//! formats the digest as 64 lowercase hex characters.  `sha2` is an external
-//! crate, so the compression function is reproduced here.
+//! formats the digest as 64 lowercase hex characters.
+//!
+//! **Phase 1:** `sha2` is *not* a workspace pin, so this stays hand-rolled
+//! while every other stand-in went; `NOTES.md` §7.3 also records that `PLAN.md`
+//! claims the original linked no `sha2` at all, which conflicts with the
+//! `compress256` call above.  The implementation is checked against FIPS 180-4's
+//! NIST vectors and against itself across the padding boundaries.
 
 /// The SHA-256 initial hash value, FIPS 180-4 §5.3.3.  The same 32 bytes are
 /// the literal at 0x1023fd008 in the binary.

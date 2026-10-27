@@ -6,12 +6,21 @@ Reconstructed from the arm64 Mach-O `/Users/cpmbpro/Code/hydra-inspect/hydra`
 (`lib.rs`, `release.rs`, `signed.rs`, `swap.rs`); this build has none —
 
 * `grep -Rn 'todo!\|unimplemented!' crates/hydra_update/src` is empty,
-* `cargo check -p hydra_update` — clean, no warnings,
-* `cargo test -p hydra_update` — **61 tests pass**,
-* `cargo check --workspace` — clean (no other crate was touched).
+* `cargo check --offline -p hydra_update` — clean, no warnings,
+* `cargo test --offline -p hydra_update` — **63 tests pass**,
+* `cargo check --offline --workspace` — clean (no other crate was touched).
 
 The binary contains the whole crate plus its consumers, so most of the calling
 convention could be read from both sides (the stub and `hydra::update`).
+
+**Phase 1 reconnected the real crates** — `reqwest`/`tokio` for the network,
+`serde`/`serde_json` for the releases document, `semver` for release tags and
+`zip`/`flate2` for the archive — so §5's departures are gone bar two,
+`src/zip.rs` and `src/inflate.rs` are deleted, and `src/json.rs` is a
+`serde_json::Value` re-export.  The
+versions, the behavioural differences that came with them, what is still a seam
+and what moved out of the deleted white-box tests are all in
+[§7 "Phase 1 reconnection"](#7-phase-1-reconnection).
 
 ---
 
@@ -124,13 +133,27 @@ JSON vec at 0x56 per record).
 
 ### 2.3 `Version` (full)
 
-`semver::Version` is an external crate, so its behaviour is reproduced: `parse`
-(three numbers, optional `-pre`, optional `+build`, no leading zeros in numbers
-or numeric pre-release identifiers), `Display`, and the ordering `major, minor,
-patch, Prerelease, BuildMetadata` that the binary compares field by field.
-`Prerelease`'s rules (empty sorts highest, numeric identifiers compare
-numerically, numeric < alphanumeric, shorter prefix first) are implemented, and
-`build` is compared last as text, as `semver` 1.x does.
+`release::Version` **is** `semver::Version` 1.0.28 again, in a newtype
+(`release::Version(semver::Version)`, `Deref` to the inner value, `From` both
+ways) so the recovered path and the recovered `as_str` stay: `parse` is
+`semver::Version::parse`, `Display` is the crate's, and the ordering the binary
+compares field by field — `major`, `minor`, `patch`, `Prerelease`, then
+`BuildMetadata` — is `semver::Version`'s derived `Ord` (the derive lists the
+fields in exactly that order, and `Prerelease`/`BuildMetadata` carry the
+identifier rules: empty sorts highest, numeric identifiers compare numerically,
+numeric < alphanumeric, shorter prefix first at 0x1010ae16c–0x1010ae1cc).
+
+One correction to what the stand-in had inferred: `BuildMetadata`'s comparison
+is *not* plain text — dot-separated numeric identifiers compare numerically, so
+`1.0.0+build.9` < `1.0.0+build.10`.  See §7.
+
+### 2.4 The JSON schema, by `serde`
+
+`release::Listed` and `release::ListedFile` are `serde` derives again
+(`Serialize` + `Deserialize`, no `#[serde(default)]`, so every field is
+required), which is where the string table in §2.1 comes from in the first
+place; `release::listed` is `serde_json::from_str::<Vec<Listed>>`, and the
+`{{Visitor}}::expecting` globals at 0x1010aed0c / 0x1010aed20 are the derive's.
 
 ---
 
@@ -181,8 +204,9 @@ digest = the part before the space, **lowercased** with a vectorised ASCII fold
 
 `minisign-verify` 0.3.0 does: structural checks (algorithm `ED`, key id equal,
 `allow_legacy = false`) and then Ed25519 over BLAKE2b-512 of the data plus the
-global signature over `signature ‖ trusted comment`.  Reproducing BLAKE2b and
-curve25519 is out of scope for a std-only rebuild, so:
+global signature over `signature ‖ trusted comment`.  `minisign-verify` is not
+a workspace pin (Phase 1, §7.3) and reproducing BLAKE2b and curve25519 stays out
+of scope, so:
 
 * key/signature **parsing, base64, the algorithm check, the key-id check and the
   trusted-comment check are implemented** (and tested),
@@ -257,34 +281,43 @@ already being executable.
 
 ### 4.5 ZIP and DEFLATE (full)
 
-`zip` 9.0.0 and `flate2` are external, so:
+`unpack` calls `zip` 9.0.0 again — `ZipArchive::new(Cursor::new(bytes))`
+(0x1010ad178), `by_name`, `read_to_end` — so the end-of-central-directory
+search (64 KiB comment window), the ZIP64 locator/record, the central-directory
+walk with the 0x0001 extra field, the local-header offset, stored/deflated
+members and the CRC-32 verification are the crate's, and `flate2` 1.1.10 (the
+pinned DEFLATE backend `zip` was built with) does the inflating.  (`zip` uses
+the declared uncompressed size as the decoder's buffer size, not as an equality
+check — the hand-written reader also compared it.  Integrity still rests on the
+CRC-32, which covers every byte returned.)  The error texts the binary carries are `zip`'s own, which
+is why they read the way they do: `"invalid Zip archive: Could not find EOCD"`,
+`"invalid Zip archive: Oversized central directory"`, `"specified file not found
+in archive"`, and — from the CRC reader — `"Invalid checksum"`.
 
-* `src/zip.rs` — end-of-central-directory search (with the 64 KiB comment
-  window), ZIP64 locator/record, central-directory walk (with the 0x0001 extra
-  field), local-header offset, stored and deflated members, CRC-32 verification.
-  Error texts follow `zip`'s (`"Could not find EOCD"`, `"Oversized central
-  directory"`, `"Invalid checksum"`, …) — they are the ones the binary carries.
-* `src/inflate.rs` — RFC 1951: stored, fixed-Huffman and dynamic-Huffman blocks.
-
-The tests carry a real 242-byte archive built with Python's `zipfile` (one
-stored, one deflated member) and raw DEFLATE streams produced with zlib.
+`src/zip.rs` and `src/inflate.rs` are **deleted**; §7.5 lists what their tests
+asserted and where that is asserted now.  The tests still carry a real 242-byte
+archive built once with Python's `zipfile` (one stored, one deflated member) in
+`src/testdata.rs`, plus archives written by `zip`'s own writer (stored,
+deflated, per-entry ZIP64, and a full ZIP64 end-of-central-directory section).
 
 ---
 
 ## 5. Departures from the original
 
+Reconnected entries are struck through; what is left is listed in §7.2/§7.3.
+
 | original | here | why |
 |---|---|---|
-| `reqwest` + `tokio` async (`look`, `fetch`, `text`, `body` are `async fn`s) | synchronous functions over a one-method `Transport` trait; the shipped `Offline` transport refuses everything | no network, no external crates; the async shape is invisible to callers of a std-only crate |
+| ~~`reqwest` + `tokio` async (`look`, `fetch`, `text`, `body` are `async fn`s)~~ | ~~synchronous functions over a one-method `Transport` trait; the shipped `Offline` transport refuses everything~~ **reconnected** | `look`/`fetch`/`fetch_with`/`text`/`body` are `async fn`s again and the shipped transport is the real `reqwest::Client`.  See §7.1 |
 | releases URL and platform asset name are compile-time constants inside `look` | parameters of `Releases::look` / `Releases::fetch` | **not recoverable**: the binary holds no releases endpoint among its 31 `https://` literals and no `.zip`/`macos`/`arm64` asset name anywhere in `__cstring`, `__const` or `__DATA`, yet `look` is called with `(&self, &Version)` only (0x10009ed48), so both values were constants it does not spell out.  `// UNKNOWN:` marked at the signature. |
-| `serde`/`serde_json` | `src/json.rs` (a small full JSON reader) + hand-written field mapping | std only; the mapping keeps `serde`'s required-field behaviour and error wording |
-| `semver::Version` | `release::Version` | std only; ordering rules reproduced and tested |
-| `sha2` | `src/sha256.rs` | std only; NIST vectors + streaming equality tests |
-| `minisign-verify` | parsing and every structural check, `Verifier` seam for Ed25519/BLAKE2b; the shipped verifier always fails | the curve is impractical here; the safe path is explicit, never a silent accept |
-| `zip` + `flate2` | `src/zip.rs` + `src/inflate.rs` | std only; stored **and** deflate supported, CRC checked |
-| `Releases::new()` can fail on `ClientBuilder::build` | cannot fail (`Ok`), the failure moves to the first request | there is no client to build |
-| `MOST` size guard: `"{} is larger than any release of Hydra's"` | same message, guard on the received length | the limit itself is not a literal in the binary; possibly a `Content-Length` comparison.  `// UNKNOWN:`, set to 512 MiB |
-| `Sums::checked` is the only entry point | plus `checked_with`, `Sums::parse`, `Sums::list`, `Releases::with`, `Releases::transport`, `Releases::fetch_with` | helpers for tests and for a build that supplies a transport/verifier |
+| ~~`serde`/`serde_json`~~ | ~~`src/json.rs` (a small full JSON reader) + hand-written field mapping~~ **reconnected**: `serde` derives on `Listed`/`ListedFile`, `json` is a `serde_json::Value` re-export | §7.2 |
+| ~~`semver::Version`~~ | ~~`release::Version`, ordering rules reproduced~~ **reconnected**: `release::Version(semver::Version)` | §7.3 |
+| `sha2` | `src/sha256.rs` (hand-rolled FIPS 180-4) | **not a workspace pin**, so it stays; §7.3 records the PLAN/NOTES conflict about whether the original even had `sha2` |
+| `minisign-verify` | parsing and every structural check, `Verifier` seam for Ed25519/BLAKE2b; the shipped verifier always fails | **not a workspace pin**, and the curve is impractical to reproduce; the safe path is explicit, never a silent accept (§7.3) |
+| ~~`zip` + `flate2`~~ | ~~`src/zip.rs` + `src/inflate.rs`~~ **reconnected**: calls `zip` 9.0.0 directly | §7.4 |
+| ~~`Releases::new()` can fail on `ClientBuilder::build`~~ | ~~cannot fail (`Ok`), the failure moves to the first request~~ **reconnected**: fails with `"Hydra cannot reach the releases: {}"` | §7.1 |
+| `MOST` size guard: `"{} is larger than any release of Hydra's"` | same message, guard on the received length | the limit itself is not a literal in the binary; possibly a `Content-Length` comparison.  `// UNKNOWN:`, set to 512 MiB.  (`reqwest` could now report `Content-Length` up front, but the guard still runs on the bytes actually received, which a missing or lying header cannot get around.) |
+| `Sums::checked` is the only entry point | plus `checked_with`, `Sums::parse`, `Sums::list`, `Releases::with`, `Releases::transport`, `Releases::fetch_with`, `client_builder`, `Http`, `Offline`, `BoxFuture`, `Transport::reqwest` | helpers for tests and for a build that supplies a transport/verifier.  `Releases::with` takes an `Arc<dyn Transport>` (the binary's `Releases` is one `Arc`-sized word); `Transport::reqwest` exists so a test can see that the default really is the reqwest client (§7.1) |
 
 Nothing else is invented: module paths (`release`, `signed`, `swap`), the
 function names (`newest`, `check`, `checked`, `unpack`, `put_in_place`,
@@ -307,3 +340,204 @@ function names (`newest`, `check`, `checked`, `unpack`, `put_in_place`,
 * The asset name is compared **exactly** (length then `memcmp`), including in
   `Sums::check`; `SHA256SUMS.txt`'s own name is looked up the same way, so a
   release that renames its checksums file is skipped rather than guessed at.
+* **`sha2` — the two records disagree.**  `PLAN.md` says "The original had no
+  sha2 crate (gs_base keeps its own SHA-256)"; §3.1 says the binary calls
+  `sha2::sha256::compress256` @0x1010b6b60 with the standard IV.  Both cannot be
+  right, and `sha2` is not a workspace pin either way, so the crate keeps
+  `src/sha256.rs`.  See §7.3.
+
+---
+
+## 7. Phase 1 reconnection
+
+Every crate this one linked that is a workspace pin is a dependency again, at
+the pinned version, through `x = { workspace = true }`:
+
+| original crate | pin | used for |
+|---|---|---|
+| `reqwest` | 0.12.28 | `Releases::new`'s client and the shipped `Http` transport (`json`/`native-tls` features from the workspace; **not** `blocking`) |
+| `tokio` | 1.53.1 | dev-dependency only: `#[tokio::test]`.  The crate never starts a runtime or spawns — its `async fn`s are awaited by `hydra::update::keep`, which owns the `tokio::time::timeout` wrappers behind `LOOK_TIMEOUT`/`FETCH_TIMEOUT` |
+| `serde` / `serde_json` | 1.0.229 / 1.0.151 | `Listed`/`ListedFile` derives and the whole document (`release::listed`, `json`) |
+| `semver` | 1.0.28 | `release::Version` |
+| `zip` | 9.0.0 | `swap::unpack` |
+| `flate2` | 1.1.10 | dev-dependency only: an independent DEFLATE decoder in the tests (it is `zip`'s own backend, which is the point) |
+
+`Cargo.lock` gained `semver` and the crate's dependency list; no other crate
+changed.  Nothing here reaches the network, at build time or in the tests.
+
+### 7.1 The network is real again (`reqwest` + `tokio`)
+
+| recovered | now |
+|---|---|
+| `Releases::new` = `ClientBuilder::default().user_agent("hydra/0.1.0-beta.7").timeout(30s)…build()` (0x1010af1bc, 208 B) | `client_builder()` does exactly that (`user_agent` 0x1010af1e0, `timeout` 0x1010af1f4, `connect_timeout` 0x1010af200) and `Releases::new` installs it — **and can fail again**, with `"Hydra cannot reach the releases: {}"` |
+| `look`/`fetch`/`text`/`body` are `async fn`s | `async fn`s again; `fetch`/`fetch_with` keep the same order of operations |
+| `text`'s generator: `RequestBuilder::new` → `send` → `error_for_status` (0x101cc4ac4/0x101cb08b0/0x101ce60dc) | inside `Http::get`: `request(url)` → `send().await` → `error_for_status()` → `bytes().await`.  Status handling belongs to the transport because only it can see a status; the alternative (a status-carrying `Vec<u8>`) would have changed the seam's contract for nothing |
+| `Releases` is one word — the `reqwest::Client` `Arc` | still one word: `Arc<dyn Transport>` |
+| the `timeout(60s)` / `timeout(15min)` wrappers | untouched: they live in `hydra::update::keep`, and `LOOK_TIMEOUT`/`FETCH_TIMEOUT` are still the constants it uses |
+
+The seam is kept, in the shape that survives object safety in edition 2021:
+
+```rust
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait Transport: Send + Sync {
+    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>>;
+    fn reqwest(&self) -> Option<&reqwest::Client> { None }   // diagnostics/tests
+}
+```
+
+* What ships is `Http` (the real client).  `Offline` is still there and
+  still refuses everything, but it is no longer what `Releases::new` installs —
+  a caller that must stay off the network says `Releases::with(Arc::new(Offline))`.
+  `Offline`'s message (`"no transport is installed, so {} was not fetched"`) is
+  a reconstruction, not a recovered literal, and is unchanged.
+* `Releases` no longer implements `Default`: the original has no default client,
+  and the only honest one (the real client) can fail.  That is the one public
+  API item dropped in Phase 1; nothing in the workspace used it.
+* reqwest has **no getters** for client configuration, and it copies the
+  builder's default headers and total timeout onto a request only inside
+  `execute_request`.  So `Http::request` sets the same two values — one
+  `user-agent: hydra/0.1.0-beta.7` header, one 30 s total timeout — on the
+  request itself as well, which is what makes them assertable without a network
+  round trip (`tests::the_default_updater_is_the_recorded_reqwest_client`).
+  Behaviour is unchanged: those are the values the client sends either way.  The
+  connect timeout is only observable from inside reqwest, so it is covered by
+  the constant assertion (`tests::carries_the_recorded_client_settings`) and by
+  the builder call itself.
+* `Transport::reqwest` exists so that test can prove the *default* updater holds
+  a real `reqwest::Client` (it reads `None` for every other transport).
+
+### 7.2 `serde`/`serde_json` 1.0.229/1.0.151 — the document again
+
+`Listed`/`ListedFile` are `Serialize + Deserialize` derives with the recovered
+field names and declaration order, no `#[serde(default)]` (so all of them are
+required), and no rename attributes — the GitHub names *are* the field names.
+`release::listed` is `serde_json::from_str::<Vec<Listed>>`, the recovered
+`from_trait` @0x1010a0f70.  `src/json.rs` keeps its name and its `parse`, but
+`Json` is now `serde_json::Value`; the hand-written parser (and its
+`Json::kind()` helper) is gone, so there is no second parser in the tree.
+
+Behavioural differences, all of them `serde`'s more precise wording:
+`"missing field `draft` at line 1 column 49"` instead of the hand-written
+`"missing field `draft`"`, `"invalid type: string "no", expected a boolean at
+line 1 column 34"` instead of `"invalid type: expected a boolean for `draft`"`.
+`newest` still wraps them in `"The releases could not be read: {}"`.
+
+New tests: `release::tests::the_schema_is_the_recovered_one` (serialized field
+order and names, round trip, every required field of both structs, a mistyped
+field) and `json::tests::is_serde_json` (the value type and its escaping).
+
+### 7.3 `semver` 1.0.28, `sha2`, `minisign-verify`
+
+**`semver` is back.**  `release::Version` is a newtype over `semver::Version`
+with `Deref` (so `version.major`/`.pre`/`.build` still read), `From` in both
+directions, `Display`, `Default` (`0.0.0`) and the recovered `as_str`.  The
+ordering is the crate's derived `Ord` — `major`, `minor`, `patch`,
+`Prerelease`, `BuildMetadata` — which is the chain the binary inlines at
+0x1010ae16c–0x1010ae1cc, and `newest`'s "only if greater than the running
+version" test is unchanged.
+
+Two honest corrections came out of it:
+
+1. **`BuildMetadata` is compared numerically per identifier, not as text.**  The
+   stand-in compared the whole string, so its test asserted
+   `1.0.0+build.10 < 1.0.0+build.9`.  With the real crate it is the other way
+   round (`build.9 < build.10`); the test now says so and
+   `version_ordering_agrees_with_semver` checks the newtype's ordering against
+   `semver::Version`'s on every pair of a ten-version ladder, so the two can
+   never drift again.
+2. **The parse error is `semver`'s** (`"unexpected end of input while parsing
+   minor version number"`, `"unexpected character 'v' while parsing major
+   version number"`) instead of the stand-in's
+   `"unexpected character in version "1.0": unexpected fourth number"`-style
+   text.  Every rejection the old tests asserted is still rejected; only the
+   wording assertions changed (`rejects_versions_semver_rejects`,
+   `unreadable_documents_are_reported`).
+
+**`sha2` is not a workspace pin, so `src/sha256.rs` stays.**  This is where the
+two records conflict: `PLAN.md` says the original had no `sha2` crate, §3.1 says
+the binary calls `sha2::sha256::compress256` @0x1010b6b60 with the standard IV
+from `__const` 0x1023fd008.  Either way it is not in the pins, adding it at a
+crate-local version would go around the pin policy, and the stand-in is
+verified against FIPS 180-4's own vectors (empty, `abc`, the 448-bit two-block
+message, a million `a`s) plus streaming/one-shot equality across the padding
+boundaries — so the checksum comparison in `Sums::check` is still checked
+byte-for-byte.  `sha2` 0.10.9/0.11.1 happen to be in the offline registry; that
+is not an invitation to bypass the pins.
+
+**`minisign-verify` is not a workspace pin, so the seam stays.**  Key and
+signature parsing, base64, the algorithm and key-id checks and the trusted
+comment are implemented and tested exactly as before; the Ed25519/BLAKE2b
+arithmetic is still behind `signed::Verifier`, and the only verifier that ships
+is `signed::Unavailable`, which fails closed.  No curve verification was
+invented.  `fetch` therefore still cannot install anything on trust — that is
+the intended behaviour, not a regression: a release whose signature cannot be
+checked is a release that is not installed.
+
+### 7.4 `zip` 9.0.0 + `flate2` 1.1.10 — the archive again
+
+`swap::unpack(bytes, name) -> Result<Vec<u8>, String>` keeps its recovered
+signature, message shapes and order of checks; the body is now
+
+```rust
+let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;   // "The release file cannot be opened: {}"
+let mut entry = archive.by_name(name)?;                        // "The release file has no {}: {}"
+entry.read_to_end(&mut out)?;                                  // "{} cannot be read out of the release file: {}"
+```
+
+so ZIP64, both compression methods (and every other method `zip` was built
+with) and the CRC-32 check are the crate's.  One check moved shape: the
+hand-written reader compared the returned length against the declared
+uncompressed size and called a mismatch `"Invalid checksum"`; `zip` passes that
+size to its decoder as a buffer hint and relies on the CRC-32 for integrity, so
+an archive whose declared size is wrong but whose bytes and CRC agree now reads
+instead of failing.  That is the real crate's behaviour (which is what the
+binary had), and no integrity check is lost — a wrong size means different
+bytes, and different bytes fail the CRC.
+
+The recovered wrapper messages are untouched; the payloads are `zip`'s `Display`
+texts, which are the strings the binary itself carries
+(`"invalid Zip archive: Could not find EOCD"`, `"specified file not found in
+archive"`, `"Invalid checksum"`), so the previously `// UNKNOWN:` "file not
+found" guess is now the real wording in the tests.
+
+One small difference from the binary's body: the buffer's capacity hint is
+`entry.size().min(64 MiB)` instead of the member's declared size.  The binary
+(`Vec::with_capacity` at 0x1010a674c) would abort on a corrupt central directory
+that declares 2^60 bytes; `read_to_end` still returns the whole member and `zip`
+still verifies its CRC-32.  No check is weakened — one unbounded allocation is
+removed.
+
+### 7.5 What the deleted white-box tests covered, and where it lives now
+
+`src/zip.rs` (6 tests) and `src/inflate.rs` (no tests of its own; its decoder
+was covered through `zip.rs`) are gone.  The coverage moved to black-box tests
+through `unpack` and through `zip` itself, in `swap::tests`:
+
+| deleted test | now |
+|---|---|
+| `zip::tests::lists_both_members` (names, methods 0/8, sizes 15/21/23) | `swap::tests::reads_real_stored_and_deflated_members` — same assertions, read off the real `ZipArchive` metadata |
+| `zip::tests::reads_a_stored_member` | `swap::tests::unpacks_the_member_it_is_named` (+ the stored member's bytes are sliced out of the archive and compared verbatim) |
+| `zip::tests::reads_a_deflated_member` | `swap::tests::unpacks_the_member_it_is_named` (+ the deflated member's raw bytes are decoded by `flate2` independently) |
+| `zip::tests::a_missing_member_is_none` | `swap::tests::unpack_reports_what_went_wrong` (exact, and exact-match is still required) |
+| `zip::tests::refuses_broken_archives` (empty, truncated, CRC) | `swap::tests::refuses_a_truncated_archive`, `refuses_a_member_whose_checksum_does_not_match`, `refuses_a_member_whose_deflate_stream_is_damaged` |
+| `zip::tests::crc32_matches_the_reference` (the reference values `zipfile` wrote) | gone as a unit test: CRC-32 is `zip`'s `crc32fast` now, and `refuses_a_member_whose_checksum_does_not_match` proves the check is live |
+
+Added with the real crate: `swap::tests::unpacks_what_the_real_writer_wrote`
+(stored, deflated, per-entry ZIP64 with its 0xFFFFFFFF sentinels and 0x0001
+extra field, and a full ZIP64 end-of-central-directory section — the last two
+had no test before, because the hand-written reader's ZIP64 path was untested
+here), `swap::tests::a_wrong_declared_size_is_not_an_error_of_its_own` (records
+the one check that changed shape, see above) and
+`swap::tests::overwrites_a_longer_leftover_new_file`.
+
+### 7.6 Gate
+
+```
+cargo check --offline -p hydra_update   # clean, no warnings
+cargo test  --offline -p hydra_update   # 63 passed
+cargo check --offline --workspace       # clean (no other crate touched)
+```
+
+Nothing in this crate reaches the network during either command: the client is
+built and its request is inspected, never sent.

@@ -1,17 +1,24 @@
 //! `hydra_update` — finding a newer Hydra release, proving it is the one its
 //! signature names, and swapping it into place.
 //!
-//! The original crate talked to GitHub with `reqwest` on a `tokio` runtime and
-//! verified with `minisign_verify`; this reconstruction is std only.  What that
-//! changes is recorded here and in `NOTES.md`:
+//! The original crate talked to GitHub with `reqwest` on a `tokio` runtime,
+//! parsed the release list with `serde_json`, parsed release tags with
+//! `semver`, unpacked the archive with `zip` and verified with
+//! `minisign_verify`.  **Phase 1** reconnected all of that at the workspace
+//! pins except the curve arithmetic; `NOTES.md` §5 has the version table.
 //!
-//! * **the network is a seam.**  [`Transport`] is one method wide; the only
-//!   implementation that ships is [`Offline`], which refuses every request, so
-//!   nothing here can reach the network by accident.  A real client is supplied
-//!   by the caller (see `Releases::with`).
-//! * **the signature math is a seam.**  [`signed::Verifier`] is called only
-//!   after the key, the signature and the trusted comment have been parsed and
-//!   checked; the built-in verifier refuses everything, so a release is never
+//! What that changes, and what it does not:
+//!
+//! * **the network is real.**  [`Releases::new`] builds the recovered
+//!   [`reqwest::Client`] ([`USER_AGENT`], [`CLIENT_TIMEOUT`] total *and*
+//!   connect) and installs it as the default [`Transport`].  The seam is still
+//!   there — [`Transport`] is one boxed-future method wide, so tests (and a
+//!   caller that must not reach the network) can supply [`Offline`] — but the
+//!   shipped transport is [`Http`], not an always-failing stub.
+//! * **the signature math is still a seam.**  [`signed::Verifier`] is called
+//!   only after the key, the signature and the trusted comment have been parsed
+//!   and checked; `minisign-verify` is not a workspace pin, so the built-in
+//!   verifier [`signed::Unavailable`] refuses everything.  Nothing is ever
 //!   accepted on trust.
 //! * **the releases URL and the asset name are parameters.**  The binary does
 //!   not carry either as a string (there is no releases endpoint among the 31
@@ -30,10 +37,16 @@ pub mod release;
 pub mod sha256;
 pub mod signed;
 pub mod swap;
-mod inflate;
-mod zip;
+
+/// Fixtures the tests share (a real ZIP built with Python's `zipfile`, and the
+/// `zip` writer that builds fresh ones).
+#[cfg(test)]
+mod testdata;
 
 use release::{Offer, Version};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The version this build reports as its own, parsed by
@@ -73,25 +86,130 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// far above anything Hydra has published and still refuses a runaway response.
 pub const MOST: u64 = 512 * 1024 * 1024;
 
+/// The future a [`Transport`] hands back.
+///
+/// The seam has to stay **object safe** (the binary's `Releases` holds a
+/// `dyn` client, and the tests pass their own transport in), so the trait
+/// cannot use `async fn` itself in edition 2021; a boxed `+ Send` future is the
+/// explicit form of what `async fn` in the trait would desugar to.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Where a release download comes from.
 ///
-/// `reqwest::Client` in the original: `Releases::new` keeps one, `look` and
-/// `fetch` use it, and it sends [`USER_AGENT`] with a [`CLIENT_TIMEOUT`].
+/// In the original this was a `reqwest::Client` held by `Releases`: `look` and
+/// `fetch` used it, and it sent [`USER_AGENT`] with a [`CLIENT_TIMEOUT`].
 /// Implementations must be honest about failure — every `Err` here becomes
 /// `"The update stopped: {}"`.
-pub trait Transport {
-    /// `GET url`, whole body.
-    fn get(&self, url: &str) -> Result<Vec<u8>, String>;
+pub trait Transport: Send + Sync {
+    /// `GET url`, whole body.  Implementations report transport *and* HTTP
+    /// failures: the recovered `text` generator called `error_for_status`
+    /// (0x101ce60dc) right after `send`.
+    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>>;
+
+    /// The `reqwest` client behind this transport, when there is one.
+    ///
+    /// `reqwest::Client` exposes no getters, so this is how a test can see that
+    /// the shipped [`Releases::new`] really installed the recovered client
+    /// settings instead of a stub.  `None` for every other transport.
+    fn reqwest(&self) -> Option<&reqwest::Client> {
+        None
+    }
 }
 
-/// The transport that ships: it refuses everything, so an unfurnished
-/// `Releases` cannot reach the network.
+/// A transport that refuses everything, so an updater furnished with it cannot
+/// reach the network.
+///
+/// **Not** what ships — [`Releases::new`] installs [`Http`].  This exists so the
+/// refusal path stays testable, and so a caller that must stay offline can say
+/// `Releases::with(Arc::new(Offline))` out loud.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Offline;
 
 impl Transport for Offline {
-    fn get(&self, url: &str) -> Result<Vec<u8>, String> {
-        Err(format!("no transport is installed, so {url} was not fetched"))
+    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+        let refusal = format!("no transport is installed, so {url} was not fetched");
+        Box::pin(async move { Err(refusal) })
+    }
+}
+
+/// The [`reqwest::ClientBuilder`] `Releases::new` builds (@0x1010af1bc, 208 B).
+///
+/// * `user_agent("hydra/0.1.0-beta.7")` — [`USER_AGENT`], set at 0x1010af1e0;
+/// * `timeout(30s)` and `connect_timeout(30s)` — the two `Some(30s)` at
+///   0x1010af1f4 / 0x1010af200.
+///
+/// reqwest 0.12 has no `blocking` feature here on purpose: it needs
+/// `futures-io`, which is not in the offline registry.
+pub fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(CLIENT_TIMEOUT)
+        .connect_timeout(CLIENT_TIMEOUT)
+}
+
+/// The transport that ships: the real `reqwest` client.
+#[derive(Debug, Clone)]
+pub struct Http {
+    client: reqwest::Client,
+}
+
+impl Http {
+    /// Build the recovered client — `Releases::new`'s only step.
+    ///
+    /// The original could fail here (`ClientBuilder::build` → an error), which
+    /// is why `Releases::new` returns a `Result`.
+    pub fn new() -> Result<Http, String> {
+        let client = client_builder()
+            .build()
+            .map_err(|e| format!("Hydra cannot reach the releases: {e}"))?;
+        Ok(Http { client })
+    }
+
+    /// Wrap a client the caller built (tests, or a caller with its own proxy
+    /// settings).
+    pub fn with_client(client: reqwest::Client) -> Http {
+        Http { client }
+    }
+
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// One GET with the recovered settings applied to the request itself.
+    ///
+    /// `reqwest` copies the builder's default headers and timeout onto the
+    /// request only at `execute` time (`Client::execute_request` inserts
+    /// `self.inner.headers` and the total timeout), so nothing about a built
+    /// `Request` shows them.  Setting them here as well is the same two values
+    /// — one `user-agent` header and one 30 s total timeout — and it makes them
+    /// observable without a network round trip.
+    pub fn request(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .timeout(CLIENT_TIMEOUT)
+    }
+}
+
+impl Transport for Http {
+    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+        Box::pin(async move {
+            // `text`'s recovered generator: `send` (0x101cb08b0) then
+            // `error_for_status` (0x101ce60dc).
+            let response = self
+                .request(url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let body = response.bytes().await.map_err(|e| e.to_string())?;
+            Ok(body.to_vec())
+        })
+    }
+
+    fn reqwest(&self) -> Option<&reqwest::Client> {
+        Some(&self.client)
     }
 }
 
@@ -99,30 +217,23 @@ impl Transport for Offline {
 ///
 /// The binary's `Releases` is one word — the `reqwest::Client` (`Arc`) — stored
 /// at `hydra::update::keep`'s state+0x108 and handed to `look` as `&self`
-/// (0x10009ed48).
+/// (0x10009ed48).  The same one word is kept here: an `Arc<dyn Transport>`.
 pub struct Releases {
-    client: Box<dyn Transport>,
-}
-
-impl Default for Releases {
-    fn default() -> Self {
-        Releases { client: Box::new(Offline) }
-    }
+    client: Arc<dyn Transport>,
 }
 
 impl Releases {
     /// `Releases::new` @0x1010af1bc: build the client.
     ///
-    /// The original can fail here (`ClientBuilder::build` returning an error →
-    /// `"Hydra cannot reach the releases: {}"`); with no client to build this
-    /// only ever succeeds, and the failure moves to the first request.
+    /// Can fail, as the original could (`ClientBuilder::build` erroring), with
+    /// `"Hydra cannot reach the releases: {}"`.
     pub fn new() -> Result<Releases, String> {
-        Ok(Releases::default())
+        Ok(Releases { client: Arc::new(Http::new()?) })
     }
 
-    /// The same updater over an explicit transport — how a networked build (or
-    /// a test) supplies one.
-    pub fn with(client: Box<dyn Transport>) -> Releases {
+    /// The same updater over an explicit transport — how a test, or a caller
+    /// that must stay off the network, supplies one.
+    pub fn with(client: Arc<dyn Transport>) -> Releases {
         Releases { client }
     }
 
@@ -135,11 +246,16 @@ impl Releases {
     /// `SHA256SUMS.txt` and `SHA256SUMS.txt.minisig`).
     ///
     /// `// UNKNOWN:` `url` is a parameter here — see the module note.  The
-    /// original's `look` took `(&self, &Version)` only and was wrapped in
-    /// [`LOOK_TIMEOUT`] by its caller; it returned
+    /// original's `look` was an `async fn` taking `(&self, &Version)` only and
+    /// was wrapped in [`LOOK_TIMEOUT`] by its caller; it returned
     /// `Result<Option<Offer>, String>`.
-    pub fn look(&self, url: &str, running: &Version, asset: &str) -> Result<Option<Offer>, String> {
-        let releases = text(self.client.as_ref(), url)?;
+    pub async fn look(
+        &self,
+        url: &str,
+        running: &Version,
+        asset: &str,
+    ) -> Result<Option<Offer>, String> {
+        let releases = text(self.client.as_ref(), url).await?;
         release::newest(&releases, running, asset)
     }
 
@@ -155,7 +271,7 @@ impl Releases {
     ///
     /// `asset` is the archive's name as `SHA256SUMS.txt` spells it, `entry` is
     /// the member inside the archive, and `place` is the file to replace.
-    pub fn fetch(
+    pub async fn fetch(
         &self,
         offer: &Offer,
         asset: &str,
@@ -163,34 +279,34 @@ impl Releases {
         place: &str,
     ) -> Result<(), String> {
         self.fetch_with(&signed::Unavailable, offer, asset, entry, place)
+            .await
     }
 
     /// [`Releases::fetch`] with an explicit [`signed::Verifier`] — the path a
-    /// build with the curve arithmetic takes, and the only way to reach the
-    /// checksum and swap steps.
-    pub fn fetch_with<V: signed::Verifier + ?Sized>(
+    /// build that can do the curve arithmetic takes, and the only way to reach
+    /// the checksum and swap steps.
+    pub async fn fetch_with<V>(
         &self,
         verifier: &V,
         offer: &Offer,
         asset: &str,
         entry: &str,
         place: &str,
-    ) -> Result<(), String> {
-        let sums_text = text(self.client.as_ref(), &offer.sums.url)?;
-        let signature = text(self.client.as_ref(), &offer.signature.url)?;
+    ) -> Result<(), String>
+    where
+        V: signed::Verifier + ?Sized + Sync,
+    {
+        let sums_text = text(self.client.as_ref(), &offer.sums.url).await?;
+        let signature = text(self.client.as_ref(), &offer.signature.url).await?;
         let version = offer.version.to_string();
-        let sums = signed::Sums::checked_with(
-            verifier,
-            sums_text.as_bytes(),
-            &signature,
-            &version,
-            KEY,
-        )?;
+        let sums =
+            signed::Sums::checked_with(verifier, sums_text.as_bytes(), &signature, &version, KEY)?;
         body(self.client.as_ref(), &offer.archive.url, |bytes| {
             sums.check(asset, bytes)?;
             let unpacked = swap::unpack(bytes, entry)?;
             swap::put_in_place(place, &unpacked)
         })
+        .await
     }
 }
 
@@ -198,13 +314,14 @@ impl Releases {
 ///
 /// The binary's `text` is an `async fn` whose generator is
 /// `hydra_update::text::{{closure}}` @0x100240204 — `IntoUrl` (0x101cc4ac4),
-/// `RequestBuilder::new` (0x101cb06cc), `send` (0x101cb08b0),
-/// `error_for_status` (0x101ce60dc), then `hydra_update::body` with a closure
-/// that insists on UTF-8.
-pub fn text(client: &dyn Transport, url: &str) -> Result<String, String> {
+/// `RequestBuilder::new` (0x101cb06cc), `send`, `error_for_status` (inside the
+/// transport here), then `hydra_update::body` with a closure that insists on
+/// UTF-8.
+pub async fn text(client: &dyn Transport, url: &str) -> Result<String, String> {
     body(client, url, |bytes| {
         String::from_utf8(bytes.to_vec()).map_err(|_| format!("{url} is not text"))
     })
+    .await
 }
 
 /// `hydra_update::body`: the body of `url`, handed to `then`.
@@ -213,13 +330,18 @@ pub fn text(client: &dyn Transport, url: &str) -> Result<String, String> {
 /// `drop_in_place<hydra_update::body<…>>` for `text`'s closure and for
 /// `hydra::update::fetch`'s closure — which is why the reading, the size guard
 /// and `"The update stopped: {}"` live here rather than in each caller.
-pub fn body<T>(
+///
+/// `then` is `Send` so the returned future is too: `hydra::update::keep` awaits
+/// `fetch` inside `tokio::time::timeout`, and keeping these futures spawnable
+/// costs nothing.
+pub async fn body<T>(
     client: &dyn Transport,
     url: &str,
-    then: impl FnOnce(&[u8]) -> Result<T, String>,
+    then: impl FnOnce(&[u8]) -> Result<T, String> + Send,
 ) -> Result<T, String> {
     let response = client
         .get(url)
+        .await
         .map_err(|e| format!("The update stopped: {e}"))?;
     if response.len() as u64 > MOST {
         // `// UNKNOWN:` see [`MOST`]; the message is the binary's.
@@ -234,15 +356,16 @@ pub fn body<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use crate::testdata::{ARCHIVE, ARCHIVE_SUM};
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     /// A transport that hands out canned bodies, in order.
-    struct Canned(RefCell<VecDeque<(String, Vec<u8>)>>);
+    struct Canned(Mutex<VecDeque<(String, Vec<u8>)>>);
 
     impl Canned {
-        fn new(pages: &[(&str, &[u8])]) -> Box<Canned> {
-            Box::new(Canned(RefCell::new(
+        fn new(pages: &[(&str, &[u8])]) -> Arc<Canned> {
+            Arc::new(Canned(Mutex::new(
                 pages
                     .iter()
                     .map(|(url, body)| (url.to_string(), body.to_vec()))
@@ -252,15 +375,20 @@ mod tests {
     }
 
     impl Transport for Canned {
-        fn get(&self, url: &str) -> Result<Vec<u8>, String> {
-            let mut pages = self.0.borrow_mut();
-            let page = pages
+        fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+            let page = self
+                .0
+                .lock()
+                .expect("the canned list")
                 .pop_front()
-                .ok_or_else(|| format!("nothing left for {url}"))?;
-            if page.0 != url {
-                return Err(format!("asked for {url}, had {}", page.0));
-            }
-            Ok(page.1)
+                .ok_or_else(|| format!("nothing left for {url}"));
+            Box::pin(async move {
+                let page = page?;
+                if page.0 != url {
+                    return Err(format!("asked for {url}, had {}", page.0));
+                }
+                Ok(page.1)
+            })
         }
     }
 
@@ -268,8 +396,8 @@ mod tests {
     struct Broken;
 
     impl Transport for Broken {
-        fn get(&self, _: &str) -> Result<Vec<u8>, String> {
-            Err("dns error: no such host".to_string())
+        fn get<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+            Box::pin(async { Err("dns error: no such host".to_string()) })
         }
     }
 
@@ -283,8 +411,8 @@ mod tests {
        ]}
     ]"#;
 
-    #[test]
-    fn looks_up_the_newest_release_over_the_transport() {
+    #[tokio::test]
+    async fn looks_up_the_newest_release_over_the_transport() {
         let releases = Releases::with(Canned::new(&[(
             "https://example.invalid/releases",
             RELEASES.as_bytes(),
@@ -292,6 +420,7 @@ mod tests {
         let running = Version::parse(VERSION).unwrap();
         let offer = releases
             .look("https://example.invalid/releases", &running, "hydra-arm64")
+            .await
             .expect("reads")
             .expect("offers");
         assert_eq!(offer.tag_name, "v0.1.0-beta.8");
@@ -299,8 +428,8 @@ mod tests {
         assert_eq!(offer.archive.size, 42);
     }
 
-    #[test]
-    fn nothing_newer_is_not_an_error() {
+    #[tokio::test]
+    async fn nothing_newer_is_not_an_error() {
         let releases = Releases::with(Canned::new(&[(
             "https://example.invalid/releases",
             RELEASES.as_bytes(),
@@ -308,16 +437,52 @@ mod tests {
         let running = Version::parse("0.1.0-beta.8").unwrap();
         assert!(releases
             .look("https://example.invalid/releases", &running, "hydra-arm64")
+            .await
             .unwrap()
             .is_none());
     }
 
-    #[test]
-    fn the_default_updater_is_offline() {
-        let releases = Releases::new().expect("builds");
+    /// The default updater is the real client, built with the recovered
+    /// settings.  No request leaves the process: only the request *builder* is
+    /// inspected (header and timeout), never `send`.
+    #[tokio::test]
+    async fn the_default_updater_is_the_recorded_reqwest_client() {
+        let releases = Releases::new().expect("builds the client");
+
+        // The shipped transport is `Http`, not a stub.
+        let client = releases
+            .transport()
+            .reqwest()
+            .expect("the default transport is a reqwest client")
+            .clone();
+
+        // The requests it makes carry the recovered user agent and the 30-second
+        // total timeout (`Http::get` builds them with `Http::request`).
+        let request = Http::with_client(client)
+            .request("https://example.invalid/releases")
+            .build()
+            .expect("builds a request");
+        assert_eq!(
+            request.headers()[reqwest::header::USER_AGENT],
+            "hydra/0.1.0-beta.7"
+        );
+        assert_eq!(request.timeout(), Some(&CLIENT_TIMEOUT));
+        assert_eq!(CLIENT_TIMEOUT, Duration::from_secs(30));
+
+        // A built client from the recovered builder is usable too (and, again,
+        // is never sent anything).
+        client_builder().build().expect("the recovered builder builds");
+    }
+
+    /// An updater someone deliberately kept offline still refuses everything.
+    #[tokio::test]
+    async fn an_offline_updater_refuses_everything() {
+        let releases = Releases::with(Arc::new(Offline));
+        assert!(releases.transport().reqwest().is_none());
         let running = Version::parse(VERSION).unwrap();
         let error = releases
             .look("https://example.invalid/releases", &running, "hydra-arm64")
+            .await
             .unwrap_err();
         assert_eq!(
             error,
@@ -326,37 +491,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_dead_network_says_so() {
-        let releases = Releases::with(Box::new(Broken));
-        let error = text(releases.transport(), "https://example.invalid/x").unwrap_err();
+    #[tokio::test]
+    async fn a_dead_network_says_so() {
+        let releases = Releases::with(Arc::new(Broken));
+        let error = text(releases.transport(), "https://example.invalid/x")
+            .await
+            .unwrap_err();
         assert_eq!(error, "The update stopped: dns error: no such host");
     }
 
-    #[test]
-    fn text_insists_on_utf8() {
+    #[tokio::test]
+    async fn text_insists_on_utf8() {
         let releases = Releases::with(Canned::new(&[(
             "https://example.invalid/bin",
             &[0x50, 0x4b, 0x03, 0x04, 0xff, 0xfe],
         )]));
-        let error = text(releases.transport(), "https://example.invalid/bin").unwrap_err();
+        let error = text(releases.transport(), "https://example.invalid/bin")
+            .await
+            .unwrap_err();
         assert_eq!(error, "https://example.invalid/bin is not text");
     }
 
-    #[test]
-    fn body_hands_the_bytes_over() {
+    #[tokio::test]
+    async fn body_hands_the_bytes_over() {
         let releases = Releases::with(Canned::new(&[("https://example.invalid/x", b"hello")]));
         let handed = body(releases.transport(), "https://example.invalid/x", |bytes| {
             Ok(bytes.to_vec())
         })
+        .await
         .unwrap();
         assert_eq!(handed, b"hello");
     }
 
+    /// The futures are `Send`, as the original's were: `keep` drives `fetch`
+    /// through `tokio::time::timeout` inside a spawned task.
+    #[tokio::test]
+    async fn the_async_paths_are_spawnable() {
+        fn is_send<T: Send>(value: T) -> T {
+            value
+        }
+        let releases = Releases::with(Arc::new(Offline));
+        let running = Version::parse(VERSION).unwrap();
+        let look = is_send(releases.look("https://example.invalid/x", &running, "hydra-arm64"));
+        assert!(look.await.is_err());
+        let offer = offer("0.1.0-beta.8");
+        let fetch = is_send(releases.fetch(&offer, "hydra-arm64", "hydra", "/tmp/hydra"));
+        assert!(fetch.await.is_err());
+    }
+
     /// The end-to-end path, which must stop at the signature: no verifier
     /// ships, so a release is never installed on trust.
-    #[test]
-    fn fetch_refuses_a_release_it_cannot_prove() {
+    #[tokio::test]
+    async fn fetch_refuses_a_release_it_cannot_prove() {
         let offer = Offer {
             tag_name: "v0.1.0-beta.8".to_string(),
             html_url: String::new(),
@@ -380,6 +566,7 @@ mod tests {
         ]));
         let error = releases
             .fetch(&offer, "hydra-arm64", "hydra", "/tmp/hydra")
+            .await
             .unwrap_err();
         // The truncated signature file cannot be decoded at all.
         assert!(
@@ -387,32 +574,6 @@ mod tests {
             "{error}"
         );
     }
-
-    /// The archive `swap::unpack` can open (see `zip::tests`): a stored
-    /// `stored.txt` and a deflated `hydra` holding "the quick brown fox.\n".
-    const ARCHIVE: &[u8] = &[
-        0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x38, 0x5b, 0x5d, 0x50, 0x20,
-        0xcd, 0x46, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x73, 0x74,
-        0x6f, 0x72, 0x65, 0x64, 0x2e, 0x74, 0x78, 0x74, 0x70, 0x6c, 0x61, 0x69, 0x6e, 0x20, 0x63, 0x6f,
-        0x6e, 0x74, 0x65, 0x6e, 0x74, 0x73, 0x0a, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08,
-        0x00, 0xe2, 0x38, 0x5b, 0x5d, 0xe4, 0x3d, 0x10, 0x75, 0x17, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00,
-        0x00, 0x05, 0x00, 0x00, 0x00, 0x68, 0x79, 0x64, 0x72, 0x61, 0x2b, 0xc9, 0x48, 0x55, 0x28, 0x2c,
-        0xcd, 0x4c, 0xce, 0x56, 0x48, 0x2a, 0xca, 0x2f, 0xcf, 0x53, 0x48, 0xcb, 0xaf, 0xd0, 0xe3, 0x02,
-        0x00, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x03, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x38, 0x5b,
-        0x5d, 0x50, 0x20, 0xcd, 0x46, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x73,
-        0x74, 0x6f, 0x72, 0x65, 0x64, 0x2e, 0x74, 0x78, 0x74, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x03, 0x14,
-        0x00, 0x00, 0x00, 0x08, 0x00, 0xe2, 0x38, 0x5b, 0x5d, 0xe4, 0x3d, 0x10, 0x75, 0x17, 0x00, 0x00,
-        0x00, 0x15, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x80, 0x01, 0x37, 0x00, 0x00, 0x00, 0x68, 0x79, 0x64, 0x72, 0x61, 0x50, 0x4b, 0x05, 0x06,
-        0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x6b, 0x00, 0x00, 0x00, 0x71, 0x00, 0x00, 0x00,
-        0x00, 0x00,
-    ];
-
-    /// The SHA-256 of `ARCHIVE`, i.e. what a `SHA256SUMS.txt` line for the
-    /// archive named `hydra-arm64` would carry.
-    const ARCHIVE_SUM: &str =
-        "9d53b7c6c1cd88f6829c41c5b52137dce0c2e749c4a3616b72444035de04060a";
 
     /// A verifier a test can install, standing in for the Ed25519 check.
     struct Agreeing;
@@ -510,8 +671,8 @@ mod tests {
     /// The whole chain with a verifier installed: fetch the checksums and their
     /// signature, parse them, hash the archive against them, unpack the member
     /// and swap it into place.
-    #[test]
-    fn fetch_installs_the_member_it_verified() {
+    #[tokio::test]
+    async fn fetch_installs_the_member_it_verified() {
         let scratch = Scratch::new("ok");
         let place = scratch.0.join("hydra");
         std::fs::write(&place, b"the old binary\n").unwrap();
@@ -533,6 +694,7 @@ mod tests {
                 "hydra",
                 place.to_str().unwrap(),
             )
+            .await
             .expect("installs");
         assert_eq!(std::fs::read(&place).unwrap(), b"the quick brown fox.\n");
         assert!(!scratch.0.join("hydra.new").exists());
@@ -541,8 +703,8 @@ mod tests {
 
     /// A checksum that does not match the archive stops the install before
     /// anything is written.
-    #[test]
-    fn fetch_refuses_an_archive_that_is_not_the_one_signed() {
+    #[tokio::test]
+    async fn fetch_refuses_an_archive_that_is_not_the_one_signed() {
         let scratch = Scratch::new("badsum");
         let place = scratch.0.join("hydra");
         std::fs::write(&place, b"the old binary\n").unwrap();
@@ -564,6 +726,7 @@ mod tests {
                 "hydra",
                 place.to_str().unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(
             error,
@@ -574,8 +737,8 @@ mod tests {
     }
 
     /// The signature must name this version.
-    #[test]
-    fn fetch_refuses_checksums_signed_for_another_version() {
+    #[tokio::test]
+    async fn fetch_refuses_checksums_signed_for_another_version() {
         let scratch = Scratch::new("version");
         let place = scratch.0.join("hydra");
         let sums = format!("{ARCHIVE_SUM}  hydra-arm64\n");
@@ -594,6 +757,7 @@ mod tests {
                 "hydra",
                 place.to_str().unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(
             error,

@@ -2,3 +2,25 @@
 name = "hydra_update"
 version = "0.0.0"
 edition = "2021"
+
+# Phase 1 reconnection: every crate the recovered `hydra_update` linked is a
+# workspace pin again — `reqwest` 0.12.28 (the client, without the `blocking`
+# feature, whose `futures-io` dependency is not in the offline registry),
+# `serde` 1.0.229 + `serde_json` 1.0.151 (the releases document), `semver`
+# 1.0.28 (release tags) and `zip` 9.0.0 (the archive member, which brings the
+# pinned `flate2` 1.1.10 in as its DEFLATE backend).
+# `sha2` and `minisign-verify` are not workspace pins — see NOTES.md.
+[dependencies]
+reqwest = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zip = { workspace = true }
+
+# Tests only: `tokio` for `#[tokio::test]` (the crate itself never spawns a task
+# or starts a runtime — its `async fn`s are awaited by the caller), and `flate2`
+# to decode a member's raw bytes independently of `zip`, proving the archive
+# really carries an RFC 1951 stream.
+[dev-dependencies]
+flate2 = { workspace = true }
+tokio = { workspace = true }

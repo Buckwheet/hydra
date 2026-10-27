@@ -3,9 +3,11 @@
 //! inventory window, conditions, scrollback and the settings model.
 //!
 //! Recovered from the arm64 Hydra binary; every module carries the addresses of
-//! the functions it came from.  The presentation layer is behind
-//! [`seam`]-style no-op seams (see each module's notes) because `egui` is not
-//! available here.
+//! the functions it came from.  Phase 4 put drawing back: the draw seams
+//! (`view::PlayView::ui`, `story::Story::paint*`, `hotbar::Bar::ui`,
+//! `frame::painted`) paint with `epaint` from the recovered theme data, through
+//! [`paint`].  No `eframe`/winit call exists here — the crate never opens a
+//! window, it only hands shapes to a `Ui` it is given.
 pub mod bounty;
 pub mod channel_line;
 pub mod combat_line;
@@ -23,6 +25,7 @@ pub mod lookout_line;
 pub mod macros;
 pub mod merge;
 pub mod object_menu;
+pub mod paint;
 pub mod perf;
 pub mod picture;
 pub mod run;

@@ -41,6 +41,9 @@ version = "0.0.0"
 [[package]]
 name = "hydra_import"
 version = "0.0.0"
+dependencies = [
+ "hydra_net",
+]
 
 [[package]]
 name = "hydra_ledger"

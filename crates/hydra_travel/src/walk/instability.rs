@@ -160,21 +160,79 @@ pub fn element_given_off(line: &str) -> Option<Element> {
     senses(line)
 }
 
-/// Answer the instability question.
+/// The question the game asked.
 ///
-/// **Partly recovered** (`0x101556534`): the argument is trimmed and
-/// ASCII-lowercased, then dispatched on length. One 11-byte needle spells
-/// `"instability"` (`0x6e69/0x7473/0x6261/0x6c69` + `0x6174/0x6962/0x696c/
-/// 0x7974`, returning tag `3`), and a 15-byte needle begins `"confu…"`. The
-/// remaining needles and their tags are not recoverable, so only the recovered
-/// ones are answered.
-pub fn asked(word: &str) -> Option<Element> {
-    let word = word.trim().to_ascii_lowercase();
-    match word.as_str() {
-        // 11 bytes, tag 3 in the original.
-        "instability" => Some(Element::Earth),
-        _ => Element::parse(&word),
+/// The four words and their tag numerals come straight out of [`asked`]'s
+/// compare chain (`0x101556574`..`0x101556674`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Asked {
+    /// `confluence` (10 bytes) — tag `0` (`mov w21, #0x0` at `0x10155663c`).
+    Confluence,
+    /// `confluence-hot` (14 bytes) — tag `1` (`mov w21, #0x1` at `0x10155672c`).
+    ConfluenceHot,
+    /// `confluence-cold` (15 bytes) — tag `2` (`mov w21, #0x2` at `0x10155660c`).
+    ConfluenceCold,
+    /// `instability` (11 bytes) — tag `3` (`mov w21, #0x3` at `0x1015565c0`).
+    Instability,
+}
+
+impl Asked {
+    /// Every word [`asked`] answers, in tag order.
+    pub const ALL: [Asked; 4] = [
+        Asked::Confluence,
+        Asked::ConfluenceHot,
+        Asked::ConfluenceCold,
+        Asked::Instability,
+    ];
+
+    /// The tag numeral the original returned for this word.
+    pub fn tag(self) -> u8 {
+        match self {
+            Asked::Confluence => 0,
+            Asked::ConfluenceHot => 1,
+            Asked::ConfluenceCold => 2,
+            Asked::Instability => 3,
+        }
     }
+
+    /// The word itself.
+    pub fn word(self) -> &'static str {
+        match self {
+            Asked::Confluence => "confluence",
+            Asked::ConfluenceHot => "confluence-hot",
+            Asked::ConfluenceCold => "confluence-cold",
+            Asked::Instability => "instability",
+        }
+    }
+}
+
+/// The area a Confluence room sits in — the 22-byte string `asked` compares the
+/// room's first path string against (`0x1015566b4`..`0x1015566e4`).
+pub const CONFLUENCE_AREA: &str = "[Elemental Confluence]";
+
+/// Which instability question a word asks.
+///
+/// **ESTABLISHED**: the body trims and lower-cases its argument
+/// (`0x101556564`, `0x10155656c`) and then switches on its **byte length**
+/// (`cmp x8, #0xd` / `#0xa` / `#0xb` / `#0xe` / `#0xf` at `0x101556574`):
+///
+/// | length | needle | tag |
+/// |---|---|---|
+/// | 10 | `confluence` (`0x6f63/0x666e/0x756c/0x6e65` then `ldrh` `"ce"`) | `0` |
+/// | 11 | `instability` (`0x6e69/0x7473/0x6261/0x6c69` + `0x6174/0x6962/0x696c/0x7974`) | `3` |
+/// | 14 | `confluence-hot` (`ldur` at `+6` = `"ence-hot"`) | `1` |
+/// | 15 | `confluence-cold` (`ldur` at `+7` = `"nce-cold"`) | `2` |
+///
+/// Anything else falls through to a room test: when the caller's tag argument is
+/// `1` the body asks `cena_map::map::Map::room` (`0x101556688`) and compares the
+/// first of the room's path strings against [`CONFLUENCE_AREA`].
+///
+/// **Not reproduced:** that fall-through, and the room the original returned
+/// beside the tag (`mov x0, x21; mov x1, x20` at `0x10155670c`) — both need the
+/// caller's tag argument, which the reconstructed signature does not carry.
+pub fn asked(word: &str) -> Option<Asked> {
+    let word = word.trim().to_lowercase();
+    Asked::ALL.into_iter().find(|asked| asked.word() == word)
 }
 
 /// Narrow a full instability line down to its element and room.
@@ -191,27 +249,34 @@ pub fn narrow(line: &str) -> Option<(Element, Option<u32>)> {
     Some((element, room))
 }
 
-/// Build the half of an element phrase that follows the adjective.
+/// Is this phrase one of the "huge … elemental" half tags? (`0x101557810`)
 ///
-/// **Partly recovered** (`0x101557810`): the body selects one of two static
-/// 64-byte tables (four `&str` entries each, at `0x10443b8a8` and
-/// `0x10443b8e8`) on its first argument, then formats through the piece list at
-/// `0x103e6c7d2`, which is `"huge "` (5) followed by a piece beginning
-/// `" element…"`. The two tables' word lists are `&str` pairs in
-/// `__DATA_CONST` and were not recovered, so this build keeps the two table
-/// shapes and the recovered format.
-pub fn half_tag(large: bool, element: Element) -> String {
-    const SMALL: [&str; 4] = ["", "", "", ""];
-    const LARGE: [&str; 4] = ["huge ", "", "", ""];
-    let table = if large { LARGE } else { SMALL };
-    let prefix = table[match element {
-        Element::Air => 0,
-        Element::Lightning => 1,
-        Element::Earth => 2,
-        Element::Water => 3,
-    }];
-    format!("{prefix} element of {element}")
+/// **ESTABLISHED:** the two tables were read out of
+/// `__DATA_CONST` and the format string decoded — this is a **predicate**, not a
+/// builder:
+///
+/// * `0x10443b8a8`, four `&str` pairs — `air` (3), `earth` (5), `ice` (3),
+///   `water` (5); i.e. the *whole* forms;
+/// * `0x10443b8e8`, four `&str` pairs — `fire` (4), `lava` (4), `steam` (5),
+///   `lightning` (9); i.e. their *half* forms, pair for pair;
+/// * `cmp w0, #0x0; csel x24, x9, x8, ne` (`0x101557840`) picks the second
+///   table when the first argument is non-zero;
+/// * the piece list at `0x103e6c7d2` is `"huge "` (5) + `" elemental"` (10);
+/// * the loop formats `huge {word} elemental` and compares it with the second
+///   argument by length (`cmp x19, x8`, `0x1015578a8`) and bytes
+///   (`memcmp`, `0x1015578c0`), returning `1` on a match and `0` otherwise.
+pub fn half_tag(half: bool, phrase: &str) -> bool {
+    let words = if half { HALF } else { WHOLE };
+    words
+        .iter()
+        .any(|word| phrase == format!("huge {word} elemental"))
 }
+
+/// The whole-element words, in the order `0x10443b8a8` holds them.
+pub const WHOLE: [&str; 4] = ["air", "earth", "ice", "water"];
+
+/// The half-element words, in the order `0x10443b8e8` holds them.
+pub const HALF: [&str; 4] = ["fire", "lava", "steam", "lightning"];
 
 #[cfg(test)]
 mod tests {
@@ -279,11 +344,64 @@ mod tests {
     }
 
     #[test]
-    fn asked_answers_the_recovered_needle() {
-        assert_eq!(asked("  INSTABILITY "), Some(Element::Earth));
-        assert_eq!(asked("water"), Some(Element::Water));
+    fn asked_answers_the_recovered_needles() {
+        assert_eq!(asked("  INSTABILITY "), Some(Asked::Instability));
+        assert_eq!(asked("Confluence"), Some(Asked::Confluence));
+        assert_eq!(asked("confluence-hot"), Some(Asked::ConfluenceHot));
+        assert_eq!(asked(" CONFLUENCE-COLD\n"), Some(Asked::ConfluenceCold));
+        // The four words are the only ones the compare chain carries; a bare
+        // element name is not a question.
+        assert_eq!(asked("water"), None);
+        assert_eq!(asked("confluenc"), None);
         assert_eq!(asked("banana"), None);
     }
+
+    /// The tag numerals the original returned, and the order they are numbered
+    /// in. The words are dispatched on their byte length in the binary, so the
+    /// lengths are part of the evidence.
+    #[test]
+    fn asked_tags_and_word_lengths_are_the_recovered_ones() {
+        assert_eq!(Asked::Confluence.tag(), 0);
+        assert_eq!(Asked::ConfluenceHot.tag(), 1);
+        assert_eq!(Asked::ConfluenceCold.tag(), 2);
+        assert_eq!(Asked::Instability.tag(), 3);
+        assert_eq!(Asked::ALL.map(|a| a.word().len()), [10, 14, 15, 11]);
+        assert_eq!(CONFLUENCE_AREA.len(), 22);
+    }
+
+    /// The two halves of the element words, read out of the two `&str` tables at
+    /// `0x10443b8a8` and `0x10443b8e8`.
+    #[test]
+    fn half_tag_tables_are_the_recovered_words() {
+        assert_eq!(WHOLE, ["air", "earth", "ice", "water"]);
+        assert_eq!(HALF, ["fire", "lava", "steam", "lightning"]);
+        assert_eq!(WHOLE.map(|w| w.len()), [3, 5, 3, 5]);
+        assert_eq!(HALF.map(|w| w.len()), [4, 4, 5, 9]);
+    }
+
+    /// `half_tag` formats `huge {word} elemental` and compares for equality — the
+    /// table is chosen by the first argument (`csel …, ne` at `0x101557840`).
+    #[test]
+    fn half_tag_matches_the_formatted_phrase_exactly() {
+        assert!(half_tag(false, "huge air elemental"));
+        assert!(half_tag(false, "huge earth elemental"));
+        assert!(half_tag(false, "huge ice elemental"));
+        assert!(half_tag(false, "huge water elemental"));
+        assert!(half_tag(true, "huge fire elemental"));
+        assert!(half_tag(true, "huge lava elemental"));
+        assert!(half_tag(true, "huge steam elemental"));
+        assert!(half_tag(true, "huge lightning elemental"));
+        // Each table only knows its own half.
+        assert!(!half_tag(false, "huge fire elemental"));
+        assert!(!half_tag(true, "huge air elemental"));
+        // It is an equality test, not a substring test.
+        assert!(!half_tag(false, "a huge air elemental"));
+        assert!(!half_tag(false, "huge air elemental!"));
+        assert!(!half_tag(false, "huge  air elemental"));
+        assert!(!half_tag(false, "Huge Air Elemental"));
+        assert!(!half_tag(false, ""));
+    }
+
 
     #[test]
     fn narrow_keeps_the_trailing_room_number() {

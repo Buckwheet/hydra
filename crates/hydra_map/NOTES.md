@@ -6,7 +6,12 @@ Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hy
 `grep -Rn 'todo!\|unimplemented!' crates/hydra_map/src` is empty — and
 
 * `cargo check -p hydra_map --offline` — clean, no warnings
-* `cargo test -p hydra_map --offline` — **65 tests pass**
+* `cargo test -p hydra_map --offline` — **67 tests pass**
+
+**Phase 2 audit pass** re-inventoried the crate from both symbol sources, found a
+whole module in the binary that this build does not have (`lay::{open_place,
+places,marks,convert,lay_out}`), and corrected three behaviours. See
+[Phase 2 audit: coverage table](#phase-2-audit-coverage-table).
 * `cargo check --workspace --offline` — clean (no other crate was touched)
 
 Phase 1 reconnected `serde`, `serde_json` and `tokio` (see *Phase 1
@@ -217,7 +222,7 @@ read entry by entry. Field *names* are the literals passed to
 
 | symbol | addr | status | notes |
 |---|---|---|---|
-| `found` | `0x1015b0bbc` | **partly** | `fn found(&Map, &str, bool) -> Vec<Found>`: trims, strips `u`/`U`, parses an `i64`, lower-cases the needle, visits every room (384-byte stride) and sorts the hits (insertion sort under 21). The *keep* predicate and the third argument are not recoverable (the mapping closure captures nothing, so the filter was inlined into the collection loop); modelled as "id equals the number, or every word of the needle appears in the title/areas/note". |
+| `found` | `0x1015b0bbc` | **partly** (numeric half **fixed**) | `fn found(&Map, &str, bool) -> Vec<Found>`: trims, strips `u`/`U`, parses an `i64`, lower-cases the needle, visits every room (384-byte stride) and sorts the hits (insertion sort under 21). **Corrected in the Phase 2 audit:** the numeric half is *two* lookups — `Map::room` for a bare number and `Map::ids_for_uid` for either shape, de-duplicated by id — so a number names rooms by uid as well as by map id. The word half's keep-predicate and the third argument are still not recoverable (the closure captures nothing, so the filter was inlined into the collection loop); modelled as "every word of the needle appears in the title/areas/note". |
 | `room::found::{{closure}}` (local) | `0x1015b1090` | **full** | builds one `Found`: the first element of a `Vec<String>` trimmed of `['[', ']']`, the room title (`+0x160`) cloned, and the `u32` at `+0x178`. |
 | `described` | `0x1015b11cc` | **partly** | `fn described(&Map, RoomId, bool) -> Option<Vec<String>>`. `Map::room` or the `isize::MIN` niche. `numbered` → one line `format!("#{} {}", id, title)` (`0x103e2b401`). Otherwise `format!("#{} {}:", id, title)` (`0x103e6cba0`), `format!("{} {}", a, b)` (`0x103e2252a`), then the last of the area `Vec<String>` (`+0x50`/`+0x58`) and the last of the spec `Vec<String>` (`+0x68`/`+0x70`). The `" (u{})"` (`0x103e6cba7`) and `" ({})"` (`0x103e28dbe`) fragments build `a`/`b`; which is which is inferred from the stack-slot order. |
 
@@ -225,7 +230,7 @@ read entry by entry. Field *names* are the literals passed to
 
 | symbol | addr | status | notes |
 |---|---|---|---|
-| `Navigator::fix` | `0x1015b3fe0` | **partly** | needs a room name (`state.room + 0xa70` must not be the `isize::MIN` niche, `0x1015b4010`), parses the room number with the shared reader, consults `hydra_model::state::ship::aboard` (`0x1015b41b4`), and resolves the port through `port_of_pier_titled` (`0x1015b452c`, `0x1015b4548`) / `port_of_pier`. The state byte at `+0x28` is `4` until a fix; the arms write `1`, `2`, `3` and `4`, and their order is **UNKNOWN**. |
+| `Navigator::fix` | `0x1015b3fe0` | **partly** (state byte **fixed**) | needs a room name (`state.room + 0xa70` must not be the `isize::MIN` niche, `0x1015b4010`), parses the room number with the shared reader, consults `hydra_model::state::ship::aboard` (`0x1015b41b4`), and resolves the port through `port_of_pier_titled` (`0x1015b452c`, `0x1015b4548`) / `port_of_pier`. The incoming state byte at `+0x28` is compared with `4` (unfixed); the three successful arms write `1`, `2`, `3`, all through the same tail, so **which arm writes which is still UNKNOWN** — this build writes one value ([`sailing::FIXED`]) and records the one-bit aboard flag the original keeps beside it (`strb w8, [x21, #0x1]` at `0x1015b4cf4`) in `Navigator::aboard`. |
 
 ### `shown.rs`
 
@@ -234,7 +239,7 @@ read entry by entry. Field *names* are the literals passed to
 | `show_route` | `0x1015af084` | **full shape** | `static BOARD: LazyLock<Mutex<HashMap<String, Arc<ShownRoute>>>>` at `0x104586e18` (state word `+0x40`); locks it and inserts. |
 | `shown_route` | `0x1015af774` | **full shape** | locks `BOARD` and returns the `Arc`. |
 | `show_course` | `0x1015af418` | **full shape** | `static COURSES` at `0x104586e60` (state word `+0x40`). |
-| `shown_course` | `0x1015afa14` | **partly** | locks `COURSES` and returns the `Arc`; at 4 520 bytes this is the only one of the four not dumped line by line, so a possible build-on-miss is not reproduced. |
+| `shown_course` | `0x1015afa14` | **full** (**fixed**: was *partly*) | 672 bytes — exactly `shown_route`'s size — with the same call set one for one (`Mutex::lock`/`unlock`, `to_lowercase`, `hash_one`, `OnceLock::initialize`, `Arc` drop). No insert, no ocean call, **no build-on-miss**. The key is the lower-cased name. |
 | `ShownRoute::from` | `0x1015af040` | **full** | `fn from(&self, u32) -> &[u32]`: walks the vector backwards (`lsl x10, x9, #2`, `ldur w11, [ptr + x10 - 4]`) and returns the tail starting at the **last** match — `&rooms[len - count..]`; no match returns the whole slice. |
 | `ShownCourse::from` | `0x1015af3d4` | **full** | the same over `Vec<u64>` (`lsl x10, x9, #3`). |
 
@@ -450,3 +455,140 @@ cargo test  -p hydra_map --offline   # 65 passed
 cargo check --workspace --offline    # clean
 grep -Rn 'todo!\|unimplemented!' crates/hydra_map/src   # empty
 ```
+
+---
+
+# Phase 2 audit: coverage table
+
+## Inventory method and counts
+
+1. `symbols_demangled.txt` — the 53 `hydra_map` lines (52 `T` functions plus the
+   one data symbol `atlas::LIVE`).
+2. `nm -a hydra | rustfilt` — **133** `hydra_map` text symbols (`T`+`t`), i.e.
+   **81** the globals file never lists: `atlas::{ask,laid,waiting_for,work}`,
+   `next_door::{cells,beside}`, `overrides::{written,filed_in}`,
+   `room::found::{{closure}}`, the whole `lay` module, every
+   `Deserialize`/`Serialize` impl and every `drop_in_place`.
+
+Extents come from the local table, so every size below (and above) is a real
+function size — this is what makes `Atlas::ask` (1 484 B) and `Atlas::work`
+(8 084 B) separable instead of one 8 572-byte blob.
+
+**Deduplication.** 133 local symbols → **138** inventory rows before filtering,
+**79** excluding `drop_in_place` glue. Only true monomorphisations are collapsed:
+the same `drop_in_place<T>` emitted once per codegen unit (e.g.
+`Vec<scene::SceneRoom>` twice, `Overrides` twice) is one row, and the two
+`SpecFromIterNested`/`SerializeMap::serialize_entry` instantiations are grouped
+under the item that owns them.
+
+## Status vocabulary
+
+**implemented** — behaviour read out of the instruction stream and asserted ·
+**partial** — door/literals/call graph recovered, a predicate or an out-of-crate
+dependency is not · **unknown** — the binary shows the shape, not the behaviour ·
+**missing** — in the binary, absent (or default-only) here · **fixed** — changed
+this pass.
+
+## `lib.rs`, `scene.rs`, `overrides.rs`, `atlas.rs`, `next_door.rs`
+
+| symbol | B | status | evidence / what is missing |
+|---|---|---|---|
+| `decode` | 504 | partial | FNV-1a 64 + `ArcInner<Map>` certain; `cena_map::binary::decode` out of crate (see below) |
+| `decode`'s fingerprint spelling | — | unknown | the format is inside the piece blob at `0x10245c048`, which does not decode with the crate's scheme; 16 lower-case hex digits is a guess (value asserted, spelling not) |
+| `load` | 384 | implemented (one seam) | `HYDRA_MAP` → `fs::read` → `decode`; the embedded image is a seam |
+| `shared` | 64 | implemented | `OnceLock` + `get_or_init(load)` |
+| `scene::{MapScene,SceneDoor,SceneEdge,SceneRoom,SceneLabel}::serialize`, `Exported::serialize` | 280…396 | implemented (serde) | key order read entry by entry |
+| `scene::*::__Visitor::expecting`, `MapScene::__FieldVisitor::visit_str`, `EdgeKind::deserialize` | 20/20/432/492 | implemented (serde) | five visitors + one full field visitor |
+| `scene::MapScene::room` | 268 | implemented | room → scene room by place + room id |
+| `Overrides::{load,save,export,applied}` | 184…1176 | implemented / partial (`applied`'s matching keys inferred) | |
+| `overrides::{written,filed_in}`, `overrides::pocket` | 460/1564/1720 | implemented / partial (`pocket`'s argument list inferred) | |
+| `Atlas::{area_names,area_of,close,held,progress,sheet}` | 12…388 | implemented | field map at `+0x00/+0x30/+0x60/+0x170/+0x1e0/+0x290` |
+| `Atlas::ask`, `Atlas::laid`, `Atlas::waiting_for` | 1484/476/468 | implemented | queue semantics in order; `2` = already laid |
+| `Atlas::{scene_of,start}` | 920/4976 | partial | the scene source and the layout worker are `cena_map_layout` seams |
+| `Atlas::work` | 8084 | partial | loop/queue/notify recovered; the **name resolution is `cena_map_layout`** — the split on `'@'` and the 24-byte sorted table are only its input. The earlier "the worker binary-searches a sorted table" was right about the *search*, but the table is not data this crate can reach |
+| `atlas::LIVE` | data | implemented / unknown type | 8-byte load; `AtomicUsize` is a modelling choice |
+| `Atlas::next_door` | 7176 | partial | place split on `'@'`, sheet from `laid`, geometry from `cells`/`beside`, unknown places `ask`ed. The two extra arguments are stored beside the name at `[sp, #0x90]`/`[x29, #-0xe0]` and the `NextDoor` field list is not in the dump (the struct is only built and dropped here) |
+| `next_door::cells`, `next_door::beside` | 280/2072 | partial | a room vector at `[arg + 0x20]` → a 0x30-byte record; `beside` is 2 072 B, bigger than "a companion predicate" suggests, and its comparison is not in the dump |
+
+## `lay.rs` — **missing module**
+
+| symbol | B | status | evidence |
+|---|---|---|---|
+| `lay::open_place` | 616 | **missing → none** | `Vec::from_iter` over `(ptr, ptr + len*4)` (u32 room ids) → `cena_map::Map::from_rooms` → `cena_map_layout::pipeline::generate_layout` → `cena_map_layout::scene::build_scene` → `cena_map_layout::open::open_place` (4) → `lay::convert(x0, x1, x2, &scene or &open)`; `None` niche on either miss |
+| `lay::places` | 268 | **missing → none** | `cena_map_layout::areas::layout_rooms` → `Map::from_rooms` → … |
+| `lay::marks` | 172 | **missing → none** | `Map::room` → `Vec<String>` → `sort` → `Vec::dedup_by` |
+| `lay::convert` | 884 | **missing → none** | 5th arg is a `MapScene`; builder for `hydra_map::scene` |
+| `lay::lay_out` | 324 | **missing → none** | |
+
+**Why they were not implemented.** All five are thin wrappers whose middle step is
+`cena_map_layout` (layout generation, area layout, `lay::{open_place,marks,
+places,convert,lay_out}`), which is **not in the workspace pins**. What *is*
+in the binary is the wrapper shape (`lay::marks` alone could be reproduced —
+`Map::room`, collect, sort, dedup — but the `Vec<String>` it collects is produced
+by an iterator whose body is not in the dump, so which strings they are would be a
+guess). The earlier note said these helpers "belong to that crate"; they do not —
+they are `hydra_map` functions. That claim is corrected here, and the seam is
+recorded rather than guessed.
+
+## `ocean.rs`, `course.rs`, `follow.rs`, `room.rs`, `sailing.rs`, `shown.rs`
+
+| symbol | B | status | evidence / what is missing |
+|---|---|---|---|
+| `ocean` (accessor) + `OCEAN` | 64 | implemented / partial init | `OnceLock<Ocean>`; the initialiser parsed the embedded tables |
+| `Heading::named` | 888 | implemented | length-dispatched compare chain, tag 8 = `None` |
+| `Ocean::{at,room,port_at,port_named,port_of_pier,port_of_pier_titled}` | 52…824 | implemented | four maps at `+0x48/+0x78/+0xa8/+0xd8` |
+| `Ocean::{piers_of,piers_titled}` | 52/260 | partial | the `Item` of the opaque iterator is not readable; a case-insensitive substring test is used |
+| `Ocean::bound` | 944 | implemented / names inferred | glyphs exact |
+| `Ocean::runs_true` | 408 | implemented | the three conditions, `TABLE[h ^ 4]` |
+| `Ocean::read` | 6112 | partial | 13-column and 3-column rows; how a text is told from another is a field-count dispatch here |
+| `Ocean::course`, `Ocean::course_holding` | 12/2760 | partial | nine states per room, RLE output and the `(u32, Heading)` run element are exact; **the cost metric is not in the dump** — this build minimises `(moves, turns)` |
+| `follow::ways_out_of` | 2616 | partial | **corrected**: the compass compare is against an **8-byte tag at `exit + 0x50`**, not against the exit's word; the word is the `String` at `+0x60`, lower-cased and used only for naming. Each entry is named after the target place — `Map::room(exit.to)` → first path string trimmed of `[`/`]`, or `format!("room {}", to)` (`0x103e23ae3`, decoded) — de-duplicated and ordered by that name. What the tag comparison *selects* is still not recovered |
+| `follow::room_of` | 908 | partial | four arguments; `title_from_subtitle`, the `"room exits"` component and `Map::locate` |
+| `follow::Follower::{view,ways_out}` | 2340/44 | partial | cache at `+0x78/+0x7c/+0x80`; the drawing half is a UI seam |
+| `room::found` | 1236 | **fixed (partial)** | see below |
+| `room::found::{{closure}}` | 316 | implemented | path (first area, `[]`-trimmed), title, id at `+0x30` |
+| `room::described` | 1192 | partial | formats exact; which of `" (u{})"`/`" ({})"` goes where is inferred from stack order |
+| `sailing::Navigator::fix` | 3360 | **fixed (partial)** | see below |
+| `ShownRoute::from`, `ShownCourse::from` | 68/68 | implemented | tail at the *last* match |
+| `show_route`, `show_course` | 848/860 | **fixed** | keys are lower-cased (`<str>::to_lowercase`); the body also `remove_entry`s first (not observable with one value per key) |
+| `shown_route` | 672 | **fixed** | keys are lower-cased |
+| `shown_course` | 672 | **fixed (full)** | 672 B, the same call set as `shown_route` one for one: `Mutex::lock/unlock`, `to_lowercase`, `hash_one`, `OnceLock::initialize`, `Arc` drop. **No insert, no ocean call → no build-on-miss.** The earlier "may build a course from the ocean on a miss" is refuted |
+
+## What changed this pass
+
+1. **`room::found`'s numeric half is two lookups, not one.** A bare number is
+   asked of `cena_map::map::Map::room` (`0x1015b0eac`) *and* of
+   `cena_map::map::Map::ids_for_uid` (`0x1015b0f00`); a `u`-prefixed number is
+   asked only of the uid index (`b.eq 0x1015b0ef8` at `0x1015b0ea0`); ids already
+   collected are skipped (`0x1015b0f74`). Added
+   [`cena::Map::ids_for_uid`] (the uid is the last element of `Room::paths`, which
+   is what `room::described` formats as `" (u{})"`) and rewrote `found` around it.
+   New test `a_number_is_looked_up_as_a_map_id_and_as_a_uid`, plus a fixture room
+   whose map id (`500`) and uid (`7116002`) differ so the two halves are
+   distinguishable.
+2. **`shown_*` normalises its keys.** All four entry points lower-case the name
+   before touching the map, so `"Bank"` and `"bank"` are one entry. New test
+   `keys_are_lower_cased`. `shown_course` is now recorded as **full**.
+3. **`Navigator::fix` no longer pretends to tell `1`/`2`/`3` apart.** The state
+   byte is set to [`sailing::FIXED`] on a fix and [`sailing::UNFIXED`] (`4`,
+   compared at `0x1015b4028`) otherwise, and the one-bit aboard field the
+   original keeps beside it (`and w8, #1` / `strb w8, [x21, #1]` at
+   `0x1015b4cf0`) is now `Navigator::aboard`. The invented `aboard → 3` is gone.
+4. **`lay` is recorded as a missing module of this crate**, with all five
+   signatures and call graphs, instead of being attributed to `cena_map_layout`.
+5. **`ways_out_of`'s compass comparison is on a tag, not on the word.**
+6. **`cargo test -p hydra_map --offline` is 67** (65 before; two new tests, one
+   existing one rewritten in place).
+
+## What remains, honestly
+
+* `lay::{open_place,places,marks,convert,lay_out}` — needs `cena_map_layout`;
+* the embedded 22 MB map image and `cena_map::binary::decode`'s record layout —
+  no recoverable layout, so [`DEFAULT_MAP`] stays empty and `decode` accepts this
+  build's own encoding;
+* `Ocean::course*`'s cost metric, `ways_out_of`'s tag selection,
+  `next_door`'s two extra arguments and `NextDoor`'s fields, `Atlas::work`'s
+  resolution, `room::found`'s word predicate and third argument,
+  `room::described`'s note placement, `Overrides::applied`'s matching keys,
+  `piers_of`/`piers_titled`'s item type, `decode`'s fingerprint spelling;
+* `Navigator::fix`'s three success numerals and the order of its arms.

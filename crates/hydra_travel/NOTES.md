@@ -6,7 +6,15 @@ The crate had 75 `todo!()` stubs over 40 files; nothing is left
 (`grep -R "todo!()\|unimplemented!()" crates/hydra_travel/src` is empty) and
 
 * `cargo check -p hydra_travel --offline` — clean, no warnings
-* `cargo test -p hydra_travel --offline` — **164 tests pass**
+* `cargo test -p hydra_travel --offline` — **167 tests pass**
+
+**Phase 2 audit pass (this document's last section) re-read the whole crate
+against the local symbol table.** It found three things the earlier reading got
+wrong — the *function extents* in this file were taken from the globals-only file,
+so several "N bytes of inlined …" claims were really "N bytes until the next
+**global** symbol", i.e. whole functions merged with their neighbours, and the
+crate's async half was missed entirely. See
+[Phase 2 audit: coverage table](#phase-2-audit-coverage-table).
 
 Phase 1 reconnected `serde` 1.0.229 and `serde_json` 1.0.151 (the `travel.json`
 document); everything else in the crate is still std-only. See
@@ -572,3 +580,248 @@ there is no hand-written parser left to test):
    but the exact output wording is not in the literal pool. The reconstructed
    sentences are labelled `// UNKNOWN:` in the sources and are not presented as
    evidence.
+
+---
+
+# Phase 2 audit: coverage table
+
+## Inventory method and counts
+
+Two sources, deduplicated by symbol, not by eyeball:
+
+1. `symbols_demangled.txt` — the 113 `hydra_travel` lines (globals: `T` symbols).
+2. `nm -a hydra | rustfilt` — **395** `hydra_travel` text symbols (`T`+`t`), i.e.
+   **282** symbols the globals file never lists: private functions
+   (`command::named`, `file::read`/`key_in`/`spot_in`/`spot_name`,
+   `route::{how,why_shut,not_known}`, `sail::go`, `settings::{on,said}`,
+   `knows::*`, `walk::routines::holds`, …), every `{{closure}}`, every
+   `Solver`/`Write`/`Deserialize` trait impl, and all `drop_in_place` glue.
+
+Extents come from the local table (`n` symbols are true function starts), so
+**every size quoted here and above is a real function size**. The 113 globals are
+a strict subset of the 395 locals; nothing needed to be reconciled between them.
+
+**Deduplication rule.** 395 local symbols collapse to **374** inventory rows by
+collapsing *true monomorphisations only*:
+
+* `walk::drive::Driver<F, W>` instantiated at `F=W=hydra_table::travel_command::
+  set_out::{{closure}}::{{closure}}` and at `…::sea::walk::{{closure}}::{{closure}}`
+  — the two instantiations of one generic item, so the generic spelling
+  `Driver<F,W>` is the row and the two addresses are recorded with it;
+* `core::ptr::drop_in_place<…>` for the same type at different codegen units
+  (`Vec<walk::drive::Taken>` appears 5×, `Vec<walk::instability::Seen>` 12×,
+  `Solver::keep` 27×): one row each;
+* `sail::sail<W,W>`, `sail::guide<W>`, `walk::drive::walk<W,W>` — one row each.
+
+Excluding `drop_in_place` glue, the table below covers **251** rows.
+
+`n=` in the table is the number of local symbols in that row; `B` is the smallest
+of their sizes (they are equal except for monomorphisations).
+
+## Status vocabulary
+
+* **implemented** — behaviour read out of the instruction stream and asserted.
+* **partial** — the door, the literals and the call graph are recovered, but a
+  predicate/table sits in an out-of-crate dependency or is not in the dump; the
+  site says which.
+* **unknown** — the binary shows the call shape, not the behaviour.
+* **missing** — present in the binary, absent (or default-only) in this build.
+* **fixed** — the status changed in this pass.
+
+## `command.rs`, `coverage.rs`, `facts.rs`, `file.rs`, `knows.rs`, `settings.rs`, `swim.rs`
+
+| symbol | B | n | status | evidence / what is missing |
+|---|---|---|---|---|
+| `command::parse` | 3664 | 1 | implemented | verbs/flags/messages recovered |
+| `command::parse::{{closure}}`, `command::named` | 68/… | 3 | implemented | `named` joins and splits the first `=` |
+| `coverage::kinds` | 124 | 1 | implemented | the 8 kind names via `variant::Name` |
+| `coverage::census` | 532 | 1 | partial | "priced" predicate inferred |
+| `coverage::report` | 788 | 1 | partial | header wording not in `__cstring` |
+| `coverage::walked` | 404 | 1 | partial | counts priced steps in routineless rooms |
+| `coverage::variant::Name as Write::write_str` | 200 | 1 | implemented | the `c >= 0x30 && (c & !0x20) < 0x41` reject |
+| `coverage::variant_is::Matching as Write::write_str` | 160 | 1 | implemented | progressive subsequence |
+| `facts::walker_from` | 2892 | 1 | partial | flag/profession names recovered, plumbing not |
+| `facts::listed_names` | 288 | 1 | partial | splits on `,` and ` and ` |
+| `file::travel_path` | 16 | 1 | implemented | `dir.join("travel.json")` |
+| `file::save_target` | 152 | 1 | implemented | read/edit/write of one `targets` entry |
+| `file::forget_target` | 152 | 1 | implemented | `Result<bool, _>`, flag at `+1` |
+| `file::{instabilities,save_instabilities,save_last_room,save_memories,take_settings}` | 204… | 5 | implemented | spot map entries |
+| `file::load` | 1260 | 1 | partial | merge policy not recoverable; returns the loaded image |
+| `file::read` | 1436 | 1 | implemented | `read_to_string` + serde + schema 3 |
+| `file::key_in`, `file::spot_in`, `file::spot_name` | 92/… | 3 | implemented | `entry().or_default()`; `safe_component` twice |
+| `file::Refused as Display::fmt` | 332 | 1 | implemented | the three texts |
+| `file::<impl From<Refused> for io::Error>::from` | 52 | 1 | implemented | `InvalidData` |
+| `file::Shared::serialize` | 1408 | 1 | implemented (serde) | recovered field order |
+| `file::Spot`/`Shared` `__Visitor::expecting`, `__FieldVisitor::visit_str` | 20/… | 3 | implemented (serde) | `struct Spot`, `struct Shared with 4 elements` |
+| `knows::{known_spells,deciding_ranks,affordable_spells}` | 412/… | 3 | implemented | spell/rank plumbing over `hydra_model::spells` |
+| `settings::key` | 2276 | 1 | implemented | schema table walk |
+| `settings::TravelSettings::{for_walker,on,set,shown}` | 356… | 4 | implemented | validation, `said`, one row per setting |
+| `settings::TravelSettings::said` | 876 | 1 | implemented | the confirmation shapes |
+| `settings::{on,on_word,memory,Memory::accept,Memory::called}` | 100… | 5 | implemented | `No memory {key}.` |
+| `swim::toward` | 408 | 1 | implemented | the 8-entry opposite table |
+| `swim::strokes` | 468 | 1 | partial | roundtime handling recovered, stroke count not |
+| `swim::sensed` | 296 | 1 | **missing → none** | local-only symbol (`0x10121448c`); nothing in `swim.rs` corresponds — it is a `Sensed` builder over the `instability` phrase table and needs that module's `Sensed` type, which is also absent |
+
+## `route.rs`
+
+| symbol | B | n | status | evidence / what is missing |
+|---|---|---|---|---|
+| `route::here` | 4 | 1 | implemented | tail call to `hydra_map::follow::room_of` |
+| `route::described` | 432 | 1 | implemented | trim → lower → split `.` → map lookup |
+| `route::destination` | 2840 | 1 | partial | **re-read**: goes through `described`, `Map::ids_for_uid`, `Map::room` **and** `Map::routes`; our build stops at the first two. Not "4444 B" |
+| `route::table` | 2824 | 1 | partial | **re-read**: a *report* renderer — header `"STEP      TRIP    TIME  "` (`0x10241efc0`) and `"[status] \| HP \| MP \| RT \| CT \| L \| R "` (`0x103e23aeb`), one 120-byte row per route. Row type is `cena_map::route`, out of crate |
+| `route::places` | 2912 | 1 | partial | builds `BTreeMap<&str, String>` + `Map::routes` + an upper-case step; our build answers the priced rooms. Not "3592 B" |
+| `route::itinerary` | 1256 | 1 | partial | `Map::routes` → `Routes::exits_to` → `Cost::price` → `coverage::walked` → `route::how`, collected into `Vec<route::Leg>`. Not "11004 B"; `Leg` is absent here |
+| `route::how` | 1316 | 1 | partial | `join_generic_copy` over `Vec<String>`; the fragments are recovered, the join order is this build's |
+| `route::why_shut` | 680 | 1 | partial (seam) | asks `Cond::ask` over a `Vec<*const Cond>` built from 0x40-byte records, calls `not_known`, formats once. `Cond` is out of crate; the three refusal literals are in the pool but the selecting branch is not in the dump |
+| `route::not_known` | 160 | 1 | **fixed (partial)** | **it is a predicate over a `Cond` tree returning `bool`** (`ask() == 2`), not a 9748-byte sentence builder. Rewritten docs; body is a seam because `Cond` has no counterpart here |
+
+## `sail.rs`, `sail/voyage.rs`
+
+| symbol | B | n | status | evidence / what is missing |
+|---|---|---|---|---|
+| `sail::wind_known` | 288 | 1 | implemented | wind words |
+| `sail::Runner::not_the_captain`, `…::wheel_already_turned` | 100/… | 2 | implemented | the two literals |
+| `sail::guided` | 1564 | 1 | partial | refusal literals + four commands recovered |
+| `sail::go` | 208 | 1 | partial | entry point |
+| `sail::MakeReady::next`, `::next::{{closure}}` | 2544 | 7 | partial | the six `contains` triggers, order inferred |
+| `sail::{sail<W,W>, guide<W>, voyage<W,W>}` | — | 6 | **missing** | only drop glue survives (`drop_in_place<sail::sail<…>::{{closure}}>`); the async drivers are in this pass's largest gap |
+| `sail::Runner` (`+ drop_in_place`) | — | 6 | **missing** | `Runner::{send,hold,out_of_roundtime}::{{closure}}` exist and call `tokio::time`, `tokio_util::CancellationToken`, `hydra_session::command::SessionHandle::{join,write}`, `hydra_model::state::clock::in_roundtime`, `broadcast::Receiver::recv` — an async runner with no counterpart in this build |
+| `sail::voyage::Voyage::{next,wind,attend,wheel_wanted}`, `next::{{closure}}` | 1148 | 5 | partial | raise sail → wheel → wait → arrived; the "turned enough" predicate not recoverable |
+
+## `walk.rs` — `Trip`
+
+| symbol | B | n | status | evidence / what is missing |
+|---|---|---|---|---|
+| `Trip::ahead`, `Trip::aside` | 96/192 | 2 | implemented | `path[at+1]`, `path[at+2]` |
+| `Trip::cannot_send` | 160 | 1 | implemented | the five refusals |
+| `Trip::to` | 284 | 1 | implemented | records and answers the command |
+| `Trip::tick` | 440 | 1 | implemented | delegates to `tick_inner` |
+| `Trip::tick_inner` | 4364 | 1 | partial | calls `plan`, `replan`, `step_from`, `send_ahead`, `run::Run::tick`, `pace::{Batch::landed,typeahead_said}`, `aside_said`, `give_up`. Our `tick` is a simplified loop |
+| `Trip::heard` | 424 | 1 | partial | `hydra_model::movement::classify`; our build only matches the refusals |
+| `Trip::seeded` | 304 | 1 | implemented | compares the path with the saved target |
+| `Trip::path_from` | **488** (not 24504) | 1 | **fixed (partial)** | seeds `vec![from]`, calls `cena_map::route::<impl Map>::routes` then `Routes::path_to`. **The A\* is in `cena_map`, not here.** Docs corrected; BFS kept as the documented stand-in |
+| `Trip::{plan,replan,step_from,give_up,aside_said,exit_between}` | 368…1332 | 6 | **missing** | all six are local-only symbols; `exit_between` is the priced-step walk (`Cost::price` + `coverage::walked`), `plan` is `Map::routes` + `Routes::path_to` |
+
+## `walk/drive.rs` — the async `Driver` tree (the largest gap)
+
+The binary's `walk::drive` is **33 symbols** of an async, generic driver:
+`Driver<F, W>` where `F`/`W` are the caller's finder/writer closures (instantiated
+at `hydra_table::travel_command::{set_out, sea::walk}::{closure}::{{closure}}`).
+
+| symbol | B | n | status | evidence |
+|---|---|---|---|---|
+| `drive::routine_name` | 432 | 1 | implemented | `Value["name"]`, `_` → ` `, else `way` |
+| `drive::gone` | 224 | 1 | implemented | did the room change |
+| `drive::is_a_move` | 31448 | 1 | partial | **synth compare chain**; our `command_for` uses the map's own exit word |
+| `drive::preflight::halted` | 144 | 1 | partial | passes the refusals through |
+| `Driver::walker` | 388 | 2 | **missing** | 2 addresses (2 instantiations) |
+| `Driver::locate` | 128 | 2 | **missing** | |
+| `Driver::fold` | 692 | 2 | **missing** | folds a `hydra_session::event::Event` into the walker |
+| `Driver::show` | 408 | 2 | **missing** | `alloc::fmt` + `hydra_session::notice::Notice::line` |
+| `Driver::price_the_way_out` | 912 | 2 | **missing** | |
+| `Driver::{send,turn,walk,hold,drain,rejoin,out_of_roundtime,until_the_room_is_told}::{{closure}}` | 312…10640 | 22 | **missing** | every one of them is an async fn over `tokio::time::{Instant,sleep}`, `tokio_util::sync::CancellationToken`, `tokio::sync::broadcast::Receiver<hydra_session::event::Event>` and `hydra_session::command::SessionHandle::{join,write,say}`. `turn` alone is 6 104/10 640 B and is the real walk loop |
+| `drive::deeds::{put,cast,deed,fill_hands,cast_to_be_carried,affords}` | 204…8508 | 11 | **missing** | `deed` calls `hands::store_commands`, `kept::{taken_from,put_back,language_in,is_spoken}`, `hydra_model::spells::spell_named` |
+| `drive::solve::{walk_to,await_line,ask_answered,aside,ask_solver,solve}` | 336…2532 | 10 | **missing** | |
+| `drive::preflight::{preflight,silver,by_gigas,day_passes,out_of_a_shop,by_way_of_the_bank,silver_needed,warn}` | 204…9632 | 13 | **missing** | |
+| `drive::confluence::{look_for,nearest,nearest_half,enter_the_plane,find_instability}` | 348…1544 | 6 | **missing** | `look_for` calls `instability::element_given_off`, `hydra_map::follow::room_of` |
+| `drive::walk<W,W>` | — | 2 | **missing** | 14 404 B closure: `Trip::{to,seeded}`, `map::routes`, `Routes::seconds_to`, `preflight`, `hands::take_back`, `instability::{senses,narrow,element_in}` |
+| `drive::{Ended,Setting,Taken,Walked}` | — | 4 | **missing** | only drop glue survives |
+
+**Why this was left unimplemented.** These are `async fn`s. Reproducing them
+means (a) `hydra_travel` taking the `tokio`/`tokio_util` pins, (b) a
+`Driver<F, W>` type whose bounds are the caller's closure futures, and (c) an
+async `hydra_session::command::SessionHandle` (`join`/`write`/`send`/`say`) plus
+`hydra_session::event::Event` and `hydra_session::notice::Notice`. (c) is a public
+API question in a sibling crate, so nothing here was changed; the seam is
+documented instead. **This is the crate's largest hole and it is not a detail: the
+walk loop the binary runs lives in `drive::Driver::turn`, not in `Trip`.**
+
+## `walk/{hands,instability,kept,mover,pace,preflight,recovery,replies,run}.rs`
+
+| symbol | B | n | status | evidence / what is missing |
+|---|---|---|---|---|
+| `hands::cast_commands` | 412 | 1 | implemented | `prepare {name}`, `cast {name}`, lower-cased |
+| `hands::store_commands` | 132 | 1 | implemented | `store right`, `store left` |
+| `hands::take_back` | 360 | 1 | partial | four container slots; `Containers::ready` mismatch (see open question 8) |
+| `instability::senses` | 2312 | 1 | implemented | phrase table |
+| `instability::element_in` | 500 | 1 | implemented | 10-byte needle `element of`, length floor 34 |
+| `instability::element_given_off` | 536 | 1 | partial | `StrSearcher` over the phrase table |
+| `instability::asked` | 728 | 1 | **fixed (partial)** | four words by byte length → tags `0/1/2/3` (`confluence`, `confluence-hot`, `confluence-cold`, `instability`), plus a fall-through that needs the caller's tag and compares the room's `paths[0]` with `"[Elemental Confluence]"`. The invented `instability → Earth` mapping is gone; the return type is now `Option<Asked>` |
+| `instability::narrow` | 1788 | 1 | partial | `Map::room` + `Vec<Sensed>`; `Sensed` is missing here |
+| `instability::half_tag` | 276 | 1 | **fixed** | **it is a predicate, not a builder.** Two `&str` tables read out of `__DATA_CONST` (`0x10443b8a8` = `air/earth/ice/water`, `0x10443b8e8` = `fire/lava/steam/lightning`), selected by `csel … ne` on the first argument, and compared with `format!("huge {word} elemental")`. The fabricated `["","","",""]` table is gone |
+| `instability::instability_table` | 296 | 1 | **missing → none** | thread-local `HashMap` built from `Map::routes` (`0x10118bc68`); needs `cena_map::route` |
+| `instability::Seen::serialize` + `__Visitor::expecting` | 488/20 | 2 | implemented (serde) | recovered field order |
+| `kept::taken_from` | 576 | 1 | partial | seven shop names → the kept item |
+| `kept::with_items` | 2024 | 1 | implemented | |
+| `kept::language_in` | 920 | 1 | partial | `Guildspeak` |
+| `kept::is_spoken` | 332 | 1 | partial | |
+| `kept::put_back` | 172 | 1 | implemented | |
+| `mover::{Mover::new,Mover::tick,is_stunned,exchange_of}` | 176… | 4 | implemented | |
+| `pace::{typeahead_of,typeahead_said,Batch::landed}`, `pace::<impl Trip>::send_ahead` | 456… | 4 | partial | description recovered, exact wording not |
+| `preflight::{silver_for,gigas_least,gigas_way,out_of_a_shop,withdraw_command}` | 164…1092 | 5 | partial | `gigas_least` default `4`; `gigas_way` uses `Map::ids_for_uid` |
+| `recovery::{Attempt::new,Attempt::again,Attempt::react,with_verb}` | 176… | 4 | partial | |
+| `replies::{word_after,numbered}` | 208/272 | 2 | implemented | |
+| `run::{Run::tick,Run::work,said,filled}` | 136… | 4 | partial | |
+| `walk::Said`, `walk::drive::{Taken,Ended,Setting,Walked}`, `walk::hands::Stored`, `walk::pace::Batch`, `walk::run::{Job,Deed,Until}`, `walk::instability::Sensed`, `walk::recovery::{First,Reaction}`, `walk::routines::Kept`, `file::Notes`, `route::{Leg,Shut}` | — | 12 | **missing** | types that survive only as `drop_in_place` glamour; several are the payloads of the `missing` functions above |
+
+## `walk/routines.rs` and the 29 routines
+
+| symbol | n | status | evidence |
+|---|---|---|---|
+| `routines::solver_for` | 1 | partial | room lookup + the two jump tables (`0x1024207c0` byte, `0x1024207d0` u16) + `DayPass::new`/`SwordGorge::new`; dispatch is on the `kind` word |
+| `routines::holds`, `routines::Seen::answered` | 2 | implemented | line scans |
+| `routines::Solver::next`, `Solver::keep` | 27 + 2 | partial | trait shape recovered; `keep` is defaulted |
+| 29 `routines::<name>::*::next` (impls) | 29 | partial | 15 have their command sequences verbatim; 14 answer `Next::Wait` with an `// UNKNOWN:` note |
+| `routines::cutter::{Cutter::{asked,board,hands,known_containers,listed,looked,open_next,resume,searched,travel,wait}, names_the_walker, one, tickets_in}` | 14 | partial | command literals recovered for the visible half |
+| `routines::casting::{active,affords,knows,Casting::turn}` | 4 | **missing → none** | no `casting` module here; `knows::*` covers part of the same ground |
+| `routines::shopping::{BankRun::{arrived,next}, Search::next, held}` | 4 | **missing → none** | no `shopping` module here |
+| `routines::day_pass::{Pass::serves,flag_for,passes_in,read_pass,sack_in,DayPass::{new,ask,bank,end,arrive,look_at}}` | 11 | partial | town list recovered |
+| `routines::crown_door::{CrownDoor::{cast,finish,push}}`, `seeking::Seeking::landed`, `flight_of_steps::climb_for`, `rune_staircase::{RuneStaircase::work,letter_after}`, `colour_barrier::walk_in`, `confluence::Learned::dir_to`, `altar_levers::row_of`, `familiar_doors::FamiliarDoors::{work,ending}`, `minotaur_maze::MinotaurMaze::choosing`, `patrol::Patrol::open`, `rolaren_gate::RolarenGate::leave`, `sword_gorge::SwordGorge::{new,put,stow,recover_or_rise}`, `trinket::{Trinket::{note,take_out},at_hand,named}` | 20 | partial | per-file evidence |
+| `routines::Routine`/`Landmark`, `Solver` drop glue | 5 | implemented (serde) | recovered field order |
+
+## What changed this pass
+
+1. **`walk::instability::half_tag` is now the recovered predicate** — the two
+   `&str` tables were read out of `__DATA_CONST`, the format string decoded from
+   the piece run at `0x103e6c7d2`, and the equality test reproduced. The previous
+   version returned an invented string from a table of empty strings. New tests:
+   `half_tag_tables_are_the_recovered_words`,
+   `half_tag_matches_the_formatted_phrase_exactly` (15 assertions).
+2. **`walk::instability::asked` now recognises all four questions and returns the
+   recovered tags** (`Asked::{Confluence,ConfluenceHot,ConfluenceCold,Instability}`
+   with tags `0/1/2/3`), instead of mapping `"instability"` to `Element::Earth`.
+   The `"[Elemental Confluence]"` fall-through is documented, not invented. New
+   tests: `asked_answers_the_recovered_needles`,
+   `asked_tags_and_word_lengths_are_the_recovered_ones`.
+3. **Function extents were recomputed from the local symbol table.** Four claims
+   in this document were wrong and are corrected above: `Trip::path_from` is 488 B
+   (not 24 504) and delegates the search to `cena_map::route::Routes::path_to`;
+   `route::not_known` is 160 B and is a `Cond`-tree predicate, not a sentence;
+   `route::itinerary` is 1 256 B and answers `Vec<Leg>`; `route::places` is
+   2 912 B. The `route::table` "saved steps" description was replaced with the
+   report-renderer reading.
+4. **The crate's async half was missing from these notes and from the code.** 33
+   `walk::drive::Driver<F,W>` symbols, 6 `sail::{Runner,sail,guide,voyage}`
+   symbols, `Trip::{plan,replan,step_from,give_up,aside_said,exit_between}`,
+   `instability::{Sensed,instability_table}`, `routines::{casting,shopping}`,
+   `swim::sensed` and a dozen payload types are now listed as **missing** with
+   their call sets. `tokio`/`tokio_util` are used by the original and are **not**
+   dependencies here — the earlier "no `tokio` call site in this crate" claim was
+   wrong.
+5. **`cargo test -p hydra_travel --offline` is 167** (164 before; three new
+   tests, none removed).
+
+## What remains, honestly
+
+* the whole `walk::drive` async driver tree (33 symbols, ~120 KB of text);
+* `sail::{Runner,sail,guide,voyage}` and the four `Voyage` methods' predicates;
+* `Trip::{plan,replan,step_from,give_up,aside_said,exit_between}`;
+* `route`'s `Routes`/`Leg`/`Cond` halves — they live in `cena_map`, which is not
+  in the workspace pins, so `table`/`places`/`itinerary`/`why_shut` stay seams;
+* `routines::{casting,shopping}`, `swim::sensed`, `instability::instability_table`;
+* every partial predicate whose dependency is out of crate (`Cond`, `Cost`,
+  `Routes`, `Containers::ready`).
+
+Nothing above was replaced with a plausible guess: where the binary does not pin a
+value, the site says `// UNKNOWN:` and this table says **partial**.

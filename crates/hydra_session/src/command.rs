@@ -209,6 +209,10 @@ pub struct Inner {
     stop: CancellationToken,
     keep_log: AtomicBool,
     lich: Mutex<crate::lich::Slot>,
+    /// the `.lich` settings (`lich.json`): the folder Lich lives in, whether it
+    /// runs, and what the window shows.  Global, not per character — see
+    /// [`crate::lich_command`].
+    lich_settings: Mutex<crate::lich_command::LichSettings>,
 }
 
 /// The handle every other part of the session holds.
@@ -242,6 +246,7 @@ impl SessionHandle {
                 stop: CancellationToken::new(),
                 keep_log: AtomicBool::new(true),
                 lich: Mutex::new(crate::lich::Slot::new()),
+                lich_settings: Mutex::new(crate::lich_command::LichSettings::default()),
             }),
         }
     }
@@ -293,15 +298,41 @@ impl SessionHandle {
 
     /// Show (or hide) Lich's own output.
     ///
-    /// **ESTABLISHED** (`0x101a3bb08`): a single flag write.
+    /// **ESTABLISHED** (`0x101a3bb08`): a single flag write.  Phase 3 keeps the
+    /// flag and mirrors it into the `.lich` settings' `view` member, so
+    /// `set_lich_view(true)` is `lich view lich` and `set_lich_view(false)` is
+    /// `lich view game` ([`crate::lich_command::LichView::from_on`]).
     pub fn set_lich_view(&self, on: bool) {
         self.inner.lich_view.store(on, Ordering::Relaxed);
+        crate::lich::lock(&self.inner.lich_settings).view =
+            crate::lich_command::LichView::from_on(on);
         self.advance_generation();
     }
 
     /// Is Lich's output being shown?
     pub fn lich_view(&self) -> bool {
         self.inner.lich_view.load(Ordering::Relaxed)
+    }
+
+    /// The `.lich` settings in force (`lich.json`): the folder Lich lives in,
+    /// whether it runs, and what the window shows.
+    ///
+    /// The session does not read or write the file — `hydra`'s binary does, at
+    /// startup and whenever [`crate::lich_command::LichOutcome::changed`] says
+    /// so; this is the in-memory copy the `.lich` commands work on.
+    pub fn lich_settings(&self) -> crate::lich_command::LichSettings {
+        crate::lich::lock(&self.inner.lich_settings).clone()
+    }
+
+    /// Install a `.lich` settings value, applying its view to
+    /// [`SessionHandle::set_lich_view`] (which is the same flag the window
+    /// reads).
+    pub fn set_lich_settings(&self, settings: crate::lich_command::LichSettings) {
+        let view = settings.view;
+        *crate::lich::lock(&self.inner.lich_settings) = settings;
+        if self.lich_view() != view.is_lich() {
+            self.set_lich_view(view.is_lich());
+        }
     }
 
     /// Is Lich (the view, not the process) in play?

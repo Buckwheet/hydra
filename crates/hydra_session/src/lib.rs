@@ -6,6 +6,7 @@ pub mod character_store;
 pub mod claimant;
 pub mod command;
 pub mod lich;
+pub mod lich_command;
 pub mod lifecycle;
 pub mod lookout_seed;
 pub mod menu_store;

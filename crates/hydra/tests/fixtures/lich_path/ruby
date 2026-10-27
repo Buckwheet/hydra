@@ -1,0 +1,58 @@
+#!/bin/bash
+# A synthetic "ruby": the Lich stand-in for `tests/lich_relay.rs`.
+#
+# Nothing here is Ruby, Lich or game text — every name and line is invented.
+# It exists so `hydra play` / `hydra serve` can be run end to end with a real
+# spawn and a real loopback handshake, and no interpreter install: the test
+# points PATH at this folder, so `hydra_lich::find_ruby` picks it up as `ruby`.
+#
+# Hydra starts Lich as (`docs/LICH_WIRE.md` §1):
+#
+#   ruby -e '<prelude>' -e '$0 = ARGV.shift; load $0' <folder>/lich.rbw \
+#        --pipe --stormfront --sentinel -g 127.0.0.1:<port>
+#
+# so the two `-e` snippets and the lich.rbw path are ignored, and the script
+# plays Lich's half of the observed handshake:
+#
+#   1. read the two stdin handshake lines (token, client identification);
+#   2. connect to 127.0.0.1:<port> and send them back as the first two lines
+#      of the socket stream (bash's /dev/tcp built-in: no network beyond
+#      loopback, no helper program);
+#   3. write one of its own lines and one 0x1F-prefixed forwarded chunk to
+#      stdout, the way Lich reports both;
+#   4. exit, so the test never waits on a parked child.
+#
+# Exit codes: 1 when argv has no usable -g address, 2 when the connection is
+# refused.
+
+set -u
+
+read -r token || true
+read -r client || true
+
+port=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-g" ] && [ "$#" -ge 2 ]; then
+        port="${2##*:}"
+    fi
+    shift
+done
+
+if [ -z "$port" ]; then
+    echo "fake ruby: no -g address in argv" >&2
+    exit 1
+fi
+
+exec 3<>"/dev/tcp/127.0.0.1/$port" || {
+    echo "fake ruby: cannot connect to 127.0.0.1:$port" >&2
+    exit 2
+}
+
+printf '%s\n%s\n' "$token" "$client" >&3
+
+# Lich's own output carries no chunk byte...
+printf '%s\n' '--- synthetic Lich is active.'
+# ...and a forwarded game chunk starts with 0x1F (037 in octal).
+printf '\037<synthetic-forwarded-line/>\n'
+
+exit 0

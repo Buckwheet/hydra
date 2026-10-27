@@ -27,13 +27,14 @@ depends on `hydra_protocol`, `hydra_session`, `hydra_lich`, `hydra_net`,
 `hydra_table`, `hydra_model`, `hydra_board`, `hydra_lookout`, `hydra_import`,
 `hydra_update`, `hydra_gui`, `hydra_ui` and `eframe`/`tokio`.
 
-**Phase 2 scope, updated by Phase 4.** The crate is recreated with path
+**Phase 2 scope, updated by Phases 3 and 4.** The crate is recreated with path
 dependencies on `hydra_protocol`, `hydra_session` and `hydra_lich` plus the
 workspace-pinned `tokio`, and — since Phase 4 — on `hydra_gui` and `eframe`
-(see §5.1). `hydra gui …` now *builds and opens* the hub window; everything that
-needs the game connection (`hydra_net`, `hydra_table`) or the ledger
-(`hydra_import`, `hydra_ledger`) is still *recognised and reported*, never faked —
-see [Wired vs not](#wired-vs-not).
+(see §5.1). `hydra gui …` now *builds and opens* the hub window, and `hydra
+play`/`hydra serve` start this character's Lich when `.lich on` is set (§6.4);
+everything that needs the game connection (`hydra_net`, `hydra_table`) or the
+ledger (`hydra_import`, `hydra_ledger`) is still *recognised and reported*,
+never faked — see [Wired vs not](#wired-vs-not).
 
 ---
 
@@ -292,13 +293,37 @@ wired; the session half is, and is unit-tested against real frames.
 (`0x10167dcc0`): a `BufReader` over the child's stdout, a bounded 64-line
 channel, lossy UTF-8, `\n`/`\r\n` stripped. Replay never goes near it.
 
-**Not wired:** `relay::show`/`relay::run` (spawning `ruby lich.rbw`, the
-`--pipe … -g 127.0.0.1:<port>` command line, and the keyed accept whose wire
-encoding is Phase 3's open question — see
-`crates/hydra_lich/NOTES.md` §3.2). Building that needs a Ruby/Lich
-installation, a character's credentials and the handshake ground truth, none of
-which belongs in this phase; `hydra login`/`play` therefore report what they
-still need instead of pretending.
+**Not wired:** `relay::show`/`relay::run` (the relay loop proper) and anything
+that needs a game stream to relay. Starting Lich itself *is* wired since Phase
+3 — see §6.4.
+
+### 6.4 The Lich start (`src/lich.rs`, Phase 3)
+
+`src/lich.rs` is the half of a Lich start that only a binary can do; the `.lich`
+commands themselves live in `hydra_session::lich_command` (see
+`crates/hydra_session/NOTES.md` §8).
+
+| function | what it does |
+|---|---|
+| `settings_path()` | `$HYDRA_LICH_SETTINGS`, else `$HYDRA_DATA_DIR/lich.json`, else `./lich.json`. The two-value form `settings_path_from(settings, data_dir)` is the test seam, so no test mutates the environment. |
+| `load_settings()` / `load_from(path)` | `LichSettings::load`; a file that is not there is the defaults (`on: false`, `view: game`, no folder). |
+| `plan_with(settings, ruby)` / `plan(settings)` | decide *before* any process exists: `FolderUnsaid` → `Where Lich is has not been said: lich folder <folder>.`, `ScriptMissing(dir)` → `<dir> has no lich.rbw in it`, `RubyMissing` → `Lich needs Ruby, which Lich's installer puts in C:\Ruby4Lich5; none was found there or on the PATH`. `plan()` supplies Ruby through the recovered `hydra_lich::find_ruby` (PATH, then `C:\Ruby4Lich5`). |
+| `start(&plan)` | `hydra_lich::relay::start_keyed_minted(&Launch::new(ruby, folder/lich.rbw))`: bind loopback, spawn `ruby -e … -e … <folder>/lich.rbw --pipe --stormfront --sentinel -g 127.0.0.1:<port>`, write the two-line stdin handshake, accept the keyed connection (`docs/LICH_WIRE.md` §1-2). Its failure paths kill and reap the child, so a refused start leaves no orphan. |
+| `announce(&plan, out)` | the two recovered start lines, on stdout: `Lich is at <dir>, for every character.` then `Lich is starting, from <dir>\lich.rbw.` — the message keeps the literal backslash of the Windows reference build while the path spawned is `<dir>/lich.rbw` on this platform (`lich_command::script_path`). |
+| `relay(&mut keyed, out, session)` | print Lich's stdout lines through `hydra_lich::wire::LichOut` (so the 0x1F chunk byte is stripped) until `Relay::pump` reports the child gone, or until the session stops (`SessionHandle::stopping`, the recovered cancellation token), which kills and reaps Lich first. Returns Lich's exit status. |
+| `off_message(label)` | what `play`/`serve` say when `.lich` is off — this phase has no game connection, so it says so instead of doing nothing. |
+| `character_of(tokens)` | the character a `play`/`serve` command line names: the first word that is neither an option nor an option's value (`VALUE_OPTIONS` is `--account`/`--game`/`--in`/`--web`; `--detach` takes none). |
+
+`main`'s `run` sends `Command::Play` and `Command::Serve` through
+`lich_side(label, character, settings)` (the settings are an argument, so the
+unit tests drive every branch without the filesystem): off → `off_message` on
+stderr, exit 1; a refusal → that sentence on stderr, exit 1; otherwise start,
+announce, relay, exit 0. `Command::Login`, the bare hub, `import` and
+`lookout seed` are unchanged and still report what they need.
+
+**Not wired, deliberately:** nothing is ever written to the accepted socket and
+Lich's own `<c>`/bare command lines are never read back, because there is no
+game to relay them to. `--detach`/`--web`/`--in` for `serve` are still ignored.
 
 ## 7. `hydra replay` — the report
 
@@ -410,15 +435,19 @@ Facts, for a later pass:
 | `hydra --help`, `--version` | **runs** | additions (§4) |
 | `hydra gui …` | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe; §5.1 |
 | `hydra` (bare hub) | recognised, exit 1 | the same `gui::run` in the binary; deliberately left reporting here (§5.1) |
-| `hydra play …`, `hydra login …` | recognised, exit 1 | needs the connector (`hydra_table`), the login (`hydra_net`) and Lich's keyed accept (§6.3) |
-| `hydra serve …` | recognised, exit 1 | needs `hydra_web` + `hydra_table` + the same relay |
+| `hydra play …`, `hydra serve …` with `.lich on` | **runs** (the Lich side) | starts Lich with the observed semantics, prints the two recovered start lines, relays Lich's stdout until it exits, exit 0; no game connection exists yet (§6.4) |
+| `hydra play …`, `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character`, and the phase has no game connection (§6.4) |
+| `hydra login …` | recognised, exit 1 | needs the connector (`hydra_table`) and the login (`hydra_net`) |
 | `hydra import …` | recognised, exit 1 | needs `hydra_import` + `hydra_ledger` |
 | `hydra lookout seed` | recognised, exit 1 | needs `hydra_table::account::data_dir` + `hydra_net::sink::config` (§5.3) |
 
-Every unwired command prints
+Every still-unwired command prints
 `hydra <name>: not wired up in this headless phase; it needs <crates>. See crates/hydra/NOTES.md.`
 on stderr and exits 1 — the same shape as every other failure `hydra::main`
-reports (`0x10021dffc`).
+reports (`0x10021dffc`). `play`/`serve` with Lich off print
+`hydra <name>: Lich is off for this character, and this headless phase has no
+game connection; it needs …` instead: same channel, same status, and it names
+both missing halves.
 
 ## 9. UNKNOWN / not recovered
 
@@ -439,11 +468,28 @@ reports (`0x10021dffc`).
 6. The `hydra_table`/`hydra_net` halves of `play`/`serve`, and the rest of
    `gui::run` beyond the window itself (`sessions`, `Who`, `Resume`, the
    single-instance claim, the login pacing): out of this crate's dependency set
-   by instruction, not by evidence. The window build is wired (§5.1).
+   by instruction, not by evidence. The window build is wired (§5.1), and the
+   Lich half of `play`/`serve` is wired (§6.4).
+7. **Phase 3, the Lich start.** Which of the recovered sentences answers
+   *which* moment of a start is INFERRED: `Lich is at {}, for every character.`
+   and `Lich is starting, from {}` are printed in that order at a start, but the
+   binary has one string table, not one call site per sentence. The same is
+   true of `.lich`'s status composition — see `crates/hydra_session/NOTES.md`
+   §8.3.
+8. **Whether a start is retried.** The reference build's `.lich on` mid-session
+   may spawn Lich immediately, and a failed start may be retried on a backoff
+   (`hydra_session::supervisor` exists for the connection). This crate starts
+   once, reports the refusal and returns; there is no restart loop.
+9. **What Lich's own output looks like here.** The reference build shows it in
+   the window (or not, per `lich view`). Headless, every stdout line goes to
+   stdout; the `view` setting is recorded and mirrored on the session
+   (`SessionHandle::set_lich_view`) but changes nothing about what is printed,
+   because there is no other pane to hold the game's text.
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **73 passing** (61 unit + 12 integration).
+`cargo test -p hydra --offline` → **89 passing** (70 unit + 19 integration:
+13 in `tests/cli.rs`, 6 in `tests/lich_relay.rs`).
 
 Unit tests (in the modules):
 
@@ -472,9 +518,17 @@ Unit tests (in the modules):
   missing `HOME`, the Application Support path, the cached executable;
 * `started` — `begin` idempotence and `elapsed`;
 * `main` — the usage path, help/version, a replay failure as a message, every
-  unwired command's text, the built hub window (`"Hydra"`, 660 × 520,
+  still-unwired command's text, `play`/`serve` with Lich off and with each
+  refusal (`Where Lich is has not been said…`, `… has no lich.rbw in it`), the
+  settings-path seam, the built hub window (`"Hydra"`, 660 × 520,
   `Renderer::Wgpu`, 256 × 256 RGBA badge icon — built, not launched), and that
-  `enable_all()` really turned the time driver on.
+  `enable_all()` really turned the time driver on;
+* `lich` (Phase 3) — the two environment seams (`HYDRA_DATA_DIR`,
+  `HYDRA_LICH_SETTINGS`), a missing `lich.json` as the defaults, all three
+  refusals with their exact sentences, a good plan's folder/script/ruby, the two
+  start lines byte for byte, the Lich-off message, and `character_of`'s
+  first-non-option-and-not-a-value rule. Nothing spawns and nothing looks at
+  `PATH`: the ruby is passed in.
 
 Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
 `crates/hydra/tests/fixtures/`):
@@ -489,14 +543,28 @@ Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
 * `empty.xml` — 0 bytes → `== 0 frames from 0 bytes`, exit 0;
 * `--help`/`-h`/`help`, `--version`/`-V`/`version`, an unknown word, `replay`
   with no file (usage on stderr) and a missing file (path + `No such file`,
-  exit 1), plus every unwired command's message.
+  exit 1), the still-unwired commands' messages, and `play`/`serve` with
+  `HYDRA_LICH_SETTINGS` pointed at a file that is not there (`Lich is off for
+  this character`, exit 1, nothing on stdout);
+* `tests/lich_relay.rs` (Phase 3) — `hydra play` and `hydra serve` run for real
+  from `CARGO_BIN_EXE_hydra` against a temp `HYDRA_DATA_DIR` whose `lich.json`
+  says `on: true` and points at a folder holding an empty synthetic `lich.rbw`,
+  with `PATH` set to `tests/fixtures/lich_path` so `find_ruby` finds the
+  synthetic `ruby` there. That script plays Lich's half of `docs/LICH_WIRE.md`
+  with bash's `/dev/tcp` built-in: it reads the two stdin handshake lines,
+  connects to `-g 127.0.0.1:<port>`, sends them back, writes one own line and
+  one 0x1F-prefixed chunk, and exits. The tests assert both recovered start
+  lines, Lich's own line, the forwarded chunk **without** its 0x1F byte, exit 0
+  and an empty stderr; plus Lich off (nothing spawned), no Ruby (the recovered
+  Ruby sentence), a folder without `lich.rbw`, and a settings file with no
+  folder. Every run is capped at 30 s and killed on overrun.
 
-Gates run in `.work/p2-bin`:
+Gates run on `p3/3` (all `--offline`):
 
 ```sh
-cargo test  -p hydra --offline        # 48 + 12 passing
+cargo test  -p hydra --offline        # 70 + 13 + 6 passing
+cargo test  -p hydra_session --offline # 217 passing
 cargo check --workspace --offline     # clean
-cargo test  --workspace --offline     # 2437 passing across the 26 crates, no failures
 target/debug/hydra --help             # the recovered usage text, exit 0
 target/debug/hydra --replay crates/hydra/tests/fixtures/small_stream.xml
 ```

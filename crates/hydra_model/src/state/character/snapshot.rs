@@ -9,16 +9,17 @@
 //! so the reconstruction clones [`Character`] plus a group label.
 
 use super::Character;
+use serde::Deserialize;
 
 /// The group label stored alongside a snapshot.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Group {
     pub leader: Option<String>,
     pub members: Vec<String>,
 }
 
 /// A captured character block.
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq, Deserialize)]
 pub struct CharacterSnapshot {
     pub character: Character,
     pub group: Group,

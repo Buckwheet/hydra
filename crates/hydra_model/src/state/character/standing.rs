@@ -21,9 +21,10 @@
 //! name; only the name extraction is implemented.
 
 use super::vocabulary::{ResourceType, Society};
+use serde::Deserialize;
 
 /// Everything the `STANDING`/society output reports.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Standing {
     /// `Order of Voln`, `Council of Light`, `Guardians of Sunfist` or `None`.
     pub society: Option<Society>,
@@ -38,7 +39,7 @@ pub struct Standing {
 }
 
 /// The two resource counters.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct ResourceAmounts {
     pub weekly: u32,
     pub total: u32,

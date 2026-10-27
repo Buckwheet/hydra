@@ -16,11 +16,13 @@
 //! `// UNKNOWN:` the table itself lives in a generated data file and is *not*
 //! embedded as a whole (unlike `crit.tsv`); [`defs`] therefore returns an empty
 //! table, and every `first_match`-style lookup answers `None`. That is the
-//! behaviour the recovered code shows for an empty table.
+//! behaviour the recovered code shows for an empty table. The name *sets* the
+//! classifiers read out of a hit are recovered (see each classifier), so
+//! [`Def::groups`] implements the `get_group_by_name` plumbing for them.
 
 use std::sync::OnceLock;
 
-use crate::pattern::{compile, Pattern};
+use crate::pattern::{compile, Groups, Pattern};
 
 /// The recovered column order of the defs TSV.
 pub const COLUMNS: [&str; 7] = ["family", "name", "role", "order", "flags", "extra", "pattern"];
@@ -78,6 +80,31 @@ impl Def {
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v)
     }
+
+    /// The named groups this row's pattern captured on `line` — the
+    /// `Captures::get_group_by_name` results the classifiers read.
+    ///
+    /// `Some(empty)` when the pattern matched but declares no named groups,
+    /// `None` when it did not match.
+    pub fn groups(&self, line: &str) -> Option<Groups> {
+        self.matcher.groups(line)
+    }
+
+    /// One named group of the first match (`get_group_by_name`).
+    pub fn group(&self, line: &str, name: &str) -> Option<String> {
+        self.matcher.capture(line, name).map(str::to_string)
+    }
+
+    /// Did the named group take part in the match? (The recovered `bool`
+    /// fields are group presence.)
+    pub fn has_group(&self, line: &str, name: &str) -> bool {
+        self.matcher.capture(line, name).is_some()
+    }
+
+    /// The named groups the `pattern` column declares.
+    pub fn group_names(&self) -> Vec<&str> {
+        self.matcher.group_names()
+    }
 }
 
 /// The whole definition table.
@@ -90,11 +117,17 @@ impl Defs {
     /// @0x0000000101b9f? (788 B) — the first match that yields every required
     /// group.
     ///
-    /// `// UNKNOWN:` the recovered body reads named groups
-    /// (`get_group_by_name`); this engine has no capture support, so only the
-    /// presence of a match is reported through [`Defs::first_def`].
+    /// The recovered body walks the compiled set, runs `Captures` on the hit
+    /// and reads the named groups the caller asks for; the group values are
+    /// handed out through [`Defs::first_match_groups`] / [`Def::groups`].
     pub fn first_match(&self, line: &str) -> Option<&Def> {
         self.defs.iter().find(|def| def.matcher.is_match(line))
+    }
+
+    /// **[`Defs::first_match`] plus the row's named groups.**
+    pub fn first_match_groups<'a>(&'a self, line: &str) -> Option<(&'a Def, Groups)> {
+        let def = self.first_match(line)?;
+        Some((def, def.groups(line)?))
     }
 
     /// @0x0000000101b9f? (780 B) — like [`Defs::first_match`] but restricted to
@@ -103,6 +136,16 @@ impl Defs {
         self.defs
             .iter()
             .find(|def| def.role == role && def.matcher.is_match(line))
+    }
+
+    /// **[`Defs::first_match_with_role`] plus the row's named groups.**
+    pub fn first_match_with_role_groups<'a>(
+        &'a self,
+        line: &str,
+        role: &str,
+    ) -> Option<(&'a Def, Groups)> {
+        let def = self.first_match_with_role(line, role)?;
+        Some((def, def.groups(line)?))
     }
 
     /// @0x0000000101b9f? (680 B) — does *any* definition match?
@@ -118,9 +161,9 @@ impl Defs {
     /// @0x0000000101b9f708 (196 B) — the `flare` / `flare_mirror` first-flight
     /// marker.
     pub fn first_flight(&self, line: &str) -> Option<&Def> {
-        self.defs
-            .iter()
-            .find(|def| matches!(def.family.as_str(), "flare" | "flare_mirror") && def.matcher.is_match(line))
+        self.defs.iter().find(|def| {
+            matches!(def.family.as_str(), "flare" | "flare_mirror") && def.matcher.is_match(line)
+        })
     }
 
     /// @0x0000000101b9ff84 (184 B) — the `barrier` def for a line.
@@ -139,16 +182,16 @@ impl Defs {
             .collect()
     }
 
-    /// @0x0000000101b9f4f8 (528 B) — the `weapon` capture of a nock line.
-    ///
-    /// `// UNKNOWN:` needs named captures; returns the def instead.
+    /// @0x0000000101b9f4f8 (528 B) — the row that carries the `weapon` group of
+    /// a nock line.
     pub fn nock_weapon(&self, line: &str) -> Option<&Def> {
         self.defs
             .iter()
             .find(|def| def.family == "nock" && def.matcher.is_match(line))
     }
 
-    /// @0x0000000101b9f7cc (528 B) — the `weapon` capture of a swing line.
+    /// @0x0000000101b9f7cc (528 B) — the row that carries the `weapon` group of
+    /// a swing line.
     pub fn swing_weapon(&self, line: &str) -> Option<&Def> {
         self.defs
             .iter()
@@ -174,6 +217,9 @@ pub fn defs() -> &'static Defs {
 }
 
 /// Install a table for tests / callers that load their own data.
+///
+/// `OnceLock::set` succeeds once per process; the classifiers therefore also
+/// take a table argument (`*_with_defs`) for callers that keep their own.
 pub fn set_defs(table: Defs) -> bool {
     DEFS.set(table).is_ok()
 }
@@ -181,6 +227,32 @@ pub fn set_defs(table: Defs) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table() -> Defs {
+        Defs {
+            defs: vec![
+                Def::new(
+                    "attack",
+                    "claw",
+                    "damaging",
+                    1,
+                    "",
+                    "",
+                    "^The (?P<attacker>.+?) swings at (?P<target>.+?)!$",
+                ),
+                Def::new(
+                    "swing",
+                    "swing",
+                    "damaging",
+                    2,
+                    "",
+                    "weapon=sword;",
+                    "^You swing your (?P<weapon>\\w+)",
+                ),
+                Def::new("attack", "plain", "damaging", 3, "", "", "^The wall slams"),
+            ],
+        }
+    }
 
     #[test]
     fn extra_column_parses_key_values() {
@@ -240,5 +312,32 @@ mod tests {
         };
         assert_eq!(defs.flare_names(), vec!["flare", "flare_mirror"]);
         assert!(defs.first_flight("A burst of flame erupts.").is_some());
+    }
+
+    #[test]
+    fn first_match_groups_reads_the_named_groups() {
+        let defs = table();
+        let (def, groups) = defs
+            .first_match_groups("The kobold swings at you!")
+            .expect("a hit");
+        assert_eq!(def.name, "claw");
+        assert_eq!(groups.get("attacker"), Some("kobold"));
+        assert_eq!(groups.get("target"), Some("you"));
+        assert_eq!(groups.names().collect::<Vec<_>>(), vec!["attacker", "target"]);
+        // a row with no named groups still reports a hit
+        let (def, groups) = defs.first_match_groups("The wall slams into you").expect("a hit");
+        assert_eq!(def.name, "plain");
+        assert!(groups.is_empty());
+        // and a miss is `None`
+        assert!(defs.first_match_groups("nothing here").is_none());
+    }
+
+    #[test]
+    fn def_group_helpers() {
+        let def = &table().defs[1];
+        assert_eq!(def.group("You swing your sword", "weapon").as_deref(), Some("sword"));
+        assert!(def.has_group("You swing your sword", "weapon"));
+        assert!(!def.has_group("You swing your sword", "attacker"));
+        assert_eq!(def.group_names(), vec!["weapon"]);
     }
 }

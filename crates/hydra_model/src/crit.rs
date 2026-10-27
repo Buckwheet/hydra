@@ -117,6 +117,38 @@ mod tests {
         assert!(!tables.is_empty());
         assert_eq!(tables.index.len(), 2394);
         assert_eq!(tables.index.compiled(), 2394);
+        // exactly one row is a look-ahead row and carries the recovered gate
+        assert_eq!(tables.index.gated(), 1);
+    }
+
+    #[test]
+    fn the_recovered_skull_gate_row_is_honoured() {
+        // Row `impact/head/9` is `^Blow to head removes skull.`; row
+        // `slash/head/3` is `^(?!.*removes skull.)Blow to head.`, which
+        // `MatchIndex` splits into the pattern `^Blow to head.` plus the gate
+        // `.*removes skull.`.
+        let tables = tables();
+        let plain = tables.parse("Blow to head.");
+        assert!(
+            plain
+                .iter()
+                .any(|e| e.damage_type == "slash" && e.rank == 3),
+            "the gated row must fire when the gate is silent, got {:?}",
+            plain
+                .iter()
+                .map(|e| (e.damage_type.as_str(), e.rank))
+                .collect::<Vec<_>>()
+        );
+        let skull = tables.parse("Blow to head removes skull.");
+        assert!(skull
+            .iter()
+            .any(|e| e.damage_type == "impact" && e.rank == 9));
+        assert!(
+            !skull
+                .iter()
+                .any(|e| e.damage_type == "slash" && e.rank == 3),
+            "the gate must suppress the slash row"
+        );
     }
 
     #[test]

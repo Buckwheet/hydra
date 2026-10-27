@@ -32,9 +32,10 @@ pub mod vocabulary;
 
 use stance::Stance;
 use stats::StatSet;
+use serde::Deserialize;
 
 /// Everything known about the logged-in character.
-#[derive(Default, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq, Deserialize)]
 pub struct Character {
     pub name: String,
     pub race: String,

@@ -5,8 +5,10 @@
 //! Recovered type names (`Property`, `Gemstone`, `Gemstones`) come from the
 //! serde `expecting` texts; `Binding` likewise.
 
+use serde::Deserialize;
+
 /// How a gemstone is bound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 pub enum Binding {
     #[default]
     None,
@@ -15,14 +17,14 @@ pub enum Binding {
 }
 
 /// A gemstone property (`+2 Strength`, …).
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Property {
     pub name: String,
     pub amount: i32,
 }
 
 /// One gemstone.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Gemstone {
     pub name: String,
     pub rank: u32,
@@ -33,7 +35,7 @@ pub struct Gemstone {
 }
 
 /// All gemstones in inventory.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Gemstones {
     pub items: Vec<Gemstone>,
 }

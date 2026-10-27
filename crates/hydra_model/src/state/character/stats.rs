@@ -5,15 +5,16 @@
 //! (recovered as one concatenated run) and the `": "` separator;
 //! `StatLine::classify_with_bold` (592 B) adds the bold-run handling.
 //! serde `expecting` texts survive for `Stat`, `Identity`, `StatValue` and
-//! `StatKind`.
+//! `StatKind`, so all four derive `Deserialize` (see [`Identity`]).
 //!
 //! `// UNKNOWN:` the exact `(value)`/`(bonus)` decomposition; the recovered
 //! parser reads `"label:"` then the integer after `" ("`.
 
 use std::collections::BTreeMap;
+use serde::Deserialize;
 
 /// The eight trainable stats, in the recovered order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum StatKind {
     Strength,
     Constitution,
@@ -63,21 +64,37 @@ impl StatKind {
 }
 
 /// One stat reading: the value and its bonus.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct StatValue {
     pub value: i32,
     pub bonus: i32,
 }
 
+/// The character-identity block of the `INFO`/`PROFILE` output.
+///
+/// Only the serde `expecting` text
+/// `<impl Deserialize for stats::Identity>::__Visitor` at `0x101c11bf8`
+/// survives; the type lives in `stats` next to `Stat`/`StatValue`, which is why
+/// it is declared here rather than in `identity.rs`.
+/// `// UNKNOWN:` the field set — these are the identity fields the recovered
+/// readers fill (`Character::apply_info`, `set_identity`, the `INFO` labels).
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Identity {
+    pub name: String,
+    pub race: String,
+    pub profession: String,
+    pub level: u32,
+}
+
 /// A `Stat` row.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Stat {
     pub kind: Option<StatKind>,
     pub value: StatValue,
 }
 
 /// The whole stat block.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct StatSet {
     pub stats: BTreeMap<StatKind, StatValue>,
 }
@@ -128,6 +145,16 @@ impl Stat {
 }
 
 impl crate::state::character::Character {
+    /// The identity block this character carries.
+    pub fn identity(&self) -> Identity {
+        Identity {
+            name: self.name.clone(),
+            race: self.race.clone(),
+            profession: self.profession.clone(),
+            level: self.level,
+        }
+    }
+
     /// Fold one stat line into the character.
     pub fn apply_stat_line(&mut self, line: &str) -> bool {
         let Some(stat) = Stat::classify(line) else {
@@ -177,6 +204,18 @@ mod tests {
         }
         assert_eq!(StatKind::parse("strength"), Some(StatKind::Strength));
         assert_eq!(StatKind::parse("Luck"), None);
+    }
+
+    #[test]
+    fn identity_reads_the_character_block() {
+        let mut character = crate::state::character::Character::default();
+        character.set_identity("Kithar", "Human", "Wizard");
+        character.level = 42;
+        let identity = character.identity();
+        assert_eq!(identity.name, "Kithar");
+        assert_eq!(identity.race, "Human");
+        assert_eq!(identity.profession, "Wizard");
+        assert_eq!(identity.level, 42);
     }
 
     #[test]

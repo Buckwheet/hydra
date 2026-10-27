@@ -24,8 +24,10 @@
 //! `// UNKNOWN:` the name of variant 6 — it is only reachable through a
 //! percentage above 100.
 
+use serde::Deserialize;
+
 /// A combat stance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Stance {
     #[default]
     Offensive,

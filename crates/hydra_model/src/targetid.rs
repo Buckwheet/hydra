@@ -20,7 +20,26 @@
 //! `tag` (876 B) builds a `String` with `FromIterator<char>` and clamps a
 //! percentage to 100 (`w8 = 100; if x3 < 100 { w8 = x3 }`).
 
+use serde::Deserialize;
+
 use crate::state::vitals::Vital;
+
+/// The record [`of`] builds, as the DOM/indicator layer receives it.
+///
+/// The serde `expecting` text
+/// `<impl Deserialize for targetid::Shown>::__Visitor` survives at
+/// `0x101be80e8`, so `targetid::Shown` is a deserialised type in the original.
+/// `// UNKNOWN:` its field set — `of` writes exactly the 20-byte vitals record
+/// (kind word, 8 copied bytes, trailing word, percentage), so the type is
+/// modelled as a newtype over [`Vital`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+pub struct Shown(pub Vital);
+
+impl From<Vital> for Shown {
+    fn from(vital: Vital) -> Shown {
+        Shown(vital)
+    }
+}
 
 /// A source record that [`of`] reads (the offsets above).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,6 +220,25 @@ mod tests {
         assert_eq!(vital.payload, 0x1122_3344_5566_7788);
         assert_eq!(vital.extra, 99);
         assert_eq!(vital.kind, 2);
+    }
+
+    #[test]
+    fn shown_wraps_the_record_of_builds() {
+        let vital = Vital {
+            kind: 4,
+            payload: 7,
+            extra: 8,
+            percent: 42,
+        };
+        let shown = Shown::from(of(&Source {
+            kind: 4,
+            current: 4,
+            maximum: 8,
+            lost: 4,
+            ..Source::default()
+        }));
+        assert_eq!(shown.0.kind, vital.kind);
+        assert_eq!(shown.0.percent, 50);
     }
 
     #[test]

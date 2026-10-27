@@ -10,8 +10,10 @@
 //! `// UNKNOWN:` the exact variant sets of `Warcry`, `AccountType`,
 //! `DeathsSting` and `Che`; only the names that appear as literals are listed.
 
+use serde::Deserialize;
+
 /// A premium/society affiliation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Society {
     OrderOfVoln,
     CouncilOfLight,
@@ -49,7 +51,7 @@ impl std::fmt::Display for Society {
 }
 
 /// A standing/society resource counter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum ResourceType {
     BountyPoints,
     CovertArtsCharges,
@@ -94,7 +96,7 @@ impl std::fmt::Display for ResourceType {
 }
 
 /// A `PSM` category heading.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum PsmCategory {
     CombatManeuvers,
     ShieldSpecializations,
@@ -140,7 +142,7 @@ impl PsmCategory {
 ///
 /// `// UNKNOWN:` the variant set (`Warcry::parse` is 3588 B and its literals
 /// are not reachable as a table); only free text is kept.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize)]
 pub struct Warcry(pub String);
 
 impl Warcry {
@@ -157,7 +159,7 @@ impl Warcry {
 
 /// `// UNKNOWN:` variant set (`AccountType` appears only as a serde field
 /// visitor string).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum AccountType {
     Free,
     Premium,
@@ -177,14 +179,14 @@ impl AccountType {
 }
 
 /// `// UNKNOWN:` variant set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum DeathsSting {
     Inactive,
     Active,
 }
 
 /// `// UNKNOWN:` variant set (`Che` appears only as a serde field visitor).
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize)]
 pub struct Che(pub String);
 
 #[cfg(test)]

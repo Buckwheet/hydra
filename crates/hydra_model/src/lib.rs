@@ -7,7 +7,14 @@ pub mod state;
 pub mod status;
 pub mod targetid;
 
-/* unresolved symbols (trait impls, closures, generics):
+/// Wire-format tests for the recovered `Deserialize` impls.
+#[cfg(test)]
+mod serde_tests;
+
+/* The 30 `Deserialize` impls recovered from the binary — one `expecting`
+   symbol each. Every one of them is implemented by a serde derive in its own
+   module (`src/serde_tests.rs` exercises them); the addresses are kept as the
+   evidence trail:
  <hydra_model::targetid::_::<impl serde_core::de::Deserialize for hydra_model::targetid::Shown>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101be80e8
  <hydra_model::state::character::psm::_::<impl serde_core::de::Deserialize for hydra_model::state::character::psm::PsmSet>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101b5c310
  <hydra_model::state::character::psm::_::<impl serde_core::de::Deserialize for hydra_model::state::character::psm::PsmRanks>::deserialize::__Visitor as serde_core::de::Visitor>::expecting @0x0000000101b5c324

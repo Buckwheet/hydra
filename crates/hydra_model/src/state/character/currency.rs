@@ -5,8 +5,10 @@
 //! The serde `expecting` text `struct Currency` survives, so the type name is
 //! right; the field set below is `// UNKNOWN:` beyond the recovered phrases.
 
+use serde::Deserialize;
+
 /// Money as raw silver pieces plus banked notes.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Currency {
     /// Coins on hand, in silver pieces.
     pub silver: u64,

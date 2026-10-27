@@ -3,11 +3,17 @@
 Recovered from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hydra`
 (demangled symbols in `/Users/cpmbpro/Code/hydra-inspect/symbols_demangled.txt`).
 The crate has 85 source files, 280 `todo!()` stubs and 317 surviving symbols.
-Everything here is `std`-only and no `todo!()`/`unimplemented!()` remains
+No `todo!()`/`unimplemented!()` remains
 (`grep -R "todo!()\|unimplemented!()" crates/hydra_model/src` is empty).
 
-Status: `cargo check -p hydra_model` and `cargo test -p hydra_model` pass
-(**308 tests**).
+**Phase 1 (dependency reconnection) is done for this crate**: the `regex` and
+`serde` stand-ins are gone, see
+[Phase 1 reconnection](#phase-1-reconnection-regex-and-serde). Remaining
+std-only bits: the `ascii` rewrite is done at source level (no `regex-syntax`
+pin) and text entry points still take `&str` rather than styled runs.
+
+Status: `cargo check -p hydra_model --offline` and
+`cargo test -p hydra_model --offline` pass (**341 tests**).
 
 ---
 
@@ -16,7 +22,7 @@ Status: `cargo check -p hydra_model` and `cargo test -p hydra_model` pass
 | tag | meaning |
 |---|---|
 | **full** | signature, control flow and constants read directly out of the instruction stream; covered by tests with real values. |
-| **partly** | the entry contract, literals and helper calls are recovered, but a data table or a regex capture is missing, so the body implements the evidenced subset only. |
+| **partly** | the entry contract, literals and helper calls are recovered, but a data table is missing (regex captures are no longer a limitation), so the body implements the evidenced subset only. |
 | **unknown** | the binary shows the call shape but not the behaviour. A safe value (`None`, empty, `false`) is returned, with a `// UNKNOWN:` comment at the site describing what *was* visible. |
 
 Recovered tooling used (read-only):
@@ -50,13 +56,104 @@ two offset ranges are established from the binary: the clock block
 
 | original dependency | recovered use | what this build does |
 |---|---|---|
-| `regex` / `regex-syntax` | `pattern::{ascii,compile,compile_gated}`, every classifier's `first_match`, `MatchIndex` (a `RegexSet`), named captures | `pattern` implements a backtracking matcher for the subset the embedded tables use (literals, `^`, `$`, `.`, `*`, `+`, `?`, lazy, `\`-escapes, class ranges, groups, `|`, `(?i)`, and zero-width `(?!…)`/`(?=…)`). Unsupported syntax sets `Pattern::error` and never matches. **No capture support**, so every recovered `get_group_by_name` result is reported as `None`. |
-| `serde` (+ `serde_core::de::Visitor`) | all the `Deserialize` impls (23 `expecting` symbols survive) | plain structs with `#[derive(Default, Clone, Debug, PartialEq)]`; the *field names* were recovered from the `expecting`/`Debug`/SQL runs, the wire format is not reproduced. |
+| ~~`regex`~~ | `pattern::{ascii,compile,compile_gated}`, `MatchIndex`, every classifier's named captures | **RECONNECTED** to `regex = "=1.13.1"` (`{ workspace = true }`), see [Phase 1](#phase-1-reconnection-regex-and-serde). |
+| ~~`serde`~~ (`serde_core::de::Visitor`) | the 30 `Deserialize` impls (one `expecting` symbol each) | **RECONNECTED** to `serde = "=1.0.229"` with `derive`, see [Phase 1](#phase-1-reconnection-regex-and-serde). |
+| `regex-syntax` | `pattern::ascii` drove `ast::parse::Parser` + a `Visitor` (`Edits`) | **KEPT as a source-level rewrite**: `regex-syntax 0.8.11` is in the binary's crate list (it is `regex`'s own dependency) but is **not** a workspace pin, so it is not a direct dependency here. `pattern::ascii` reproduces the recovered edit set by scanning the source; see that function. |
 | `tokio` | none observed in this crate | n/a |
 | `egui`/`wgpu` | none observed in this crate (the drawing lives in `hydra_gui`) | n/a |
-| `toml_edit` | none observed in this crate | n/a |
+| `toml_edit` | none observed in this crate (`toml` is a *dev*-dependency for the wire tests only) | n/a |
 | `hydra_protocol` (path dep, allowed) | `Runs`/`Run`/`Link` in `state/lines.rs`, `state/combat/target.rs` | used as-is. |
 | `gs_base` (path dep, allowed) | `body::BodyPart` in `state/creatures/body.rs` | used as-is. |
+
+---
+
+## Phase 1 reconnection (`regex` and `serde`)
+
+### `regex`
+
+`Cargo.toml` now has `regex = { workspace = true }` (`=1.13.1`).
+`src/pattern.rs` is a thin layer over the real engine:
+
+* `compile` = `ascii` + `Regex::new` — exactly the recovered
+  `0x101b8a0d8` (`bl regex::regex::string::Regex::new @0x101d8c61c`).
+* `compile_gated` = `ascii` + `RegexBuilder::new` + `dfa_size_limit(0)` +
+  `build` — `0x101b89800`; the limit argument is `x1 = 0` at `0x101b89830`
+  and `regex` documents `0` as *no limit*.
+* `Pattern` keeps its public shape (`source`, `case_insensitive`, `error`,
+  `is_match`, `is_ok`; `PartialEq` is now hand-written because `Regex` is not
+  comparable) and **gains captures**: `Pattern::{captures, capture,
+  group_names, groups}` and the owned [`pattern::Groups`], which is the
+  recovered `Captures::get_group_by_name` result set.
+* `ascii`'s edit set is now *recovered*, not guessed (see the function's
+  table): `\d \D \s \S \w \W` → `[0-9]` / `[^0-9]` /
+  `[\t\n\x0B\x0C\r ]` / `[^\t\n\x0B\x0C\r ]` / `[0-9A-Za-z_]` /
+  `[^0-9A-Za-z_]`, and `\b` → `(?-u:\b)`. A `(?u)` flag group is **not**
+  stripped (there is no `Ast::Flags` branch); the old build's
+  "drop a leading `(?u)`" was an invention and is gone.
+
+Consequences for behaviour:
+
+* Syntax the hand-written matcher rejected is compiled for real: `\b`, `\p{…}`,
+  `{n,m}`, nested classes, … `Pattern::is_ok` therefore answers `true` for
+  them now. The two tests that pinned the *stand-in's* limits
+  (`\p{L}` must fail, `\b` is a literal `b`) were rewritten to pin the real
+  behaviour instead — they documented the matcher, not recovered behaviour.
+* Look-around is **not** `regex` syntax. The embedded crit table has exactly
+  one look-ahead row (`slash/head/3`, `^(?!.*removes skull.)Blow to head.`);
+  `MatchIndex::build` handles it the way the binary does (`str::replace` of the
+  20-byte literal by the empty string + a separately compiled 16-byte gate
+  `.*removes skull.`), so all 2394 rows still compile
+  (`MatchIndex::compiled() == 2394`, `gated() == 1`) and the row is suppressed
+  on `Blow to head removes skull.` — pinned by a new test.
+* `crit::match_index::MatchIndex` is a `Vec` of compiled patterns + optional
+  gate, **not** a `RegexSet`: the recovered `build` (`0x101b9b0d4`) compiles one
+  `Regex` per row into a 64-byte record. (The `RegexSetBuilder` symbols in the
+  binary belong to `hydra_lookout`, whose `ignore` list is an
+  `Option<RegexSet>`.)
+
+Sibling impact: `hydra_lookout` is the only crate that uses
+`hydra_model::pattern` directly; it compiles `\b`-bearing and `(?i)` patterns
+through `pattern::compile` and its 41 tests still pass
+(`cargo test -p hydra_lookout --offline`).
+
+### `serde`
+
+`Cargo.toml` now has `serde = { workspace = true }` (`=1.0.229`, `derive`).
+All **30** recovered `Deserialize` impls are implemented (see the address list
+in `src/lib.rs` and the tests in `src/serde_tests.rs`):
+
+`targetid::Shown`, `character::psm::{PsmSet,PsmRanks}`,
+`character::stats::{Stat,StatKind,StatValue,Identity}`,
+`character::skills::{Skill,SkillKind,SkillSet}`,
+`character::enhancive::{Bonus,EnhanciveTotals,Resource,Section}`,
+`character::currency::Currency`,
+`character::standing::{Standing,ResourceAmounts}`,
+`character::gemstones::{Binding,Gemstone,Gemstones,Property}`,
+`character::snapshot::{CharacterSnapshot,Group}` and
+`character::vocabulary::{AccountType,Che,DeathsSting,PsmCategory,ResourceType,Society,Warcry}`.
+
+Five further derives are needed to make `CharacterSnapshot` work and are
+additive only: `Character`, `StatSet`, `Stance`, `Experience` and
+`state::vitals::Vital`.
+
+Three of the thirty were *named* by the binary but had no body in the stubs, so
+they are declared here for the first time with a `// UNKNOWN:` field set:
+`targetid::Shown` (a newtype over the 20-byte vitals record `of` builds),
+`stats::Identity` (the identity block, reachable as `Character::identity()`) and
+`enhancive::Bonus` (`{ amount, ranks }`).
+
+Deviations, honestly:
+
+* **No `Serialize`.** The binary has no `Serialize` impl for any `hydra_model`
+  type (only `toml`/`serde_json`/`toml_edit` serializer internals), so none is
+  derived. `src/serde_tests.rs` is therefore one-directional
+  (document → model), using `serde_json` and `toml` as dev-dependencies.
+* **Wire format unknown.** The impls are derives over the recovered *field
+  names*; no `rename`/`tag`/`default` attributes are applied, so the enum
+  forms are the variant identifiers (`"OrderOfVoln"`, not `"Order of Voln"`),
+  which the binary does not carry. A field is required unless it is
+  `Option`, and `BTreeMap<Resource, i32>` keys are enum identifiers (a
+  `Resource::Stat(..)` key cannot be a JSON object key).
 
 Text entry points: the recovered parsers take styled runs and call
 `Runs::plain` first (visible in `SkillLine::classify_with_bold`,
@@ -85,9 +182,9 @@ extracted verbatim instead of guessed:
 
 | symbol | addr | status | recovered signature / notes |
 |---|---|---|---|
-| `ascii` | `0x101b89924` | partly | `fn ascii(&str) -> String`. Original: `regex_syntax::ast::Parser` + `Visitor` (`Edits`) collecting start/end edits, `driftsort_main`, re-splice, re-compile. Rewrites `\d \D \w \W \s \S` to ASCII classes and drops a leading `(?u)`; exact edit set UNKNOWN. |
-| `compile` | `0x101b8a0d8` | partly | `fn compile(&str) -> Pattern`. `ascii` → parse → matcher (see departures). |
-| `compile_gated` | `0x101b89800` | partly | `fn compile_gated(&str) -> Option<Pattern>`; original wrapped `RegexBuilder::dfa_size_limit(..).build()`. |
+| `ascii` | `0x101b89924` | full (edit set) | `fn ascii(&str) -> String`. `regex_syntax::ast::Parser` + `Visitor` (`Edits`) with the two entry points `visit_pre` (`0x101b8cc64`) and `visit_class_set_item_pre` (`0x101b8cb40`), `driftsort_main` over the edits, `String::replace_range` from the highest offset down. Edits: perl classes → `[<class>]` / `[^<class>]` with the class table `0-9` / `\t\n\x0B\x0C\r ` / `0-9A-Za-z_` (`0x1044a3798` + lengths at `0x1039d6c00`), and `\b` → `(?-u:\b)` (`movz/movk`, node kind word `4`). Implemented at source level in `src/pattern.rs` (no `regex-syntax` pin). |
+| `compile` | `0x101b8a0d8` | full | `fn compile(&str) -> Pattern` = `ascii` + `regex::Regex::new`. |
+| `compile_gated` | `0x101b89800` | full | `fn compile_gated(&str) -> Option<Pattern>` = `ascii` + `RegexBuilder::new(..).dfa_size_limit(0).build()`. |
 
 ### `crit.rs`, `crit/types.rs`, `crit/load.rs`, `crit/match_index.rs`
 
@@ -97,7 +194,7 @@ extracted verbatim instead of guessed:
 | `crit::CritTables::load` | `0x101c0df94` | full | `fn() -> Result<CritTables, BuildError>`; parses the embedded 228812-byte table. **No arguments.** |
 | `crit::CritTables::parse` | `0x101c0e024` | full | `fn(&self, &str) -> Vec<&CritEntry>`. |
 | `crit::load::parse_tsv` | `0x101bab758` | full (grammar) / partly (semantics of unused columns) | header + 19 columns recovered verbatim, three error texts + the `header is {}` format. |
-| `crit::match_index::MatchIndex::build` | `0x101b9b0d4` | partly | patterns compiled case-insensitively. The `.*removes skull.` / `(?!.*removes skull.)` pair turned out to be *table data*, not an injected gate. |
+| `crit::match_index::MatchIndex::build` | `0x101b9b0d4` | full | one `regex::Regex` per row (64-byte record), no `RegexSet`; a row containing the 20-byte literal `(?!.*removes skull.)` has that literal replaced by `""` and gets the 16-byte `.*removes skull.` compiled through `compile_gated` as a *negative gate* (`Option<Regex>`, `None` = no gate). Only `slash/head/3` is gated. |
 | `crit::match_index::MatchIndex::matches` | `0x101b9bd88` | full | `fn(&self, &str) -> Vec<usize>`; lowercases the line, reports every matching index. |
 | `crit::types::Position::parse` | `0x101b6c214` | full | length dispatch: `kneeling` 0, `prone` 1, `sitting` 2, everything else (incl. `standing`, empty) 3. |
 | `crit::types::WoundLocation::parse` | `0x101b6c014` | full | `head` 0, `neck` 1, `chest` 2, `abdomen` 3, `back` 4, `nerves` 5, `right_leg` 6, `both_eyes` 7, else 8. **`left_arm`, `left_leg`, `*_hand`, `*_eye` are not accepted** (tested). |
@@ -166,23 +263,23 @@ extracted verbatim instead of guessed:
 |---|---|---|---|
 | `defs::defs` | `0x101b?` (56 B) | full (accessor) / unknown (table) | `OnceLock`; the defs TSV is a generated data file and is not embedded → empty table. |
 | `Def::extra` | `0x101b9f?` (568 B) | full | `k=v;…` parsing (`damaging=1;aoe=0;spawns=0;key=ThornsImpact_GS;`). |
-| `Defs::{any_match,first_match,first_match_with_role}` | `0x101b9efa0`-ish | partly | pattern match over the table; captures unavailable. |
+| `Defs::{any_match,first_match,first_match_with_role}` | `0x101b9efa0`-ish | full (plumbing) / partly (table) | pattern match over the table; `first_match_groups` / `first_match_with_role_groups` hand out the row's named groups (`Def::{groups,group,has_group}`), i.e. the recovered `get_group_by_name`. The table itself is still not embedded. |
 | `Defs::{barrier,family,first_flight,gemstone_property,nock_weapon,swing_weapon,flare_names}` | various | partly | family-scoped lookups; `flare`/`flare_mirror` recovered. |
-| `attack::{AttackLine,AmbushPrefix,RedirectPrefix}::classify` | `0x101b8fd08`,`0x101b90e68`,`0x101b91624` | partly | def families + group names (`attacker`, `interceptor`, `intended`, `group`, `weapon`, `aimed`, `environment`, `target`) recovered; values `None`. |
-| `attack::{attackerless_line,swing_weapon,coup_kill_location}` | `0x101b919d8`,`0x101b9139c`,`0x101b91c8c` | partly | families `attack`/`swing`/`coup_kill`. |
-| `bracket::{assault_start,assault_end,sequence_start,sequence_end}` | `0x101be67b8`,… | partly | roles `assault`/`sequence`. |
+| `attack::{AttackLine,AttackPrefix,RedirectPrefix}::classify` | `0x101b8fd08`,`0x101b90e68`,`0x101b91624` | partly (groups filled, table missing) | def families + group names (`attacker`, `interceptor`, `intended`, `group`, `weapon`, `aimed`, `environment`, `ambush_prefix`, `reaction_prefix`, `redirect…`, `target`); every group is now read out of the hit. `RedirectPrefix` is modelled by `AttackPrefix`'s `redirect_from`/`redirect_to` (the recovered name run is truncated). |
+| `attack::{attackerless_line,swing_weapon,coup_kill_location}` | `0x101b919d8`,`0x101b9139c`,`0x101b91c8c` | partly | `attackerless_line` tests the recovered family list (`ATTACKERLESS_FAMILIES`); `swing_weapon` reads the `weapon` group; `coup_kill_location` uses family `coup_kill`. |
+| `bracket::{assault_start,assault_end,sequence_start,sequence_end}` | `0x101be67b8`,… | partly | roles `assault`/`sequence`; the `target` group is filled. |
 | `bracket::AssaultName::parse` | 372 B | full | non-empty text. |
-| `damage::DamageLine::classify` | `0x101ba031c` | partly | family `damage`, `" hits!"`. |
-| `flare::FlareLine::classify` | `0x101b8dbc0` | partly | families `flare`/`flare_mirror`; eight group names recovered. |
+| `damage::DamageLine::classify` | `0x101ba031c` | partly | family `damage`, `" hits!"`, `target` group filled. |
+| `flare::FlareLine::classify` | `0x101b8dbc0` | partly | families `flare`/`flare_mirror`; all nine recovered groups (`attacker`, `flare_weapon_link`, `spawns`, `target`, `reactive`, `barriers`, `via_cast`, `released`, `aura`) are read; the `bool` fields are group presence. |
 | `outcome::Outcome::classify` | `0x101bffc98` | partly | 15 outcome names recovered verbatim (`hit evade block parry warded ward_failed intercept unaffected fumble hindrance already_dead miss resisted confused frenzied`). |
-| `resolution::Resolution::classify` | `0x101be4bb0` | partly | family `resolution`, group `as`, `f64::from_str`. |
+| `resolution::Resolution::classify` | `0x101be4bb0` | partly | family `resolution`, group `as` parsed with `f64::from_str` (falling back to the first number on the line). |
 | `resolution::crit_rider_line` | `0x101be54c0` | partly | family `crit_rider`. |
 | `resolution::ResolutionKind::parse` | 580 B | partly | codes `as cs uaf fs ds td udf fd avd cva mm` recovered, plus `smr ssr activation maneuver_roll` from the serde variant list. |
-| `spell_loss::SpellLoss::classify` | `0x101bfe79c` | partly | family `spell_loss`, groups `target`/`spell_name`. |
-| `status::{StatusLine::classify,StatusName::parse}` | `0x101b91df8`,`0x101b9216c` | partly | family `status`, group `target`. |
+| `spell_loss::SpellLoss::classify` | `0x101bfe79c` | partly | family `spell_loss`, groups `target`/`spell_name` (falls back to the row `name`). |
+| `status::{StatusLine::classify,StatusName::parse}` | `0x101b91df8`,`0x101b9216c` | partly | family `status`, group `target` filled. |
 | `target::{link_name,link_in,bolded_link,any_link,is_self,pattern_addresses_self}` | `0x101bff3fc`-ish | partly | link identity is `noun`/`exist`; boldness lives on the run, not the link. |
 | `tracker::{set_crit_tables,publish,take_facts,invalidate_for_reconnect}` | `0x101bdb?` | full | field names recovered from `Debug::fmt`: `held_cast`, `held_pre_flares`, `active_assault`, `volley_round`, `tremors`, `crit_tables`, `pending`, `dropped`. |
-| `ucs::{PositionTier::parse,UcsAttack::parse,UcsLine::classify}` | `0x101be58?` | partly | the three recovered phrases. |
+| `ucs::{PositionTier::parse,UcsAttack::parse,UcsLine::classify}` | `0x101be58?` | partly | the three recovered phrases; the `tier` group is fed to `PositionTier::parse` first. |
 
 ### `state/creatures/*`
 
@@ -276,11 +373,15 @@ extracted verbatim instead of guessed:
 
 ## Evidence gaps / conflicts
 
-1. **Regex captures.** `Defs::first_match`, `FlareLine::classify`,
-   `AttackLine::classify`, `SpellLoss::classify` and `StatusLine::classify` all
-   read named groups (`attacker`, `target`, `weapon`, `spell_name`, …). The
-   std-only engine has no capture support, so those fields stay `None`. This is
-   the single largest fidelity loss (≈30 functions).
+1. ~~**Regex captures.**~~ **Closed in Phase 1**: the real `regex` supplies the
+   capture set, and every classifier that reads named groups
+   (`Defs::first_match`, `FlareLine`, `AttackLine`, `AttackPrefix`,
+   `SpellLoss`, `StatusLine`, `DamageLine`, `Resolution`, `UcsLine`, the
+   brackets) now fills its fields. What is still missing for those classifiers
+   is the **def table** (gap 2), not the captures. Residual: the exact *names*
+   of the `redirect…` and `tier`-adjacent groups are partly truncated in the
+   string pool, and a def row whose pattern declares no group leaves the field
+   `None`.
 2. **Data tables that are not in the binary.** The spell table, the bestiary
    (`creatures.tsv`), the combat `defs` TSV, the object-type table and the
    movement phrase table are all generated data files. Only `crit.tsv` happens
@@ -301,6 +402,18 @@ extracted verbatim instead of guessed:
    report a huge size because the next *named* symbol is far away
    (`roundtime_remaining_after` claims 13316 B but only 60 B are its own). The
    real function was recovered and the extra bytes belong to unnamed functions.
-7. **`ascii`'s edit set.** The visitor-based rewrite is visible structurally, but
-   the exact edits are not; the `\d`/`\w`/`\s` → ASCII rewrite is the documented
-   reconstruction.
+7. ~~**`ascii`'s edit set.**~~ **Closed in Phase 1**: the two visitor entry
+   points and their static tables give the exact edits (perl classes →
+   ASCII classes, `\b` → `(?-u:\b)`). The *implementation* differs from the
+   original: `regex-syntax` is not a workspace pin, so the edits are applied by
+   a source scan rather than on a `regex_syntax::ast::Ast`. A `\b` inside a
+   bracketed class is left alone (the AST never yields an assertion there); a
+   `\\` escape followed by `d`/`b` is handled correctly because the scan
+   consumes escapes in pairs.
+8. **`serde` wire format.** The `Deserialize` impls are derives over the
+   recovered field names; renames, tagging and defaults are `// UNKNOWN:` and
+   none is applied. No `Serialize` exists in the binary for these types, so the
+   crate can read its wire form but not write it.
+9. **Three types without a body.** `targetid::Shown`, `stats::Identity` and
+   `enhancive::Bonus` are only known to exist because their `Deserialize`
+   `expecting` symbols survive; their field sets here are a reconstruction.

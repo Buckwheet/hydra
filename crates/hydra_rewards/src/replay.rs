@@ -44,9 +44,11 @@ pub const ANNOUNCED: &str = "earned the following reward";
 ///     .collect();
 /// ```
 ///
-/// **Departure**: the original replayed the text through Hydra's own protocol
-/// parser; this reconstruction feeds it line by line — the same text reaches
-/// the watcher for every log that has one line per `\n`.
+/// **KEPT (Phase 1 seam)**: the original replayed the text through Hydra's own
+/// protocol parser; this feeds it line by line — the same text reaches the
+/// watcher for every log that has one line per `\n`, and the local
+/// `hydra_protocol`'s `Frame` cannot carry the "line ends here" fact the
+/// watcher needs (`NOTES.md` §5.2).
 pub fn rewards(text: &str) -> Vec<Said> {
     if text.len() < parse::THANKS.len().max(ANNOUNCED.len()) || !text.contains(ANNOUNCED) {
         return Vec::new();

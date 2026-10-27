@@ -70,6 +70,9 @@ impl Attempt {
     ///
     /// **Partly recovered**: the body matches the room's refusal lines and
     /// reports whether another attempt is worth making.
+    ///
+    /// // UNKNOWN: the exact refusal sentences are reconstructed; the binary's
+    /// literal pool has `is locked` but not the two `go that way` lines.
     pub fn react(&mut self, line: &str) -> bool {
         let lower = line.to_ascii_lowercase();
         lower.contains("you can't go that way")

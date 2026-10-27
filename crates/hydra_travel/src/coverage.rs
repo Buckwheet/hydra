@@ -94,6 +94,9 @@ pub fn census(map: &crate::map::Map) -> Census {
 /// The message shape is the recovered `reveals the following contents` /
 /// `the containers listed` style of report (`0x10241e97a`); the travel report
 /// lists one `kind: count` line per kind after a header.
+///
+/// // UNKNOWN: the exact header wording is not in the pool; the counts and the
+/// `kind: count` rows are.
 pub fn report(census: &Census) -> String {
     let mut out = String::new();
     out.push_str(&format!(

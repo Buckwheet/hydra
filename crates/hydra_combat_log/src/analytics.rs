@@ -1,4 +1,10 @@
 //! The analytics reports: estimates and cross-tabs over the recorded fights.
+//!
+//! // UNKNOWN: several report headings are **not** in the binary's literal
+//! pool (`Flare: `, `Def - `, `Barrier - `, `Aim`, `Difference: ` and
+//! `(none recorded)`). The recovered SQL, counts and table columns are real;
+//! the surrounding wording is the nearest recovered vocabulary and each site
+//! is marked `// UNKNOWN:`. See `NOTES.md` §"Inferred wording".
 
 use crate::command::Analytics;
 use crate::report::{self, Scope};
@@ -127,6 +133,8 @@ pub fn gear(store: &Store, character: &str, scope: &Scope) -> Lines {
     }
     if worn.is_empty() {
         out.push(String::from("Worn over the hunts:"));
+        // UNKNOWN: no `(none recorded)` literal survives; the recovered
+        // heading says the table is empty, so this line stands in for it.
         out.push(String::from("  (none recorded)"));
     } else {
         out.push(String::from("Worn over the hunts:"));
@@ -181,6 +189,8 @@ pub fn flare(
         }
     }
     let mut out = vec![match name {
+        // UNKNOWN: `Proc rate by attack:` is recovered; the named-flare
+        // heading (`Flare: …`) is not in the pool.
         Some(n) => format!("Flare: {} - {}", n, hunts.label),
         None => format!("Proc rate by attack: {}", hunts.label),
     }];
@@ -479,6 +489,8 @@ pub fn defense(
         row("TD", &mut td),
         row("UDF", &mut udf),
     ];
+    // UNKNOWN: `Def - …` is not a recovered literal; the grid heads and the
+    // predicate it summarises are.
     let mut out = vec![format!("Def - {} - {}", hunts.label, want)];
     out.extend(report::grid(&["", "Min", "Avg", "Median", "Max"], &rows));
     Ok(out)
@@ -518,6 +530,7 @@ pub fn intercepts(store: &Store, character: &str, scope: &Scope) -> Lines {
     }
     let mut out = vec![
         String::from("By barrier (a block's share is of every attack; an absorb's, of what would have hit):"),
+        // UNKNOWN: the `Barrier - …` line is not in the literal pool.
         format!("Barrier - {}", hunts.label),
     ];
     let rows: Vec<Vec<String>> = stops
@@ -758,6 +771,8 @@ fn aim_report(store: &Store, hunts: &report::Hunts) -> Lines {
         &cells,
     ));
     let diff = unaimed.0 - aimed.0;
+    // UNKNOWN: the `Difference: ` prefix is not in the pool; the recovered
+    // `Fewer median attempts …` clause is.
     out.push(format!(
         "Difference: {}  Fewer median attempts with aiming (positive favors aiming)",
         diff

@@ -4,6 +4,8 @@
 //! put_back,is_spoken}` (`0x101526e50`, `0x101527090`, `0x101527878`,
 //! `0x101527c10`, `0x101527cbc`).
 
+use hydra_model::state::lines::ChunkLine;
+
 /// The item a walk takes out of a container first (`taken_from`,
 /// `0x101526e50`).
 ///
@@ -46,13 +48,18 @@ pub fn language_in(line: &str) -> Option<&'static str> {
     None
 }
 
-/// The command that puts a kept item back (`put_back`, 172 bytes at
-/// `0x101527c10`).
-pub fn put_back(item: &str, container: &str) -> Option<String> {
-    if item.is_empty() || container.is_empty() {
-        return None;
-    }
-    Some(format!("put {item} in {container}"))
+/// Did the game acknowledge putting a kept item back (`put_back`, 172 bytes at
+/// `0x101527c10`)?
+///
+/// **ESTABLISHED** (the whole 172-byte body): it walks a `&[ChunkLine]` (24-byte
+/// stride, `ChunkLine::text` at `0x101bfe51c`), compares the first eight bytes
+/// with the constant built in registers — `'Y','o','u',' ','p','u','t',' '` —
+/// and returns whether **any** line starts with `"You put "`. Nothing about
+/// items or containers is read.
+pub fn put_back(lines: &[ChunkLine]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.text().starts_with("You put "))
 }
 
 /// Did this line come from speech (`is_spoken`, 1404 bytes at `0x101527cbc`)?
@@ -90,9 +97,14 @@ mod tests {
         );
         assert!(is_spoken("\"hello\""));
         assert!(!is_spoken("The gate opens."));
-        assert_eq!(
-            put_back("cheap gem", "sack").as_deref(),
-            Some("put cheap gem in sack")
-        );
+        // The recovered function is a predicate over the game's lines.
+        let line = |text: &str| ChunkLine {
+            runs: hydra_protocol::runs::Runs::from_vec(vec![
+                hydra_protocol::runs::Run::new(text),
+            ]),
+        };
+        assert!(put_back(&[line("You put a cheap gem in a sack.")]));
+        assert!(!put_back(&[line("You get a cheap gem from a sack.")]));
+        assert!(!put_back(&[]));
     }
 }

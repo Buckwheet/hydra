@@ -168,6 +168,8 @@ pub fn attack_detail(store: &Store, id: i64, _deepen: bool) -> Lines {
             row.creature_id.unwrap_or(0)
         ));
     } else {
+        // UNKNOWN: no `Target: no target` literal survives; `Target: ` and the
+        // missing-target case are recovered separately.
         out.push(String::from("Target: no target"));
     }
     if let Some(attacker) = &row.attacker {
@@ -311,6 +313,8 @@ pub fn tree(store: &Store, root: i64) -> Lines {
         ));
         return Ok(out);
     }
+    // UNKNOWN: the tree heading is built from the recovered `SEQUENCE: `
+    // prefix; the ` (root)` marker is not a literal in the pool.
     out.push(format!("SEQUENCE: {} (root)", attack.name));
     for child in children {
         out.push(format!("  {} -> {}", child.seq, child.name));

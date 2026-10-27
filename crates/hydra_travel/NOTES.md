@@ -309,7 +309,7 @@ and a **u16** table at `0x1024207d0` (offsets `× 4` from `0x10156b80c` and
 | `settings::on` | `0x10152a2a0` | full | |
 | `memory` | `0x10152aaf8` | partly | |
 | `Memory::accept` / `Memory::called` | `0x10152a4b0`, `0x10152aa18` | partly | `No memory {key}.` recovered (`0x103e63126`). |
-| `on_word` | `0x10152b780` | full | on/yes/true/1 vs off/no/false/0. |
+| `on_word` | `0x10152b780` | full | on/yes/true vs off/no/false (no single-digit arms). |
 
 ### `swim.rs`
 
@@ -447,3 +447,18 @@ else in the workspace changed.
    `Routine` carries `kind` plus the 13 other fields, and the 31 kind words; the
    original enum shape (`Errand`, `Puzzle`, `Opening`, `Landmark`) is recorded
    here but flattened into one struct.
+
+8. **`walk::hands` versus `hydra_model`'s `Containers`.** The binary's
+   `Containers::ready` takes a slot number and returns the slot's container
+   (`Option<&str>` at `0x101bdc9ac`), while the already-committed
+   `hydra_model::state::containers::Containers::ready` takes a line and returns
+   `bool`. `store_commands` and `take_back` are therefore reconstructed against a
+   simplified seam with `// UNKNOWN:` at the call sites; the recovered call
+   shapes (`fn(&GameState) -> Vec<String>` and
+   `fn(&GameState, &str) -> Vec<String>`) are recorded there. Fixing this needs a
+   change to `hydra_model`, which is outside this crate's scope.
+9. **`route::not_known`, `coverage::report`, `walk::pace::typeahead_said` and
+   `walk::recovery::Attempt::react`.** Their predicates and counts are recovered,
+   but the exact output wording is not in the literal pool. The reconstructed
+   sentences are labelled `// UNKNOWN:` in the sources and are not presented as
+   evidence.

@@ -191,6 +191,9 @@ pub fn why_shut(step: &Step, condition_met: bool) -> Option<&'static str> {
 /// **Partly recovered**: the body is the "not known" branch of the destination
 /// lookup; it asks the condition walker (`Cond::ask`) and lists the candidate
 /// names it does know.
+///
+/// // UNKNOWN: the exact sentence is not in the binary's literal pool; the
+/// recovered pieces are the place name and the list of known names.
 pub fn not_known(map: &Map, name: &str) -> String {
     let known = places(map);
     if known.is_empty() {

@@ -77,10 +77,10 @@ impl Kind {
                     Some(format!("{key} is one of {}.", words.join(", ")))
                 }
             }
-            Kind::Room => Some(format!(
-                "{key} is a room number, or blank for none of that town's rooms."
-            )),
-            Kind::Text => Some(format!("{key} is {} from {} to {}.", value, 1, 1)),
+            Kind::Room => Some(format!("{key} is a room number, or blank.")),
+            // The recovered pieces are `{} is {}` (`0x103e62c3e`), used by
+            // `TravelSettings::set` as the confirmation for a plain value.
+            Kind::Text => Some(format!("{key} is {value}.")),
         }
     }
 }
@@ -486,8 +486,8 @@ pub fn on(name: &str) -> bool {
 /// (pieces at `0x103e63082`).
 pub fn on_word(word: &str) -> Option<bool> {
     match word.trim().to_ascii_lowercase().as_str() {
-        "on" | "yes" | "true" | "1" => Some(true),
-        "off" | "no" | "false" | "0" => Some(false),
+        "on" | "yes" | "true" => Some(true),
+        "off" | "no" | "false" => Some(false),
         _ => None,
     }
 }
@@ -806,6 +806,11 @@ mod tests {
             settings.set("ice", "sprint").unwrap_err(),
             "ice is one of run, wait, or blank."
         );
+        // `{} is a room number, or blank.` (0x103e6c1b1..0x103e6c1d4).
+        assert_eq!(
+            settings.set("mularos_lover", "at home").unwrap_err(),
+            "mularos_lover is a room number, or blank."
+        );
     }
 
     #[test]
@@ -822,7 +827,10 @@ mod tests {
         assert_eq!(on_word(" ON "), Some(true));
         assert_eq!(on_word("Yes"), Some(true));
         assert_eq!(on_word("false"), Some(false));
-        assert_eq!(on_word("0"), Some(false));
+        // The recovered arms are only the words; `0`/`1` are not accepted
+        // (`on_word`, 0x10152b780..0x10152b9e0: no single-character arm).
+        assert_eq!(on_word("0"), None);
+        assert_eq!(on_word("1"), None);
         assert_eq!(on_word("maybe"), None);
     }
 }

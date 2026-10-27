@@ -301,3 +301,17 @@ supplies the real `CritTables` behind `session::crit_tables`.
    account and nickname matches, so all three are accepted.
 10. **`commands::ENTRIES`** holds the 16 help rows whose name *and* description
     survive contiguously; the table continues past them.
+
+## 7. Inferred wording
+
+Four seams print sentences whose exact text is not in the binary's literal pool;
+each is marked `// UNKNOWN:` at the site and is not presented as evidence:
+
+| site | inferred text | recovered around it |
+| --- | --- | --- |
+| `commands::install` | `… is not a folder` | the folder resolution and `lich.rbw` markers |
+| `table::forget_password` | `… is not forgotten: …` | `… is forgotten.` and `env_name` |
+| `pages::{load_file,apply}` | `… has no settings path` | `who`, `settings_path`, `load` |
+| `pages::TARGETID_KEYS` | `creature_tags` | `targetid` and the "creature tags" messages |
+
+`account::forget`'s no-entry message is likewise marked `UNKNOWN` in the source.

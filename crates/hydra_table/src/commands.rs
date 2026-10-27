@@ -201,6 +201,8 @@ pub fn ours(existing: &str) -> bool {
 /// `hydra_lich`.  `Err` carries the folder that was not there.
 pub fn install(folder: &Path) -> Result<PathBuf, String> {
     if !folder.is_dir() {
+        // UNKNOWN: the refusal wording is not in the pool; the 33 KB body
+        // resolves the folder and reads/writes `lich.rbw`.
         return Err(format!("{} is not a folder", folder.display()));
     }
     Ok(folder.join(INSTALLED_SCRIPT))

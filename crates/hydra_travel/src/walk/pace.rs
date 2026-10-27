@@ -16,6 +16,9 @@ pub fn typeahead_of(setting: Option<u32>) -> u32 {
 
 /// The confirmation a typeahead change prints (`typeahead_said`,
 /// `0x10156b3cc`).
+///
+/// // UNKNOWN: `typeahead is ` is not in the literal pool; only the setting
+/// number and the trailing full stop are evidenced.
 pub fn typeahead_said(setting: u32) -> String {
     format!("typeahead is {setting}.")
 }

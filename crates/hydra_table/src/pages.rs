@@ -224,6 +224,8 @@ pub fn who(name: &str) -> Result<(String, String), String> {
 pub fn load_file(root: &Path, who: &str) -> Result<SettingsFile, String> {
     let (game, character) = self::who(who)?;
     let path = settings_store::settings_path(root, &game, &character)
+        // UNKNOWN: the no-path message is not in the pool; the recovered
+        // pieces are `who`, `settings_path` and `load`.
         .ok_or_else(|| format!("{who} has no settings path"))?;
     settings_store::load(&path)
 }
@@ -296,6 +298,7 @@ pub fn log_settings(root: &Path, who: &str) -> BTreeMap<String, bool> {
 pub fn apply(root: &Path, who: &str) -> Result<std::path::PathBuf, String> {
     let (game, character) = self::who(who)?;
     let path = settings_store::settings_path(root, &game, &character)
+        // UNKNOWN: as in `load_file`; the wording is reconstructed.
         .ok_or_else(|| format!("{who} has no settings path"))?;
     settings_store::load(&path)?;
     Ok(path)
@@ -348,6 +351,10 @@ pub const SORT_KEYS: [&str; 2] = ["sorter", "sorter_width"];
 pub const SYMBOL_KEYS: [&str; 3] = ["symbol", "lich_symbol", "style"];
 
 /// The target-id switches.
+///
+/// // UNKNOWN: `targetid` is recovered; the second word is not in the pool
+/// (the messages say "creature tags", with a space), so it is reconstructed in
+/// the settings-key spelling.
 pub const TARGETID_KEYS: [&str; 2] = ["targetid", "creature_tags"];
 
 #[cfg(test)]

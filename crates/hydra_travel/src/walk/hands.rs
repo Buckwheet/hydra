@@ -20,11 +20,18 @@ pub fn cast_commands(spell: &str) -> Option<Vec<String>> {
 
 /// The commands that put something away.
 ///
-/// **ESTABLISHED** (`0x10154e9b0`, 96 bytes): the body builds a `Vec` from an
-/// iterator over three parts — the state's `+0x10d0` and `+0x1088` fields (the
-/// left and right hand containers), the 5-byte word `right` at `0x10241ef96`
-/// and the 4-byte word `left` at `0x10207aed4` — i.e. one `store` step per hand,
-/// right first.
+/// **Partly recovered** (`0x10154e9b0`, 96 bytes): the body takes `&GameState`
+/// in `x0`, builds the `Vec<String>` through `sret` (untouched `x8`), reads the
+/// state at `+0x10d0`/`+0x1088`, and joins them with the 5-byte `right`
+/// (`0x10241ef96`) and 4-byte `left` (`0x10207aed4`) words through
+/// `SpecFromIterNested::from_iter`.
+///
+/// // UNKNOWN: the exact iterator (which of `store`/`get`/`remove` from the
+/// merged pool applies to each hand) and the container predicate are not
+/// recoverable. `hydra_model`'s `Containers::ready` also has a different
+/// signature than the binary's `ready(slot)`, so this build keeps the simplified
+/// `(right, left)` seam and emits one recovered `store <hand>` per non-empty
+/// hand.
 pub fn store_commands(right: bool, left: bool) -> Vec<String> {
     let mut commands = Vec::new();
     if right {
@@ -38,11 +45,18 @@ pub fn store_commands(right: bool, left: bool) -> Vec<String> {
 
 /// Take the walker's items back out of the containers.
 ///
-/// **ESTABLISHED** (`0x10154ea10`): the body walks the four container slots
-/// (`Containers::ready` with `0..=3` at `0x10154ea40`, `0x10154ea84`,
-/// `0x10154eac8`, `0x10154eb10`) and, when a slot holds the item it is looking
-/// for (the `memcmp` at `0x10154ea60` over the item name), reports the slot's
-/// `store_mode`. The four `store_mode` tests select the command.
+/// **Partly recovered** (`0x10154ea10`): the real call shape is
+/// `fn(&GameState, &str) -> Vec<String>` — it reads `x1`'s `(ptr, len)` item,
+/// calls `Containers::ready(state + 0xc00, slot)` for slots `0..=3`
+/// (`0x10154ea40`, `0x10154ea84`, `0x10154eac8`, `0x10154eb10`), compares the
+/// container text (`memcmp` at `0x10154ea60`) and then tests
+/// `Containers::store_mode(slot)`.
+///
+/// // UNKNOWN: the reconstructed `hydra_model::state::containers::Containers`
+/// has a `ready(line: &str) -> bool` reader rather than the binary's
+/// `ready(slot) -> Option<&str>`, so the recovered four-slot walk cannot be
+/// expressed against it. This seam takes the four slot names and returns the
+/// recovered `get <item> from <hand>` shape for the matching slot.
 pub fn take_back(held: &str, slots: &[Option<String>; 4]) -> Vec<String> {
     let mut commands = Vec::new();
     for (index, slot) in slots.iter().enumerate() {

@@ -395,3 +395,25 @@ barriers    barkskin mirror_image_def wthorns640_block sward319 edefenseiii414_l
    immediates in the handler tails; `answer`'s jump table covers `0..=16` plus the
    `String` variant `0x15`. The mapping of `17..20` to `barkskin`/`intercepts`/
    `effects`/`gear` is inferred from the report each tail calls.
+
+---
+
+## Inferred wording
+
+The recovered SQL, counts, column sets and the literal pool give the numbers and
+most headings. A handful of surrounding report strings do **not** occur in the
+binary and are therefore marked `// UNKNOWN:` at their site:
+
+| function | invented fragment | what *is* recovered |
+| --- | --- | --- |
+| `analytics::flare` | `Flare: ` (named-flare heading) | `Proc rate by attack:`, the `Procs`/`targets` heads, the SQL |
+| `analytics::gear` | `(none recorded)` | `Worn over the hunts:`, `Held as a swing was made:` |
+| `analytics::compare` | `Difference: `, `Aim` | `Fewer median attempts …`, `Hunt comparison (creature mix affects results)` |
+| `analytics::defense` | `Def - ` | the DS/TD/UDF grid heads and the observations |
+| `analytics::intercepts` | `Barrier - ` | `By barrier (…)`, `blocks before the roll` |
+| `detail::tree` | ` (root)` | `SEQUENCE: single attack (no spawn tree); hit  (this attack)` |
+| `detail::creature`/`attack_detail` | `Target: no target` | `Target: ` and the missing-target branch |
+
+Everything else quoted in the sources was checked against the binary's
+`__cstring`/`__const` (format blobs were decoded with the piece-length scheme in
+`hydra_exp/NOTES.md`).

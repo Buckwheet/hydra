@@ -9,4 +9,5 @@ edition = "2021"
 #   hydra_protocol - `runs::Runs` (line text, via hydra_model)
 #   hydra_session  - `store::safe_component` (used by `file::spot_name`)
 hydra_model = { path = "../hydra_model" }
+hydra_protocol = { path = "../hydra_protocol" }
 hydra_session = { path = "../hydra_session" }

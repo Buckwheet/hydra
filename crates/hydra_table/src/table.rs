@@ -296,6 +296,8 @@ pub fn forget_password(what: &str) -> String {
     let variable = account::env_name(what);
     match account::forget(what) {
         Ok(()) => format!("{variable} is forgotten."),
+        // UNKNOWN: `{variable} is forgotten.` is recovered; the failure
+        // wording is not in the pool.
         Err(error) => format!("{variable} is not forgotten: {error}"),
     }
 }

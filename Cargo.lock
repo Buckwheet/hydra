@@ -111,6 +111,7 @@ name = "hydra_travel"
 version = "0.0.0"
 dependencies = [
  "hydra_model",
+ "hydra_protocol",
  "hydra_session",
 ]
 

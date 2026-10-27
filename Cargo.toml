@@ -1,3 +1,40 @@
 [workspace]
 resolver = "2"
 members = ["crates/gs_base","crates/gs_puppet","crates/gs_render","crates/hydra_board","crates/hydra_cast","crates/hydra_combat_log","crates/hydra_exp","crates/hydra_gui","crates/hydra_host","crates/hydra_import","crates/hydra_ledger","crates/hydra_lich","crates/hydra_lookout","crates/hydra_map","crates/hydra_model","crates/hydra_net","crates/hydra_protocol","crates/hydra_rewards","crates/hydra_session","crates/hydra_survey","crates/hydra_table","crates/hydra_travel","crates/hydra_ui","crates/hydra_update","crates/hydra_web"]
+
+[workspace.dependencies]
+tokio = { version = "=1.53.1", features = ["full"] }
+tokio-util = "=0.7.19"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+toml = "=1.1.6"
+toml_edit = "=0.25.15"
+tungstenite = "=0.29.0"
+tokio-tungstenite = "=0.29.0"
+reqwest = { version = "=0.12.28", features = ["json","native-tls"] }
+hyper = { version = "=1.11.1", features = ["server","http1"] }
+hyper-util = "=0.1.20"
+http-body-util = "=0.1.5"
+tower-http = "=0.6.11"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+jiff = "=0.2.37"
+uuid = { version = "=1.26.1", features = ["v4"] }
+rand = "=0.9.5"
+regex = "=1.13.1"
+zip = "=9.0.0"
+flate2 = "=1.1.10"
+image = "=0.25.10"
+anyhow = "=1.0.104"
+base64 = "=0.22.1"
+rpassword = "=7.5.4"
+keyring = "=3.6.3"
+mdns-sd = "=0.21.5"
+qrcode = "=0.14.1"
+parking_lot = "=0.12.5"
+flume = "=0.12.0"
+indexmap = "=2.14.2"
+smallvec = "=1.16.1"
+memmap2 = "=0.9.11"
+semver = "=1.0.28"
+winit = "=0.30.13"
+wgpu = "=29.0.4"

@@ -1276,6 +1276,60 @@ mod tests {
     }
 
     #[test]
+    fn per_family_pose_overrides_replace_bones() {
+        // biped's `[family.treekin.arms_up]` raises the arms less far than the
+        // template's 152°, and spells both sides out.
+        let plain = PoseSet::for_family("biped", "").unwrap();
+        let treekin = PoseSet::for_family("biped", "treekin").unwrap();
+        assert_eq!(plain.get("arms_up").unwrap().bone("arm_l").rot, Vec3::new(0.0, 0.0, 152.0));
+        assert_eq!(
+            treekin.get("arms_up").unwrap().bone("arm_l").rot,
+            Vec3::new(45.0, 0.0, 90.0)
+        );
+        assert_eq!(
+            treekin.get("arms_up").unwrap().bone("arm_r").rot,
+            Vec3::new(-70.0, 0.0, -70.0)
+        );
+        // A family that only overrides one pose keeps the rest of the template.
+        assert_eq!(
+            treekin.get("prone").unwrap().root,
+            plain.get("prone").unwrap().root
+        );
+        // An unknown family is the plain template.
+        let unknown = PoseSet::for_family("biped", "nonesuch").unwrap();
+        assert_eq!(unknown.get("arms_up").unwrap().bone("arm_l").rot, Vec3::new(0.0, 0.0, 152.0));
+    }
+
+    #[test]
+    fn every_shipped_file_parses_its_guards_and_postures() {
+        // `[guard.*]` and `[posture.*]` sections are status-driven overlays; the
+        // templates that carry them all have at least one of the two.
+        let mut with_overlays = 0;
+        for (name, text) in SHIPPED {
+            let set = PoseSet::from_toml(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            if !set.posture.is_empty() || !set.guard.is_empty() {
+                with_overlays += 1;
+            }
+            assert!(set.poses.contains_key("stand"), "{name} has no stand pose");
+            // Every pose bone is a plain `<name>`, `<name>_l` or `<name>_r`; the
+            // `root` shorthand is split off into `Pose::root`.
+            for (pose_name, pose) in &set.poses {
+                for bone in pose.bones.keys() {
+                    assert!(
+                        !bone.contains('.') && !bone.contains(' '),
+                        "{name}/{pose_name}: bad bone name {bone:?}"
+                    );
+                }
+            }
+        }
+        // Only the humanoid templates carry them; biped is one.
+        assert!(with_overlays >= 1, "{with_overlays}");
+        let biped = PoseSet::for_family("biped", "").unwrap();
+        assert!(biped.posture.contains_key("cower"));
+        assert!(biped.guard.contains_key("back"));
+    }
+
+    #[test]
     fn dead_pose_selection_is_stable_per_family() {
         let set = PoseSet::for_family("biped", "").unwrap();
         let a = set.dead_hash("troll");

@@ -2,3 +2,9 @@
 name = "hydra_table"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+hydra_protocol = { path = "../hydra_protocol" }
+hydra_session = { path = "../hydra_session" }
+hydra_net = { path = "../hydra_net" }
+hydra_model = { path = "../hydra_model" }

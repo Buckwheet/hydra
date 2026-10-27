@@ -1,9 +1,15 @@
 //! Child-process helpers for the Lich relay.
 //!
-//! The original crate used `tokio::process` for the Lich child.  This
-//! std-only reconstruction keeps the recovered logic (password-env-var
-//! filtering, Ruby discovery, token generation) but uses `std::process`
-//! and `/dev/urandom` instead.
+//! The original crate used `tokio::process` for the Lich child.  Phase 1
+//! reconnected `tokio`, so this module now carries both a
+//! [`tokio::process::Command`] builder ([`command_async`], used by the async
+//! relay) and the `std::process` builder ([`command`], kept for the
+//! synchronous facade and its tests).  The recovered logic
+//! (password-env-var filtering, Ruby discovery, token generation) is shared by
+//! both paths.
+//!
+//! Still std-only: `new_token` reads `/dev/urandom`, because `getrandom` is
+//! not in the workspace pins (see `NOTES.md` §4).
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -55,6 +61,35 @@ pub fn command(ruby: &Path) -> Command {
     cmd
 }
 
+/// [`command`] for the tokio child process used by the async relay.
+///
+/// **Reconnected in Phase 1**: the original built a `tokio::process::Command`
+/// (the recovered `spawn` returns a tokio `Child`), so the async path now does
+/// too.
+pub fn command_async(ruby: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(ruby);
+    filter_password_env_tokio(&mut cmd, std::env::vars_os());
+    cmd
+}
+
+/// Names that the recovered `child::command` removes from the child
+/// environment.  Shared by both command builders.
+fn password_env_names<I>(vars: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut names = Vec::new();
+    for (name, _value) in vars {
+        // The binary feeds the raw OsStr bytes to is_password; use the
+        // lossy view so non-UTF-8 names never panic (they cannot match the
+        // ASCII prefix unless their first 15 bytes are ASCII anyway).
+        if is_password(&name.to_string_lossy()) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Apply the recovered `HYDRA_PASSWORD_*` removal pass to an existing
 /// command using an explicit environment iterator.  Split out so tests do
 /// not need to mutate the test process's real environment.
@@ -62,13 +97,18 @@ pub fn filter_password_env<I>(cmd: &mut Command, vars: I)
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
-    for (name, _value) in vars {
-        // The binary feeds the raw OsStr bytes to is_password; use the
-        // lossy view so non-UTF-8 names never panic (they cannot match the
-        // ASCII prefix unless their first 15 bytes are ASCII anyway).
-        if is_password(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
+    for name in password_env_names(vars) {
+        cmd.env_remove(name);
+    }
+}
+
+/// [`filter_password_env`] for a [`tokio::process::Command`].
+pub fn filter_password_env_tokio<I>(cmd: &mut tokio::process::Command, vars: I)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    for name in password_env_names(vars) {
+        cmd.env_remove(name);
     }
 }
 
@@ -320,6 +360,45 @@ mod tests {
     fn command_uses_the_given_ruby_program() {
         let cmd = command(Path::new("/opt/ruby/bin/ruby"));
         assert_eq!(cmd.get_program(), "/opt/ruby/bin/ruby");
+    }
+
+    #[test]
+    fn command_async_uses_the_given_ruby_program() {
+        // Phase 1: the async path builds a real tokio::process::Command.
+        let cmd = command_async(Path::new("/opt/ruby/bin/ruby"));
+        assert_eq!(cmd.as_std().get_program(), "/opt/ruby/bin/ruby");
+    }
+
+    #[test]
+    fn command_async_removes_password_prefixed_environment_variables() {
+        let mut cmd = tokio::process::Command::new("ruby");
+        cmd.env("HYDRA_PASSWORD_A", "secret-a");
+        cmd.env("hydra_password_B", "secret-b");
+        cmd.env("HYDRA_PASSWORD", "fourteen-bytes");
+        cmd.env("KEEP_ME", "kept");
+
+        let vars: Vec<(OsString, OsString)> = vec![
+            ("HYDRA_PASSWORD_A".into(), "secret-a".into()),
+            ("hydra_password_B".into(), "secret-b".into()),
+            ("HYDRA_PASSWORD".into(), "fourteen-bytes".into()),
+            ("KEEP_ME".into(), "kept".into()),
+        ];
+        filter_password_env_tokio(&mut cmd, vars);
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&("HYDRA_PASSWORD_A".into(), None)));
+        assert!(envs.contains(&("hydra_password_B".into(), None)));
+        assert!(envs.contains(&("HYDRA_PASSWORD".into(), Some("fourteen-bytes".into()))));
+        assert!(envs.contains(&("KEEP_ME".into(), Some("kept".into()))));
     }
 
     #[test]

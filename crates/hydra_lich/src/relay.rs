@@ -1,27 +1,40 @@
-//! The Lich relay: pending typed lines, notices, reader threads and the
+//! The Lich relay: pending typed lines, notices, line readers and the
 //! child-process lifecycle.
 //!
-//! The original crate is inherently `tokio`-based.  Everything here is a
-//! std-only equivalent with the same observable ordering:
+//! The original crate is inherently `tokio`-based.  Phase 1 reconnected the
+//! real crates, so this module now has two layers over the same recovered
+//! semantics:
 //!
-//! * `read_lines` = `BufReader<ChildStdout>` -> bounded channel (capacity 64)
-//! * `keep_errors` = `BufReader<ChildStderr>` -> `Arc<Mutex<VecDeque<String>>>`
-//!   keeping the last [`KEPT_ERRORS`] lines
-//! * `Waits` = queue of typed lines plus `hand_held`/`tell` flags
-//! * `spawn`/`show`/`run` = command construction and relay lifecycle
+//! * **tokio-native (new)**: [`read_lines_async`] (`tokio::io::BufReader` ->
+//!   `tokio::sync::mpsc::channel(64)`), [`keep_errors_async`] (last
+//!   [`KEPT_ERRORS`] lines under a `tokio::sync::Mutex`), [`spawn_async`] /
+//!   [`build_command_async`] (`tokio::process`), [`RelayAsync`] and
+//!   [`run_async`] / [`run_until`] (a real `tokio::select!` loop with a
+//!   `tokio_util::sync::CancellationToken`).
+//! * **synchronous facade (kept)**: [`read_lines`], [`keep_errors`], [`spawn`],
+//!   [`show`], [`run`] and [`Relay`], with the same signatures and observable
+//!   ordering as before, driven by [`crate::runtime`].
 //!
-//! See `NOTES.md` for the recovered wire protocol and the
-//! established-vs-UNKNOWN split.
+//! `Waits`, [`Notice`], [`Typed`], [`never_given`], [`shared_symbol`] and
+//! [`Ended`] are unchanged value types shared by both layers.
+//!
+//! See `NOTES.md` for the recovered wire protocol, the established-vs-UNKNOWN
+//! split and the Phase 1 reconnection table.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio_util::sync::CancellationToken;
 
 /// Bounded capacity of the child-stdout line channel (`mpsc::channel(0x40)`
 /// in `read_lines` @ `0x10167dcc0`).
@@ -365,33 +378,39 @@ impl Ended {
     }
 }
 
-/// Spawn a thread that reads text lines from `reader` into a bounded
-/// channel of capacity [`LINE_CHANNEL_CAPACITY`].
+/// Read text lines from an async reader into a bounded channel of capacity
+/// [`LINE_CHANNEL_CAPACITY`].
 ///
-/// Recovered (`read_lines` @ `0x10167dcc0`): a `tokio::io::BufReader` over
-/// an `OwnedReadHalf`, a bounded `mpsc` of `String` with capacity 64, and a
-/// detached task that forwards every line.  The std version uses
-/// `BufRead::read_until(b'\n')` + `String::from_utf8_lossy` (the binary
-/// calls `from_utf8_lossy` on the bytes) and a `sync_channel(64)` so a slow
-/// consumer applies backpressure exactly like the bounded tokio channel.
+/// **Reconnected in Phase 1** (`tokio` 1.53.1).  Recovered (`read_lines` @
+/// `0x10167dcc0`): a `tokio::io::BufReader` over the child's stdout, a bounded
+/// `mpsc` of `String` with capacity 64, and a detached task that forwards
+/// every line; the sender closes at EOF, which disconnects the receiver.
 ///
-/// The returned receiver disconnects when the reader reaches EOF or errors.
-pub fn read_lines<R>(reader: R) -> Receiver<String>
+/// The binary's `BufReader` allocates `0x2000` bytes — tokio's default
+/// capacity is exactly 8192, so [`tokio::io::BufReader::new`] is the faithful
+/// equivalent.  Line splitting uses `read_until(b'\n')` rather than
+/// `AsyncBufReadExt::lines` on purpose: the binary runs `String::from_utf8_lossy`
+/// over the bytes, while `lines()` would return an `InvalidData` error on the
+/// first invalid byte.  The delimiter and a preceding `\r` are stripped, like
+/// `Lines`.
+pub async fn read_lines_async<R>(reader: R) -> tokio::sync::mpsc::Receiver<String>
 where
-    R: BufRead + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
-    let (tx, rx) = mpsc::sync_channel(LINE_CHANNEL_CAPACITY);
-    thread::spawn(move || {
-        let mut reader = reader;
+    let (tx, rx) = tokio::sync::mpsc::channel(LINE_CHANNEL_CAPACITY);
+    crate::runtime::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(reader);
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
+            match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => break,
                 Ok(_) => {
                     strip_line_ending(&mut buf);
                     let line = String::from_utf8_lossy(&buf).into_owned();
-                    if tx.send(line).is_err() {
+                    // Bounded send: a slow consumer stalls the reader, exactly
+                    // like the recovered `Semaphore::new(0x40)` channel.
+                    if tx.send(line).await.is_err() {
                         break;
                     }
                 }
@@ -402,41 +421,181 @@ where
     rx
 }
 
-/// Spawn a thread that keeps the last [`KEPT_ERRORS`] stderr lines in a
-/// shared ring.
+/// Synchronous [`read_lines_async`]: a `std::io::BufRead` in, a
+/// `std::sync::mpsc::Receiver` out.
 ///
-/// Recovered (`keep_errors` @ `0x10167dd7c` + closure @ `0x10167aa64`):
-/// allocates the `Arc<Mutex<VecDeque<String>>>` itself, spawns a task over
-/// `Lines<BufReader<ChildStderr>>`, and for each line pops the front while
-/// the deque length is `0x14 == 20` before pushing the new line.  Returns
-/// the ring and the task handle.
+/// The recovered signature is `fn(OwnedReadHalf) -> mpsc::Receiver<String>`
+/// and the existing public API of this crate (and its tests) is synchronous, so
+/// this facade keeps both while doing the actual work on tokio: the blocking
+/// reader is adapted through [`BlockingReader`], the lines come from
+/// [`read_lines_async`] (real tokio `BufReader` + bounded tokio channel), and
+/// only the last hop back to `std::sync::mpsc` is a plain channel, kept in step
+/// by one bridge thread.
+///
+/// The returned receiver disconnects when the reader reaches EOF or errors.
+pub fn read_lines<R>(reader: R) -> Receiver<String>
+where
+    R: BufRead + Send + 'static,
+{
+    let lines = crate::runtime::block_on(read_lines_async(BlockingReader::new(reader)));
+    bridge_to_std(lines)
+}
+
+/// Move a tokio line channel onto a `std::sync::mpsc` receiver.
+///
+/// Both channels are bounded at [`LINE_CHANNEL_CAPACITY`], so the sync facade
+/// applies the same backpressure as the tokio channel.  The bridge thread ends
+/// when the tokio sender closes (EOF) or the std receiver is dropped.
+fn bridge_to_std(mut lines: tokio::sync::mpsc::Receiver<String>) -> Receiver<String> {
+    let (tx, rx) = mpsc::sync_channel(LINE_CHANNEL_CAPACITY);
+    thread::spawn(move || {
+        while let Some(line) = lines.blocking_recv() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// How many bytes [`BlockingReader`] reads per chunk from the blocking source.
+const READ_CHUNK: usize = 8192;
+
+/// How many chunks the adapter may run ahead of the async reader.
+const CHUNK_BUFFER: usize = 2;
+
+/// Adapts a blocking [`std::io::Read`] into a tokio [`AsyncRead`].
+///
+/// The original never needed this: every reader it fed to `read_lines` /
+/// `keep_errors` was already a tokio resource (`tokio::process::ChildStdout`).
+/// Our synchronous facade still accepts plain `std::io::BufRead` values (a
+/// `Cursor<Vec<u8>>` in the tests, a `BufReader<ChildStdout>` in [`show`]), so
+/// this adapter reads them on a dedicated thread and hands the bytes over a
+/// small bounded tokio channel.  That keeps blocking I/O off the runtime
+/// workers while the line splitting itself stays in [`read_lines_async`].
+pub struct BlockingReader {
+    chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl BlockingReader {
+    /// Start a reader thread for `reader` and adapt it.
+    pub fn new<R>(mut reader: R) -> Self
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (tx, chunks) = tokio::sync::mpsc::channel(CHUNK_BUFFER);
+        thread::spawn(move || loop {
+            let mut buf = vec![0u8; READ_CHUNK];
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    // `blocking_send` panics inside a runtime; this is a plain
+                    // std thread, and it also gives us backpressure.
+                    if tx.blocking_send(buf).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        });
+        Self {
+            chunks,
+            chunk: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for BlockingReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        loop {
+            if me.pos < me.chunk.len() {
+                let n = buf.remaining().min(me.chunk.len() - me.pos);
+                buf.put_slice(&me.chunk[me.pos..me.pos + n]);
+                me.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            match me.chunks.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    me.chunk = chunk;
+                    me.pos = 0;
+                }
+                // The reader thread is gone: EOF.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Keep the last [`KEPT_ERRORS`] stderr lines in a shared ring (tokio flavour).
+///
+/// **Reconnected in Phase 1**: the recovered `keep_errors` (`0x10167dd7c` +
+/// closure `0x10167aa64`) allocates the `Arc<Mutex<VecDeque<String>>>` itself,
+/// spawns a task over the child's stderr and pops the front while the deque
+/// holds `0x14 == 20` entries.  This version does the same with
+/// `tokio::sync::Mutex` and a tokio task, and returns its `JoinHandle`.
+pub fn keep_errors_async<R>(
+    stderr: R,
+) -> (
+    Arc<tokio::sync::Mutex<VecDeque<String>>>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let kept: Arc<tokio::sync::Mutex<VecDeque<String>>> =
+        Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(KEPT_ERRORS)));
+    let sink = Arc::clone(&kept);
+    let handle = crate::runtime::spawn(async move {
+        let mut lines = read_lines_async(stderr).await;
+        while let Some(line) = lines.recv().await {
+            let mut ring = sink.lock().await;
+            push_kept(&mut ring, line);
+        }
+    });
+    (kept, handle)
+}
+
+/// Keep the last [`KEPT_ERRORS`] stderr lines in a shared ring (sync facade).
+///
+/// The signature is the one the existing tests and [`Relay::errors`] use.  The
+/// line reading is the tokio one ([`read_lines_async`]); only the ring's lock
+/// type differs from [`keep_errors_async`], because this ring is shared with
+/// synchronous readers.
 pub fn keep_errors<R>(stderr: R) -> (Arc<Mutex<VecDeque<String>>>, JoinHandle<()>)
 where
     R: BufRead + Send + 'static,
 {
-    let kept: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_ERRORS)));
+    let kept: Arc<Mutex<VecDeque<String>>> =
+        Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_ERRORS)));
     let sink = Arc::clone(&kept);
+    let mut lines = crate::runtime::block_on(read_lines_async(BlockingReader::new(stderr)));
     let handle = thread::spawn(move || {
-        let mut reader = stderr;
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    strip_line_ending(&mut buf);
-                    let line = String::from_utf8_lossy(&buf).into_owned();
-                    let mut ring = sink.lock().unwrap_or_else(|poison| poison.into_inner());
-                    if ring.len() >= KEPT_ERRORS {
-                        ring.pop_front();
-                    }
-                    ring.push_back(line);
-                }
-                Err(_) => break,
-            }
+        while let Some(line) = lines.blocking_recv() {
+            let mut ring = sink.lock().unwrap_or_else(|poison| poison.into_inner());
+            push_kept(&mut ring, line);
         }
     });
     (kept, handle)
+}
+
+/// The recovered ring rule: drop the oldest line while the deque is full, then
+/// push.  Shared by both ring flavours.
+fn push_kept(ring: &mut VecDeque<String>, line: String) {
+    while ring.len() >= KEPT_ERRORS {
+        ring.pop_front();
+    }
+    ring.push_back(line);
 }
 
 fn strip_line_ending(buf: &mut Vec<u8>) {
@@ -487,29 +646,64 @@ impl Launch {
 /// then `env` pairs, stdin/stdout/stderr piped, cwd = parent of `lich`.
 pub fn build_command(launch: &Launch, port: u16) -> Command {
     let mut cmd = crate::child::command(&launch.ruby);
-    cmd.arg("-e")
-        .arg(RUBY_PRELUDE)
-        .arg("-e")
-        .arg(RUBY_LOAD_LICH)
-        .arg(&launch.lich);
-    for arg in LICH_ARGS {
-        cmd.arg(arg);
-    }
-    cmd.arg(format!("127.0.0.1:{port}"));
-    cmd.args(&launch.args);
+    cmd.args(launch_args(launch, port));
     for (key, value) in &launch.env {
         cmd.env(key, value);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(parent) = launch.lich.parent() {
-        if !parent.as_os_str().is_empty() {
-            cmd.current_dir(parent);
-        }
+    if let Some(parent) = working_directory(launch) {
+        cmd.current_dir(parent);
     }
     cmd
 }
+
+/// [`build_command`] for `tokio::process`.
+///
+/// **Reconnected in Phase 1**: the recovered `spawn` built a
+/// `tokio::process::Command` and returned a tokio `Child`; the async relay
+/// ([`spawn_async`]) now uses exactly that.
+pub fn build_command_async(launch: &Launch, port: u16) -> tokio::process::Command {
+    let mut cmd = crate::child::command_async(&launch.ruby);
+    cmd.args(launch_args(launch, port));
+    for (key, value) in &launch.env {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(parent) = working_directory(launch) {
+        cmd.current_dir(parent);
+    }
+    cmd
+}
+
+/// The argv after the Ruby program, in recovered order.
+fn launch_args(launch: &Launch, port: u16) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(6 + LICH_ARGS.len() + launch.args.len());
+    for arg in ["-e", RUBY_PRELUDE, "-e", RUBY_LOAD_LICH] {
+        args.push(OsString::from(arg));
+    }
+    args.push(launch.lich.clone().into_os_string());
+    for arg in LICH_ARGS {
+        args.push(OsString::from(arg));
+    }
+    args.push(OsString::from(format!("127.0.0.1:{port}")));
+    for arg in &launch.args {
+        args.push(OsString::from(arg));
+    }
+    args
+}
+
+/// `Path::parent(lich.rbw)` when it is non-empty (the recovered `cwd`).
+fn working_directory(launch: &Launch) -> Option<&std::path::Path> {
+    match launch.lich.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Some(parent),
+        _ => None,
+    }
+}
+
 
 /// A spawned child with its piped streams taken out of `Child`.
 pub struct Spawned {
@@ -548,6 +742,50 @@ pub fn spawn(launch: &Launch, port: u16) -> io::Result<Spawned> {
     })
 }
 
+/// A spawned tokio child with its piped streams taken out of `Child`.
+///
+/// **Reconnected in Phase 1**: `tokio::process` instead of `std::process`.
+pub struct SpawnedAsync {
+    pub child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+    pub stderr: tokio::process::ChildStderr,
+}
+
+/// Start the Lich child on tokio.
+///
+/// Recovered: `spawn` built a `tokio::process::Command`, spawned it and returned
+/// a `Result<Child…, io::Error>` (sret tag 3 is the error branch).  Must be
+/// awaited inside a runtime — tokio's process driver needs a reactor, so call it
+/// from [`run_until`]/[`show_async`] under [`crate::runtime`] or under the
+/// caller's own runtime.
+pub async fn spawn_async(launch: &Launch, port: u16) -> io::Result<SpawnedAsync> {
+    let mut command = build_command_async(launch, port);
+    // The recovered relay reaps Lich on every exit path; do the same when a
+    // `RelayAsync` is dropped mid-flight, so tests and aborted relays cannot
+    // leave an orphaned ruby behind.
+    command.kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("child stdin missing"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr missing"))?;
+    Ok(SpawnedAsync {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 /// A live relay: child, line receiver, kept stderr ring and pending typed
 /// lines.
 pub struct Relay {
@@ -564,18 +802,22 @@ pub struct Relay {
     pub output: Vec<String>,
     stderr_handle: JoinHandle<()>,
     status: Option<ExitStatus>,
+    /// Real `tokio_util::sync::CancellationToken` (`tokio-util` 0.7.19): the
+    /// recovered relay loop is cancelled through one, so the synchronous facade
+    /// carries one too instead of a plain stop flag.
+    stop: CancellationToken,
 }
 
 /// Wire a spawned child into a relay.
 ///
 /// Recovered `show` @ `0x10167e060` starts the reader/writer/error tasks and
 /// returns a control handle pair (stored at +0x280/+0x288 by the relay
-/// loop).  The std-only version returns the whole [`Relay`], which is the
-/// equivalent testable amount of state.
+/// loop).  This version returns the whole [`Relay`], which is the equivalent
+/// testable amount of state.
 pub fn show(launch: &Launch, port: u16) -> io::Result<Relay> {
     let spawned = spawn(launch, port)?;
-    // BufReader's 8192-byte default matches the recovered `0x2000`
-    // allocation in both reader closures.
+    // `read_lines`/`keep_errors` wrap the blocking pipe in a
+    // `tokio::io::BufReader` (8192 bytes, the recovered `0x2000` allocation).
     let lines = read_lines(BufReader::with_capacity(8192, spawned.stdout));
     let (errors, stderr_handle) =
         keep_errors(BufReader::with_capacity(8192, spawned.stderr));
@@ -589,6 +831,7 @@ pub fn show(launch: &Launch, port: u16) -> io::Result<Relay> {
         output: Vec::new(),
         stderr_handle,
         status: None,
+        stop: CancellationToken::new(),
     })
 }
 
@@ -671,10 +914,22 @@ impl Relay {
         }
     }
 
-    /// Drive one relay step: wait for a stdout line, or notice that the
-    /// child has exited.  Returns `false` once the child is gone and the
-    /// line channel has been drained.
+    /// Drive one relay step: wait for a stdout line, notice that the child has
+    /// exited, or observe the stop token.  Returns `false` once the child is
+    /// gone and the line channel has been drained, or once the token has been
+    /// cancelled.
     pub fn pump(&mut self) -> io::Result<bool> {
+        if self.stop.is_cancelled() {
+            // Reap only a child that is still running: `Child::kill` on an
+            // already-reaped process is an error on some platforms.
+            let status = match self.child.try_wait()? {
+                Some(status) => status,
+                None => self.child.kill().and_then(|()| self.child.wait())?,
+            };
+            self.status = Some(status);
+            self.drain_ready_lines();
+            return Ok(false);
+        }
         match self.lines.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
                 self.output.push(line);
@@ -716,9 +971,29 @@ impl Relay {
         self.status
     }
 
+    /// The relay's `CancellationToken` (`tokio-util` 0.7.19), the same handle
+    /// the recovered loop is cancelled through.  Cancel it to stop the relay at
+    /// the next [`Relay::pump`]; the token is cloneable and may be cancelled
+    /// from another thread.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.stop.clone()
+    }
+
+    /// Has the stop token been cancelled?
+    pub fn is_cancelled(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+
     /// Stop the child (SIGKILL via `std`) and reap it.
+    ///
+    /// Also cancels the token, so a [`Relay::pump`]/[`Relay::run_to_end`] on
+    /// another thread (or a later call) sees the stop.
     pub fn stop(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.kill().and_then(|()| self.child.wait())?;
+        self.stop.cancel();
+        let status = match self.child.try_wait()? {
+            Some(status) => status,
+            None => self.child.kill().and_then(|()| self.child.wait())?,
+        };
         self.status = Some(status);
         Ok(status)
     }
@@ -726,25 +1001,29 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        // Best effort: do not leave an orphaned Lich child behind.
+        // Best effort: do not leave an orphaned Lich child behind.  Cancelling
+        // first matches the recovered teardown, which cancels the token before
+        // reaping the child.
+        self.stop.cancel();
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // The stderr thread owns its own reader and exits at EOF; joining a
+        // The stderr task owns its own reader and exits at EOF; joining a
         // possibly blocked reader is unsafe, so intentionally detach it.
         let _ = &self.stderr_handle;
     }
 }
 
-/// Top-level relay entry point.
+/// Top-level relay entry point (synchronous facade).
 ///
 /// Recovered `run` @ `0x10167dfa0` claims a `LichDoor`, copies the launch
 /// state and then drives the select loop in `run::{{closure}}`
 /// (`0x10112ec94`): spawn/show once, multiplex child stdout, stderr, typed
 /// lines, symbol/tell requests and child exit.
 ///
-/// std-only equivalent: start the child, read every stdout line to EOF and
-/// return the mapped [`Ended`] reason.  Frame parsing and session delivery
-/// are the caller's responsibility (`Relay::output` / `Relay::lines`).
+/// This facade starts the child, reads every stdout line to EOF and returns the
+/// mapped [`Ended`] reason; [`run_async`] is the tokio-native equivalent.
+/// Frame parsing and session delivery are the caller's responsibility
+/// (`Relay::output` / `Relay::lines`).
 pub fn run(launch: Launch, port: u16) -> io::Result<Ended> {
     let mut relay = show(&launch, port)?;
     let status = relay.run_to_end()?;
@@ -752,6 +1031,268 @@ pub fn run(launch: Launch, port: u16) -> io::Result<Ended> {
     // recovered Ended::Exited contains the Display of the ExitStatus, which
     // also distinguishes signal termination.
     Ok(Ended::Exited(status.code()))
+}
+
+/// One step of the tokio relay loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// A stdout line was read; it has been appended to `RelayAsync::output`.
+    Line,
+    /// The child exited with this status.
+    Exited(ExitStatus),
+    /// The [`CancellationToken`] was cancelled; the child was killed.
+    Cancelled,
+}
+
+/// A live relay on `tokio::process`.
+///
+/// **Reconnected in Phase 1.**  This is the tokio-native counterpart of
+/// [`Relay`]: same recovered state (child, line channel, last-20 stderr ring,
+/// [`Waits`]) but with the primitive types the binary used —
+/// `tokio::sync::mpsc::channel(64)` for stdout, `tokio::sync::Mutex` for the
+/// ring and the queue, `tokio::sync::watch` for the hand-held flag (+0x160 in
+/// the recovered `Waits::new`), and a `CancellationToken` for cancellation.
+pub struct RelayAsync {
+    pub child: tokio::process::Child,
+    /// Writer to the child's stdin (game commands / typed lines).
+    pub stdin: tokio::process::ChildStdin,
+    /// Child stdout lines (frame/text lines from Lich).
+    pub lines: tokio::sync::mpsc::Receiver<String>,
+    /// Last [`KEPT_ERRORS`] stderr lines.
+    pub errors: Arc<tokio::sync::Mutex<VecDeque<String>>>,
+    /// Pending typed lines and hand-held state.
+    pub waits: tokio::sync::Mutex<Waits>,
+    /// The recovered `watch::Receiver<bool>`: `true` once Lich knows the
+    /// character and typed lines are handed over instead of queued.
+    pub hand: tokio::sync::watch::Receiver<bool>,
+    /// Cancellation for the relay loop.
+    pub stop: CancellationToken,
+    /// Every stdout line observed by [`RelayAsync::pump`], in order.
+    pub output: Vec<String>,
+    status: Option<ExitStatus>,
+    hand_tx: tokio::sync::watch::Sender<bool>,
+    stderr_task: tokio::task::JoinHandle<()>,
+}
+
+/// Wire a spawned tokio child into a relay.
+///
+/// The async counterpart of [`show`]: recovered `show` @ `0x10167e060` starts
+/// the reader/error tasks and returns the control handles the select loop
+/// multiplexes.
+pub async fn show_async(launch: &Launch, port: u16) -> io::Result<RelayAsync> {
+    let spawned = spawn_async(launch, port).await?;
+    let lines = read_lines_async(spawned.stdout).await;
+    let (errors, stderr_task) = keep_errors_async(spawned.stderr);
+    let (hand_tx, hand) = tokio::sync::watch::channel(false);
+    Ok(RelayAsync {
+        child: spawned.child,
+        stdin: spawned.stdin,
+        lines,
+        errors,
+        waits: tokio::sync::Mutex::new(Waits::new(false)),
+        hand,
+        stop: CancellationToken::new(),
+        output: Vec::new(),
+        status: None,
+        hand_tx,
+        stderr_task,
+    })
+}
+
+impl RelayAsync {
+    /// Write one line to the child's stdin and flush it.
+    pub async fn send(&mut self, line: &str) -> io::Result<()> {
+        self.stdin.write_all(line.as_bytes()).await?;
+        if !line.ends_with('\n') {
+            self.stdin.write_all(b"\n").await?;
+        }
+        self.stdin.flush().await
+    }
+
+    /// Queue or hand a typed line according to [`Waits::typed`].
+    pub async fn type_line(&mut self, line: String) -> io::Result<Typed> {
+        let typed = self.waits.lock().await.typed(line);
+        match typed {
+            Typed::Handed(line) => {
+                self.send(&line).await?;
+                Ok(Typed::Handed(line))
+            }
+            queued => Ok(queued),
+        }
+    }
+
+    /// Arm the hold, flip the `watch` flag and flush the queue to the child.
+    pub async fn release_hold(&mut self) -> io::Result<Vec<String>> {
+        let drained = {
+            let mut waits = self.waits.lock().await;
+            waits.set_hand_held(true);
+            waits.hand_held()
+        };
+        // `watch::Sender::send` only fails when there are no receivers.
+        let _ = self.hand_tx.send(true);
+        for line in &drained {
+            self.send(line).await?;
+        }
+        Ok(drained)
+    }
+
+    /// Ask Lich to acknowledge the character; returns the notice, if any.
+    pub async fn tell(&mut self) -> Option<Notice> {
+        self.waits.lock().await.tell()
+    }
+
+    /// Snapshot of the kept stderr lines.
+    pub async fn errors(&self) -> Vec<String> {
+        self.errors.lock().await.iter().cloned().collect()
+    }
+
+    /// Drain stdout lines the reader task has already produced (plus a short
+    /// grace period, mirroring the synchronous facade).
+    async fn drain_ready_lines(&mut self) {
+        while let Ok(line) = self.lines.try_recv() {
+            self.output.push(line);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        while let Ok(Some(line)) = tokio::time::timeout_at(deadline, self.lines.recv()).await {
+            self.output.push(line);
+        }
+    }
+
+    /// Drive one relay step: a stdout line, the child's exit, or cancellation.
+    ///
+    /// This is the recovered `tokio::select!` (`run::{{closure}}` @
+    /// `0x10112ec94`), reduced to the three arms this crate owns.  The other
+    /// recovered arms (door commands, the `watch` channel, the `Waits`
+    /// deadline) belong to `hydra_session`; see `NOTES.md` §4.
+    pub async fn pump(&mut self) -> io::Result<Step> {
+        enum Ready {
+            Line(Option<String>),
+            Exited(io::Result<ExitStatus>),
+            Cancelled,
+        }
+
+        // Split the borrows so the select arms can hold `&mut child`,
+        // `&mut lines` and `&stop` at the same time.
+        let ready = {
+            let Self {
+                child,
+                lines,
+                stop,
+                ..
+            } = self;
+            tokio::select! {
+                line = lines.recv() => Ready::Line(line),
+                waited = child.wait() => Ready::Exited(waited),
+                _ = stop.cancelled() => Ready::Cancelled,
+            }
+        };
+
+        match ready {
+            Ready::Line(Some(line)) => {
+                self.output.push(line);
+                Ok(Step::Line)
+            }
+            Ready::Line(None) => {
+                // The reader task ended at EOF; collect the exit status.
+                let status = match self.status {
+                    Some(status) => status,
+                    None => {
+                        let status = self.child.wait().await?;
+                        self.status = Some(status);
+                        status
+                    }
+                };
+                self.drain_ready_lines().await;
+                Ok(Step::Exited(status))
+            }
+            Ready::Exited(waited) => {
+                let status = waited?;
+                self.status = Some(status);
+                self.drain_ready_lines().await;
+                Ok(Step::Exited(status))
+            }
+            Ready::Cancelled => {
+                let _ = self.child.start_kill();
+                let status = self.child.wait().await?;
+                self.status = Some(status);
+                self.drain_ready_lines().await;
+                Ok(Step::Cancelled)
+            }
+        }
+    }
+
+    /// Run the relay loop to its end and map it to [`Ended`].
+    ///
+    /// `Ended::Stopped` is the recovered "Lich stopped." branch (level 2), which
+    /// is what a cancelled token produces.
+    pub async fn run_to_end(&mut self) -> io::Result<Ended> {
+        loop {
+            match self.pump().await? {
+                Step::Line => continue,
+                Step::Exited(status) => return Ok(Ended::Exited(status.code())),
+                Step::Cancelled => return Ok(Ended::Stopped),
+            }
+        }
+    }
+
+    /// Last exit status observed by [`RelayAsync::pump`].
+    pub fn status(&self) -> Option<ExitStatus> {
+        self.status
+    }
+
+    /// Cancel the relay loop.
+    pub fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    /// Has the stop token been cancelled?
+    pub fn is_cancelled(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+
+    /// Kill and reap the child now.
+    pub async fn kill(&mut self) -> io::Result<ExitStatus> {
+        self.stop.cancel();
+        let _ = self.child.start_kill();
+        let status = self.child.wait().await?;
+        self.status = Some(status);
+        Ok(status)
+    }
+}
+
+impl Drop for RelayAsync {
+    fn drop(&mut self) {
+        // Never leave an orphaned Lich behind: cancel the token and start the
+        // kill.  `spawn_async` sets `kill_on_drop(true)` so tokio reaps it.
+        self.stop.cancel();
+        let _ = self.child.start_kill();
+        // The stderr task owns its reader and ends at EOF; joining it here
+        // would need an executor, so it is intentionally detached.
+        let _ = &self.stderr_task;
+    }
+}
+
+/// Top-level relay entry point, tokio-native.
+///
+/// The recovered `run` @ `0x10167dfa0` claims a `LichDoor`, copies the launch
+/// state and drives the select loop; this is that entry point with a fresh
+/// [`CancellationToken`] (see [`run_until`] to supply one).
+pub async fn run_async(launch: Launch, port: u16) -> io::Result<Ended> {
+    run_until(launch, port, CancellationToken::new()).await
+}
+
+/// [`run_async`] with a caller-supplied [`CancellationToken`].
+///
+/// Cancelling the token while the relay runs kills the child and answers
+/// `Ended::Stopped`, the recovered "Lich stopped." (level 2) notice.
+pub async fn run_until(
+    launch: Launch,
+    port: u16,
+    stop: CancellationToken,
+) -> io::Result<Ended> {
+    let mut relay = show_async(&launch, port).await?;
+    relay.stop = stop;
+    relay.run_to_end().await
 }
 
 #[cfg(test)]
@@ -1137,4 +1678,365 @@ mod tests {
         let err = spawn(&launch, 1).err().expect("spawn should fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 1: tests for the tokio-native layer.
+    // ---------------------------------------------------------------------
+
+    /// A fake `ruby` in a fresh temp directory: `script` is written as the
+    /// interpreter and an empty `lich.rbw` sits beside it (so the recovered
+    /// `cwd = parent(lich)` is set).
+    #[cfg(unix)]
+    fn fake_ruby(tag: &str, script: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "hydra-lich-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let ruby = root.join("ruby");
+        fs::write(&ruby, script).unwrap();
+        let mut perms = fs::metadata(&ruby).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ruby, perms).unwrap();
+        let lich = root.join("lich.rbw");
+        fs::write(&lich, "# fake\n").unwrap();
+        (root, ruby, lich)
+    }
+
+    /// Drain a tokio line channel that is already closed at `capacity` lines,
+    /// but read it asynchronously.
+    async fn drain_async(mut rx: tokio::sync::mpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(line) = rx.recv().await {
+            out.push(line);
+        }
+        out
+    }
+
+    #[test]
+    fn line_channel_capacity_matches_the_recovered_semaphore() {
+        // `Semaphore::new(0x40)` in `read_lines`.
+        assert_eq!(LINE_CHANNEL_CAPACITY, 64);
+        assert_eq!(KEPT_ERRORS, 20);
+    }
+
+    #[tokio::test]
+    async fn read_lines_async_reads_lines_in_order() {
+        // `&[u8]` implements `tokio::io::AsyncRead`, so the bytes below are the
+        // child's stdout as far as the relay is concerned.
+        let input: &'static [u8] = b"first\r\nsecond\n\nfourth\n";
+        assert_eq!(
+            drain_async(read_lines_async(input).await).await,
+            ["first", "second", "", "fourth"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_async_replaces_invalid_utf8_like_from_utf8_lossy() {
+        let input: &'static [u8] = b"ok\nbad\xffbyte\n";
+        assert_eq!(
+            drain_async(read_lines_async(input).await).await,
+            ["ok", "bad\u{fffd}byte"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_async_stops_at_eof() {
+        let input: &'static [u8] = b"";
+        assert!(drain_async(read_lines_async(input).await).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_lines_async_applies_bounded_backpressure() {
+        // A writer that keeps writing must stall once the 64-line channel is
+        // full and the duplex buffer behind it is full too: that is the
+        // recovered `Semaphore::new(0x40)` backpressure, not an unbounded
+        // queue.
+        use tokio::io::AsyncWriteExt;
+
+        const LINES: usize = 200;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut lines = read_lines_async(reader).await;
+
+        let writer = tokio::spawn(async move {
+            for i in 0..LINES {
+                let line = format!("{i:020}\n");
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Nothing consumes the lines: the reader task fills its 64 slots, stops
+        // draining the duplex, and the writer blocks well before line 200.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "the writer finished, so the channel was not bounded"
+        );
+
+        let mut got = Vec::new();
+        while let Some(line) = lines.recv().await {
+            got.push(line);
+            if got.len() == LINES {
+                break;
+            }
+        }
+        assert_eq!(got.len(), LINES);
+        assert_eq!(got[0], format!("{:020}", 0));
+        assert_eq!(got[LINES - 1], format!("{:020}", LINES - 1));
+        // Draining unblocked the writer.
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer stayed blocked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn keep_errors_async_keeps_the_last_twenty() {
+        let mut input = String::new();
+        for i in 0..25 {
+            input.push_str(&format!("err-{i}\n"));
+        }
+        let (ring, task) = keep_errors_async(Cursor::new(input.into_bytes()));
+        task.await.unwrap();
+        let ring = ring.lock().await;
+        assert_eq!(ring.len(), KEPT_ERRORS);
+        assert_eq!(ring.front().unwrap(), "err-5");
+        assert_eq!(ring.back().unwrap(), "err-24");
+    }
+
+    #[test]
+    fn build_command_async_matches_the_sync_argv() {
+        let launch = Launch {
+            ruby: PathBuf::from("/usr/bin/ruby"),
+            lich: PathBuf::from("/opt/lich/lich.rbw"),
+            args: vec!["GEMSTONE".into(), "Hero".into()],
+            env: vec![
+                (OsString::from("LICH_DIR"), OsString::from("/opt/lich")),
+                (OsString::from("GAME"), OsString::from("DR")),
+            ],
+        };
+        let sync_args: Vec<OsString> = build_command(&launch, 1234)
+            .get_args()
+            .map(|a| a.to_os_string())
+            .collect();
+        let async_cmd = build_command_async(&launch, 1234);
+        let async_args: Vec<OsString> = async_cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_os_string())
+            .collect();
+        assert_eq!(sync_args, async_args);
+        assert_eq!(
+            async_cmd.as_std().get_program(),
+            build_command(&launch, 1234).get_program()
+        );
+        assert_eq!(
+            async_cmd.as_std().get_current_dir(),
+            Some(std::path::Path::new("/opt/lich"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn show_async_relays_stdout_stdin_stderr_and_exit_status() {
+        use std::fs;
+
+        let (root, ruby, lich) = fake_ruby(
+            "async-relay",
+            "#!/bin/sh\n\
+             echo 'first line'\n\
+             echo 'second line'\n\
+             read line\n\
+             echo \"got:$line\"\n\
+             echo 'stderr line' 1>&2\n\
+             exit 3\n",
+        );
+
+        let mut relay = show_async(&Launch::new(&ruby, &lich), 4002).await.unwrap();
+
+        // The typed line is queued (the hand is not held) and says the recovered
+        // login notice.
+        match relay.type_line("north".into()).await.unwrap() {
+            Typed::Queued(Some(notice)) => assert_eq!(
+                notice.text(),
+                "Lich is still logging in; what you typed follows once it knows the character."
+            ),
+            other => panic!("unexpected typed result: {other:?}"),
+        }
+        assert!(relay.output.is_empty(), "line must not be written yet");
+        assert!(!*relay.hand.borrow());
+
+        assert_eq!(
+            relay.release_hold().await.unwrap(),
+            ["north".to_string()]
+        );
+        // `release_hold` flips the recovered `watch` flag.
+        assert!(*relay.hand.borrow());
+
+        assert_eq!(relay.run_to_end().await.unwrap(), Ended::Exited(Some(3)));
+        assert_eq!(relay.output, ["first line", "second line", "got:north"]);
+
+        // The stderr task ends at EOF; give it a moment.
+        let mut errors = relay.errors().await;
+        for _ in 0..200 {
+            if errors == ["stderr line"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            errors = relay.errors().await;
+        }
+        assert_eq!(errors, ["stderr line"]);
+        assert_eq!(relay.status().and_then(|s| s.code()), Some(3));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_async_maps_child_exit_status_to_ended() {
+        use std::fs;
+
+        let (root, ruby, lich) = fake_ruby("async-run", "#!/bin/sh\necho started\nexit 5\n");
+        let ended = run_async(Launch::new(&ruby, &lich), 4003).await.unwrap();
+        assert_eq!(ended, Ended::Exited(Some(5)));
+        assert_eq!(ended.notice().unwrap().text(), "Lich exited (5).");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_until_stops_the_relay_when_the_token_is_cancelled() {
+        use std::fs;
+
+        // A Lich that prints one line and then hangs: only cancellation can end
+        // it.
+        let (root, ruby, lich) = fake_ruby(
+            "async-cancel",
+            "#!/bin/sh\necho 'Lich v5.0'\nwhile true; do sleep 1; done\n",
+        );
+
+        let stop = CancellationToken::new();
+        let canceller = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            canceller.cancel();
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until(Launch::new(&ruby, &lich), 4004, stop),
+        )
+        .await
+        .expect("cancellation did not stop the relay")
+        .unwrap();
+
+        assert_eq!(ended, Ended::Stopped);
+        assert_eq!(ended.notice().unwrap().text(), "Lich stopped.");
+        assert_eq!(ended.notice().unwrap().level, 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_already_cancelled_token_never_runs_the_child() {
+        use std::fs;
+
+        // The child would print a marker; a token cancelled up front must kill it
+        // before any output is collected.
+        let (root, ruby, lich) = fake_ruby(
+            "async-precancel",
+            "#!/bin/sh\necho marker\nsleep 5\n",
+        );
+
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until(Launch::new(&ruby, &lich), 4005, stop),
+        )
+        .await
+        .expect("the relay hung on a pre-cancelled token")
+        .unwrap();
+        assert_eq!(ended, Ended::Stopped);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sync_facade_stop_cancels_the_token_and_kills_the_child() {
+        use std::fs;
+
+        // A child that ignores nothing and sleeps: it only ends when stopped.
+        let (root, ruby, lich) = fake_ruby("sync-stop", "#!/bin/sh\necho started\nsleep 30\n");
+        let mut relay = show(&Launch::new(&ruby, &lich), 4006).unwrap();
+
+        // Consume the start line so the test is not racing the reader.
+        assert_eq!(relay.next_line_timeout(Duration::from_secs(5)), Some("started".to_string()));
+        assert!(!relay.is_cancelled());
+
+        let status = relay.stop().unwrap();
+        assert!(relay.is_cancelled());
+        assert!(status.code().is_none() || status.code() != Some(0));
+        // A later pump observes the stop and reports the end.
+        assert!(!relay.pump().unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_relay_async_drop_cancels_and_kills_the_child() {
+        // `spawn_async` uses `kill_on_drop(true)` and `RelayAsync::drop` cancels
+        // the token, so a failing spawn is the only observable here; the live
+        // child case is covered by `run_until_stops_the_relay_when_the_token_is
+        // _cancelled`.
+        let launch = Launch::new("/definitely/not/ruby", "/definitely/not/lich.rbw");
+        let err = spawn_async(&launch, 1).await.err().expect("spawn should fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_the_token_from_another_thread_stops_run_to_end() {
+        use std::fs;
+
+        let (root, ruby, lich) = fake_ruby("sync-token", "#!/bin/sh\necho started\nsleep 30\n");
+        let mut relay = show(&Launch::new(&ruby, &lich), 4007).unwrap();
+        // The token is the relay's real `CancellationToken`, not a stop flag:
+        // cancelling it from another thread ends `run_to_end`.
+        let token = relay.cancellation_token();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            token.cancel();
+        });
+        let status = relay.run_to_end().unwrap();
+        canceller.join().unwrap();
+        assert!(relay.is_cancelled());
+        // Killed by SIGKILL: no exit code on Unix.
+        assert_eq!(status.code(), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn blocking_reader_adapts_a_std_reader_to_async() {
+        // The synchronous facade feeds `BlockingReader` into the tokio reader;
+        // check the adapter on its own too.
+        let mut reader = crate::runtime::block_on(read_lines_async(BlockingReader::new(
+            Cursor::new(b"alpha\nbeta\n".to_vec()),
+        )));
+        let mut out = Vec::new();
+        while let Some(line) = crate::runtime::block_on(reader.recv()) {
+            out.push(line);
+        }
+        assert_eq!(out, ["alpha", "beta"]);
+    }
 }
+

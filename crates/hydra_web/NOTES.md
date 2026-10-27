@@ -329,18 +329,23 @@ and `Arc<Seat>`-ish values at `+0x328`.
 ## 3. Counts
 
 * Stubs in the crate: **49**. Implemented: **49**.
-* Fully recovered: **24** — `lan_address`, `http::request`, `pairing::{matches,
-  pairing}`, `workspace::{path, revision, answered}`, `phone::{file, keep, kept}`,
-  `notes::read`, `highlights::{sounds, changed, listed, MarkForm::mark}`,
-  `bonjour::Drop`, `client::{message, refused_here, push_asked, phone, phone_put,
+* **Fully** recovered: **26** — `lan_address`; `http::request`;
+  `pairing::{matches, pairing}`; `workspace::{path, answered}`;
+  `phone::{file, keep, kept}`; `notes::read`; `highlights::{sounds, changed,
+  listed}`; `client::{message, refused_here, push_asked, phone, phone_put,
   highlights_text, highlights_merge, workspace_of, game_said, press, button,
-  TrainerPanel::open}`, `wire::{run, hand, picture_out}`.
-* Partly recovered: **24** — `tasks::tasks`, `trainer::{trainer, sheet}`,
-  `injuries::doll`, `inventory::{inventory, add}`, `highlights::{Form::of,
-  Form::worn, save, merge}`, `follow::Follow::take`, `bonjour::Announced::start`,
-  `client::{wheel, link, inventory_act, trainer_asked, trainer_step, attach, look,
-  panel, wear}`, `wire::{story_line, card, view, banners}`.
-* Unknown: **1** — `one_connections`.
+  TrainerPanel::open}`; `wire::run`.
+* **Partly** recovered: **22** — `bonjour::Announced::start`; `tasks::tasks`;
+  `trainer::trainer`; `injuries::doll`; `inventory::inventory`;
+  `highlights::{Form::of, Form::worn, save, merge}`; `follow::Follow::take`;
+  `client::{attach, wheel, link, inventory_act, trainer_asked, look, panel,
+  wear}`; `wire::{story_line, card, view, banners}`.
+* **Unknown**: **1** — `one_connections`.
+* Non-stub helpers that are fully recovered and tested: `http::{accept_key,
+  base64, sha1, switching, respond, read_head}`, `pairing::{is_token,
+  fresh_token}`, `workspace::revision`, `highlights::{parse, render}`,
+  `highlights::MarkForm::mark`, `client::wheel_command`,
+  `bonjour::Drop for Announced`, `wire::{hand, picture_out}`.
 
 ## 4. Tests
 

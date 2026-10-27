@@ -654,6 +654,7 @@ dependencies = [
 name = "hydra_exp"
 version = "0.0.0"
 dependencies = [
+ "hydra_ledger",
  "hydra_model",
  "hydra_net",
 ]

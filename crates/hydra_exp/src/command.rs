@@ -14,9 +14,14 @@
 //! map a `rusqlite::error::Error` to its `Display` text (tag `1`) and otherwise
 //! dispatch on the byte at `&Parsed + 0` — `read` through the ten-entry jump
 //! table at `0x10240cff0`, `answer` through a chain of compares for the four
-//! mutating variants and a `bl read` for everything else. The original read its
-//! rows through `hydra_ledger::reader`; that crate is still a stub, so this
-//! build takes a [`Source`] instead (see `NOTES.md` for the departure).
+//! mutating variants and a `bl read` for everything else.
+//!
+//! [`Source`] is the seam those two functions read and write through. It is
+//! this crate's public API (siblings and the tests pass their own
+//! implementations), and [`crate::ledger::LedgerSource`] is the real one: it
+//! drives `hydra_ledger::Ledger::{reader, writer, prune_pulses}` and maps
+//! `rusqlite`-era errors to their `Display` text, which is why the trait's error
+//! type is `String` (see `NOTES.md`).
 
 use hydra_net::eastern;
 

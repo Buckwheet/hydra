@@ -3,9 +3,16 @@
 //! The binary's reports take slices of `hydra_ledger::row::Pulse` (stride
 //! `0xd0` = 208 bytes — visible as the `mov w9, #0xd0; madd` address arithmetic
 //! in every report) and of `hydra_ledger::row::Snapshot` (stride `0x90` = 144).
-//! `hydra_ledger` is still a stub in this workspace (`row::Pulse` and
-//! `row::Who` do not exist there yet), so the shapes are declared here instead;
-//! every field below is placed at the byte offset the binary actually reads.
+//!
+//! Those rows are also declared here, because this crate's public API is these
+//! types (every `report::*` takes `&[Pulse]`/`&[Snapshot]`) and they are *not*
+//! the same types: `hydra_exp`'s copy names the readings off the reports
+//! (`bonus`, `label`, `Who { name }`), while `hydra_ledger`'s names them off its
+//! tables (`instant`, `name`, `Who { instance, character }`) and types the
+//! snapshot kind. [`crate::ledger`] maps between the two, so the one 208-byte
+//! row is read and written through the real `hydra_ledger`; every field below is
+//! at the byte offset the binary actually reads, which is the offset the
+//! ledger's copy uses too.
 //!
 //! Offsets inside the 208-byte `Pulse` that were observed: `+0x30` (`rpa`,
 //! `Option<String>` — its capacity word is the `isize::MIN` niche), `+0x68`

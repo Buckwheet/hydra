@@ -6,8 +6,10 @@ an **unslid virtual address**. The crate is Hydra's experience tracker: it parse
 what the game says about experience, keeps per-creature/per-hunt rows, computes
 levels and rates, and prints the `exp …` reports.
 
-Status: `cargo check -p hydra_exp` and `cargo test -p hydra_exp` pass (**36
-tests**); `grep -rn 'todo!()\|unimplemented!()' crates/hydra_exp/src` is empty.
+Status: `cargo check -p hydra_exp --offline` and `cargo test -p hydra_exp
+--offline` pass (**46 tests**); `grep -rn 'todo!()\|unimplemented!()'
+crates/hydra_exp/src` is empty. Phase 1 (Layer 2) reconnected `hydra_ledger`
+behind the crate's row/report seam — see “the `hydra_ledger` seam” below.
 
 ---
 
@@ -296,12 +298,78 @@ interval` → (two "fullness" lines) → `Active Time` → `Rate` → `Total Pul
 
 | original | recovered use | what this build does |
 |---|---|---|
-| `hydra_ledger::row::Pulse` (208 B), `row::Who`, `reader::Reader`, the writer | every report takes `&[Pulse]`; `read`/`answer` open `Ledger::reader()` and call `Reader::{last_pulses, pulses_between, latest_snapshots, snapshots}` | `hydra_ledger` is still a stub in this workspace (`row.rs` only declares `Stamp`), and only files under `crates/hydra_exp/` may change. The row shapes are therefore declared in [`crate::row`] at their recovered offsets, and the reader/writer half is the [`crate::command::Source`] / [`crate::recorder::Sink`] trait pair. |
-| `rusqlite::error::Error` → `Display` into the reply | `read`/`answer` tag `1` replies | the `Source`/`Sink` methods return `Result<_, String>`; the error text is passed through unchanged. |
+| `hydra_ledger::row::Pulse` (208 B), `row::Snapshot`, `row::Who`, `reader::Reader`, the writer, `Ledger::prune_pulses` | every report takes `&[Pulse]`; `read`/`answer` open `Ledger::reader()` and call `Reader::{last_pulses, pulses, latest_snapshots, snapshots}`; `answer` writes through `Writer::try_record` and `Ledger::prune_pulses`; `recorder::start` walks `latest_snapshots` and writes snapshots | **reconnected** — `hydra_ledger = { path = "../hydra_ledger" }`, and [`crate::ledger::{LedgerSource, LedgerSink}`] implement the [`crate::command::Source`] / [`crate::recorder::Sink`] traits over the real `Ledger`/`Reader`/`Writer`. [`crate::row`] still declares its own copies, because those are this crate's public API and they are *not* the ledger's types — see “the `hydra_ledger` seam” below. |
+| `rusqlite::error::Error` → `Display` into the reply | `read`/`answer` tag `1` replies | `hydra_exp` never named `rusqlite` itself; the text reached it through `hydra_ledger`. The `Source`/`Sink` methods return `Result<_, String>` and [`crate::ledger`] fills that text from `hydra_ledger::Error`'s `Display` (and `writer::Closed`'s, i.e. `hydra_ledger::CLOSED_TEXT`), unchanged. `rusqlite` remains `hydra_ledger`'s own pin; the ledger still runs on its std store, so a real `hydra.db` does not open yet. |
 | `alloc::fmt::format` blobs | all report text | ordinary `format!` with the recovered pieces, column widths and precisions. |
 | `HashMap`/`RandomState` in `Tracker` | `knows` inserts `(kind byte, Option<String>) → 0x30-byte value` into the map at `+0x1e8` | `std::collections::HashMap` with the same key/value shape. |
 | `hydra_net::eastern` (path dep) | `date`, `offset`, `midnight`, `format`, `parse` | used as-is. |
 | `hydra_model::…::Experience` (path dep) | `Tracker::heard` calls `apply_bar` | used as-is (see the conflict below). |
+
+### The `hydra_ledger` seam, reconnected
+
+`hydra_ledger` is no longer a stub: it carries the full `row`/`reader`/`writer`
+reconstruction (208-byte `Pulse`, 144-byte `Snapshot`, `Who { instance,
+character }`, the `Reader` `SELECT`s, the writer thread, `prune_pulses`), and it
+is a path dependency of this crate. [`crate::ledger`] is the adapter; `read`,
+`answer` and `recorder::start` are unchanged and still go through the
+`Source`/`Sink` traits, so every sibling-facing signature and every existing test
+is untouched. `LedgerSource`/`LedgerSink` are bound to one ledger directory and
+one `hydra_ledger::row::Who` (instance **and** character) because that is what
+every `Reader` query filters on, while [`crate::row::Who`] carries the name
+alone; `LedgerSource::as_who()` builds the reports' `Who` from the same pair.
+
+Why [`crate::row`] keeps its own copies instead of re-exporting the ledger's:
+they are the public API (`report::*` takes `&[Pulse]`), and the two families of
+names/types differ. The same 208-byte row, read off the reports on this side and
+off the `pulses` columns on the ledger's:
+
+| `hydra_exp` | `hydra_ledger` |
+|---|---|
+| `bonus` (`+0xc0`, the amount a brooch/instant row holds) | `instant` (the column name) |
+| `fashlonae: Option<u8>` | `fashlonae: Option<u32>` |
+| `source: crate::row::Source` | `source: hydra_ledger::row::Source` (same five bytes) |
+| — (the reports read none of these) | `instance`, `character`, `mind_text`, `game_time`, `fxp`, `fxp_max`, `mind_percent` |
+
+and for the 144-byte snapshot, `label` vs the ledger's `name`, and the `u8` kind
+byte vs the ledger's typed `SnapshotKind` (`favor`/`resource`/`suffused`).
+`fashlonae` is narrowed **clamping** rather than dropping, because
+`report::bonuses` only asks whether the tag is `1` and the word is `2`: presence
+is the meaning. The fields this crate has no source for are filled from the bound
+`Who` on the way in and ignored on the way out.
+
+Two deliberate differences from the binary, both in [`crate::ledger`]'s docs:
+
+1. **One writer per recorded row.** The binary opens `Ledger::writer()` once and
+   `try_record` only `try_send`s. The ledger's `Connection` in this workspace is
+   a whole-file store, so a long-lived writer keeps the database as it was when
+   its thread started and each `COMMIT` rewrites the file from that copy — it
+   would resurrect rows a `prune_pulses` (its own connection) deleted. Each write
+   therefore uses its own `Writer` and flushes it: `try_record` is blocking and
+   durable here (`Ok(())` = on disk, and a later read sees it). With a real
+   SQLite connection the long-lived writer becomes safe *and* faithful again.
+2. **Closed windows.** `Reader::pulses` and `Reader::snapshots` are half-open
+   (`at >= from AND at < to`), while `command::Source` documents closed
+   intervals (as the recovered windows are handed in), so the adapter passes
+   `to + 1`, saturating.
+
+**Integration risk for the parent:** `hydra_ledger` is being rewritten in its own
+Layer-2 worktree. The adapter is kept thin on purpose — it names only
+`Ledger::{open, reader, writer, prune_pulses}`, `Reader::{last_pulses, pulses,
+latest_snapshots, snapshots}`, `Writer::{try_record, flush}`,
+`hydra_ledger::CLOSED_TEXT` and `row::{Pulse, Snapshot, Row, Source,
+SnapshotKind, Who}` (plus whatever `Error`'s `Display` says). If that crate's
+`Reader` returns different row types or renames those methods, `src/ledger.rs`
+must be re-pointed, and it is the only file in this crate that would need it.
+Note also that the ledger keys pulses *and* snapshots by (instance, character),
+so a caller must know the instance; the reports only ever needed the name, which
+is why the adapter takes the pair at construction.
+
+Nothing else in this crate's departure table is a workspace pin: there is no
+`serde`, `regex`, `toml`, `jiff`, `tokio` or `rusqlite` use in
+`crates/hydra_exp/src` (`grep` confirms the only imports from outside the crate
+are `hydra_net::eastern` and `hydra_model`'s `Experience`), so there is nothing
+to reconnect there — `rusqlite` is reached through `hydra_ledger`'s `Display`
+text, and never named here.
 
 ### Evidence conflicts / things that could not be established
 
@@ -357,18 +425,23 @@ interval` → (two "fullness" lines) → `Active Time` → `Rate` → `Total Pul
 ## Layout of this crate
 
 ```
-src/lib.rs        modules: catalog, command, levels, recorder, report, row, tracker
+src/lib.rs        modules: catalog, command, ledger, levels, recorder, report, row, tracker
 src/levels.rs     LEVELS table + label()
-src/row.rs        Pulse / Snapshot / Who / Source  (stand-ins for hydra_ledger::row)
+src/row.rs        Pulse / Snapshot / Who / Source  (this crate's view of the ledger's rows)
 src/report.rs     Totals + the twelve reports
 src/catalog.rs    Entry, command(), matches(), REPORTS
 src/command.rs    Source trait, Parsed, Reply, HELP, parse/parse_time/run/read/answer
 src/tracker.rs    Tracker, Bar, Watch, Known
 src/recorder.rs   names_a_snapshot, Sink trait, start
+src/ledger.rs     LedgerSource / LedgerSink — the real hydra_ledger behind the two traits
 ```
 
 `Edit`d by hand against the disassembly; the tests assert literal recovered
 values (level thresholds and percentages, the ten `said` lines, the five-column
 `last` table with its widths, the 90 s timing limit, the Eastern-date grouping
 of `daily`, `parse_time`'s three spellings, and `names_a_snapshot`'s three
-tests).
+tests). The ten `ledger` tests round-trip every mapped field through a throwaway
+ledger directory under `std::env::temp_dir()` (removed by each test), and cover
+the oldest-first ordering, the closed windows, the instance/character filter,
+`prune_pulses`, `command::answer`'s manual gain, `recorder::start` over a real
+sink, and the `Display` text of a failed connection.

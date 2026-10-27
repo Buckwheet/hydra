@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 hydra_net = { path = "../hydra_net" }
 hydra_model = { path = "../hydra_model" }
+hydra_ledger = { path = "../hydra_ledger" }

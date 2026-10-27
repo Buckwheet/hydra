@@ -24,7 +24,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The client-identification line, exactly as observed on both channels.
 ///
@@ -176,7 +176,43 @@ pub fn keyed_listener() -> io::Result<(TcpListener, u16)> {
 /// error is returned, so a peer that guessed wrong sees the connection close
 /// instead of a live socket.
 pub fn accept_keyed_listener(listener: &TcpListener, token: &str) -> io::Result<TcpStream> {
-    let (mut stream, _addr) = listener.accept()?;
+    accept_keyed_listener_within(listener, token, ACCEPT_TIMEOUT)
+}
+
+/// [`accept_keyed_listener`] with an explicit wait for Lich to connect.
+///
+/// The recovered 60-second deadline covers *waiting for Lich* as well as the
+/// two handshake reads; `listener.accept()` alone blocks forever.  The test
+/// seam takes a short wait so the timeout path can be exercised quickly.
+pub fn accept_keyed_listener_within(
+    listener: &TcpListener,
+    token: &str,
+    wait: Duration,
+) -> io::Result<TcpStream> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + wait;
+    let accepted = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    listener.set_nonblocking(false)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Lich did not connect within the accept deadline",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => {
+                listener.set_nonblocking(false)?;
+                return Err(err);
+            }
+        }
+    };
+    listener.set_nonblocking(false)?;
+    let (mut stream, _addr) = accepted;
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(ACCEPT_TIMEOUT))?;
     stream.set_write_timeout(Some(ACCEPT_TIMEOUT))?;
     match accept_keyed(&mut stream, token) {
@@ -500,6 +536,23 @@ mod tests {
         let err = accept_keyed_listener(&listener, &token).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(["closed", "reset"].contains(&client.join().unwrap()));
+    }
+
+    #[test]
+    fn a_lich_that_never_connects_times_out() {
+        let (listener, _port) = keyed_listener().unwrap();
+        let token = synthetic_token();
+        let started = Instant::now();
+        let err =
+            accept_keyed_listener_within(&listener, &token, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the accept did not honour its deadline"
+        );
+        // The listener is left usable (blocking again), so a late Lich can
+        // still be accepted after the timeout path.
+        listener.set_nonblocking(false).unwrap();
     }
 
     #[test]

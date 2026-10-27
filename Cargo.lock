@@ -134,6 +134,11 @@ dependencies = [
 [[package]]
 name = "hydra_ui"
 version = "0.0.0"
+dependencies = [
+ "gs_base",
+ "hydra_model",
+ "hydra_protocol",
+]
 
 [[package]]
 name = "hydra_update"

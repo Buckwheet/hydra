@@ -1,4 +1,11 @@
-#![allow(dead_code,unused)]
+#![allow(dead_code, unused)]
+//! `hydra_ui` — the story/text front end: themes, highlights, the hotbar, the
+//! inventory window, conditions, scrollback and the settings model.
+//!
+//! Recovered from the arm64 Hydra binary; every module carries the addresses of
+//! the functions it came from.  The presentation layer is behind
+//! [`seam`]-style no-op seams (see each module's notes) because `egui` is not
+//! available here.
 pub mod bounty;
 pub mod channel_line;
 pub mod combat_line;
@@ -23,7 +30,13 @@ pub mod settings;
 pub mod sorter;
 pub mod story;
 pub mod theme;
+pub mod toml;
 pub mod view;
+
+mod emoji_table;
+mod layer;
+
+pub use layer::Over;
 
 /* unresolved symbols (trait impls, closures, generics):
  <hydra_ui::hotbar::icon::Icon as core::convert::TryFrom<hydra_ui::hotbar::icon::IconDe>>::try_from @0x00000001018cace8

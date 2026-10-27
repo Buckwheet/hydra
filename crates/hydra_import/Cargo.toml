@@ -2,3 +2,8 @@
 name = "hydra_import"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# `instance_of` resolves `<settingsInfo instance="...">` through the recovered
+# endpoint table (see crates/hydra_net/src/gemstone/endpoint.rs).
+hydra_net = { path = "../hydra_net" }

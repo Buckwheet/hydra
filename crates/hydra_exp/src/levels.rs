@@ -34,6 +34,22 @@ pub const LEVELS: [u64; 101] = [
     7_572_500,
 ];
 
+/// The level *number* for `exp`: the highest `i` with `LEVELS[i] <= exp`.
+///
+/// This is the scan `levels::label` performs (`0x1012ec07c`); it is split out
+/// because `report::range` prints the bare numbers (`Levels Gained: {} ({} ->
+/// {})` formats them with `<u64 as Display>::fmt`, not with the label).
+pub fn number(exp: u64) -> usize {
+    let mut level = 0usize;
+    for i in (0..LEVELS.len()).rev() {
+        if exp >= LEVELS[i] {
+            level = i;
+            break;
+        }
+    }
+    level
+}
+
 /// The label printed once the table runs out at the top level.
 ///
 /// Literal at `0x10240db06`, 15 bytes: `"level 100 (cap)"`.
@@ -57,13 +73,7 @@ pub const CAP: &str = "level 100 (cap)";
 /// at 0 and the argument is unsigned); the binary's "fell off the bottom" path
 /// returns level 0 for it, which is the same answer.
 pub fn label(exp: u64) -> String {
-    let mut level = 0usize;
-    for i in (0..LEVELS.len()).rev() {
-        if exp >= LEVELS[i] {
-            level = i;
-            break;
-        }
-    }
+    let level = number(exp);
     if level + 1 >= LEVELS.len() {
         return CAP.to_string();
     }
@@ -105,6 +115,15 @@ mod tests {
         assert_eq!(label(7_500), "level 2 (50.0% through)");
         // level 99 spans 7,460,000 ..= 7,572,500.
         assert_eq!(label(7_462_500), "level 99 (2.2% through)");
+    }
+
+    #[test]
+    fn number_is_the_scan_behind_the_label() {
+        assert_eq!(number(0), 0);
+        assert_eq!(number(2_499), 0);
+        assert_eq!(number(2_500), 1);
+        assert_eq!(number(7_572_500), 100);
+        assert_eq!(number(u64::MAX), 100);
     }
 
     #[test]

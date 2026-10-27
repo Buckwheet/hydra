@@ -6,7 +6,7 @@ an **unslid virtual address**. The crate is Hydra's experience tracker: it parse
 what the game says about experience, keeps per-creature/per-hunt rows, computes
 levels and rates, and prints the `exp …` reports.
 
-Status: `cargo check -p hydra_exp` and `cargo test -p hydra_exp` pass (**30
+Status: `cargo check -p hydra_exp` and `cargo test -p hydra_exp` pass (**36
 tests**); `grep -rn 'todo!()\|unimplemented!()' crates/hydra_exp/src` is empty.
 
 ---
@@ -113,7 +113,7 @@ offset arithmetic, not from drop glue.
 | `report` | `last` | `0x1012b04d0` | **full** |
 | `report` | `daily` | `0x1012b09b8` | **full** |
 | `report` | `level` | `0x1012b12fc` | **full** |
-| `report` | `range` | `0x1012b18a4` | partly (formats + aggregates; two "fullness" lines and one placeholder UNKNOWN) |
+| `report` | `range` | `0x1012b18a4` | partly (every line but the two "fullness" ones is recovered) |
 | `report` | `Totals::said` | `0x1012b3da0` | **full** |
 | `report` | `stamp` | `0x1012b3a68` | **full** |
 | `report` | `today` | `0x1012b3bf4` | **full** |
@@ -238,7 +238,9 @@ catalog  the eleven report entries and the twelve help lines (see below)
 ```
 
 Timing gap limit: the static `i64` at `0x10240cf28` is **90** (`0x5a`); the gap
-filter keeps `diff < 91`.
+filter keeps `diff < 91`, and `report::range` uses the *same* constant for its
+`(gaps >{}s excluded)` placeholder, so both reports share
+[`report::TIMING_GAP_LIMIT`].
 
 `command` vocabulary (help table at `0x10442dc00`, 12 × `&str`):
 `session`, `today`, `hour`, `daily`, `last`, `instant`, `timing`, `level`,
@@ -263,6 +265,32 @@ hydra_gui's catalogue): `Today/today`, `Hour/hour`, `Daily/daily`,
 `report` = `pulses_between(from, to + 1)`.
 
 ---
+
+### `report::range` in detail
+
+The body is `0x1012b18a4 .. 0x1012b34ec` (7,240 B, all straight-line `format!`
+pushes), so the line order is the address order: `Period` → `Experience Report
+for` → `Starting Exp` → `Ending Exp` → `Levels Gained` → `Total Gained` →
+`Bounty`/`Brooch`/`Instant` → one row per source present → `Min`/`Max`/`Avg
+interval` → (two "fullness" lines) → `Active Time` → `Rate` → `Total Pulses` →
+`Next Level`.
+
+* `Ending Exp: {} (axp {}) - {}` — the third argument is `levels::label` of the
+  last pulse's absorbed experience (`bl levels::label` at `0x1012b1da0` with
+  `[sp+0xc0]`, the ending exp, and the result passed as a `String`).
+* `Levels Gained: {} ({} -> {})` — all three placeholders are integers
+  (`<u64 as Display>::fmt` at `0x1012b1ef0`), i.e. the bare level numbers and
+  their difference — which is why [`levels::number`] exists next to
+  [`levels::label`].
+* `Active Time: {}h {}m` adds up the surviving gaps, and `Rate` is
+  `total_exp * 3600 / active_seconds`; `Next Level` divides `until_next` by that
+  rate.
+* `UNKNOWN:` the two "Avg mind fullness" / "Avg pool fullness" lines. Their
+  shape is established — an `f64` mean of a `0..=99` integer column (the closure
+  filters with `cmp x10, #0x63`) plus a second percentage that divides one count
+  by another (`ucvtf`/`fdiv` at `0x1012b2b48`) — but the two row offsets those
+  columns live at are not, so this build prints neither line rather than a
+  number it cannot back.
 
 ## `std`-only departures and cross-crate seams
 

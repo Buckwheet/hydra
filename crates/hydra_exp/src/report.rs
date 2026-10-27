@@ -524,21 +524,15 @@ pub fn range(name: &str, pulses: &[Pulse], from: i64, to: i64) -> Vec<String> {
         last.axp,
         levels::label(last.exp.max(0) as u64)
     ));
-    let first_level = levels::label(first.exp.max(0) as u64);
-    let last_level = levels::label(last.exp.max(0) as u64);
-    let gained_levels = last_level
-        .split(' ')
-        .nth(1)
-        .and_then(|n| n.parse::<i64>().ok())
-        .unwrap_or(0)
-        - first_level
-            .split(' ')
-            .nth(1)
-            .and_then(|n| n.parse::<i64>().ok())
-            .unwrap_or(0);
+    // The three placeholders of `Levels Gained: {} ({} -> {})` are integers
+    // (`<u64 as Display>::fmt`, `0x1012b1ef0`), i.e. the bare level numbers.
+    let first_level = levels::number(first.exp.max(0) as u64);
+    let last_level = levels::number(last.exp.max(0) as u64);
     out.push(format!(
         "Levels Gained: {} ({} -> {})",
-        gained_levels, first_level, last_level
+        last_level.saturating_sub(first_level),
+        first_level,
+        last_level
     ));
     out.push(format!(
         "Total Gained: {} exp, {} ascension",
@@ -940,6 +934,70 @@ mod tests {
             timing(&pulses[..1]),
             vec!["Not enough pulse data found for timing analysis."]
         );
+    }
+
+    #[test]
+    fn range_reports_the_span_aggregates_and_the_active_rate() {
+        let pulses = vec![
+            Pulse {
+                at: T - 120,
+                exp: 2_500,
+                axp: 10,
+                exp_gained: 500,
+                axp_gained: 10,
+                ..Pulse::default()
+            },
+            Pulse {
+                at: T - 60,
+                exp: 3_000,
+                axp: 20,
+                exp_gained: 500,
+                axp_gained: 10,
+                ..Pulse::default()
+            },
+            Pulse {
+                at: T,
+                exp: 3_750,
+                axp: 30,
+                exp_gained: 750,
+                axp_gained: 10,
+                until_next: Some(1_250),
+                ..Pulse::default()
+            },
+        ];
+        let lines = range("Sindar", &pulses, T - 120, T);
+        assert_eq!(
+            lines[0],
+            "Period: 2026-07-20 13:03:52 to 2026-07-20 13:05:52"
+        );
+        assert_eq!(lines[1], "Experience Report for Sindar");
+        assert_eq!(lines[2], "Starting Exp: 2500 (axp 10)");
+        assert_eq!(
+            lines[3],
+            "Ending Exp:   3750 (axp 30) - level 1 (50.0% through)"
+        );
+        assert_eq!(lines[4], "Levels Gained: 0 (1 -> 1)");
+        assert_eq!(lines[5], "Total Gained: 1750 exp, 30 ascension");
+        assert_eq!(lines[6], "  Bounty:   0 (0.00%)");
+        assert_eq!(lines[7], "  Brooch:   0 (0.00%)");
+        assert_eq!(lines[8], "  Instant:  0 (0.00%)");
+        assert_eq!(
+            lines[9],
+            "  normal                        3 pulses (100.0%)       1750 exp"
+        );
+        assert_eq!(lines[10], "  Min interval: 60 seconds");
+        assert_eq!(lines[11], "  Max interval: 60 seconds");
+        assert_eq!(lines[12], "  Avg interval: 60.0 seconds");
+        assert_eq!(lines[13], "  Active Time:  0h 2m (gaps >90s excluded)");
+        assert_eq!(lines[14], "  Rate:         52500 exp/hour (active)");
+        assert_eq!(lines[15], "  Total Pulses: 3");
+        assert_eq!(
+            lines[16],
+            "  Next Level:   1250 exp to go (~0.0h at this rate)"
+        );
+        assert_eq!(lines.len(), 17);
+        // An empty span keeps just the period line.
+        assert_eq!(range("Sindar", &[], T - 60, T).len(), 1);
     }
 
     #[test]

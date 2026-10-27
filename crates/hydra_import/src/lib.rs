@@ -746,4 +746,40 @@ mod tests {
         b.prefix = None;
         assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
     }
+
+    /// `Eq` is derived (all four fields) while `Ord` is hand-written
+    /// (`+0x18` stamp, then `+0x00` name), so the two disagree on records that
+    /// differ only in `files`/`prefix`.
+    ///
+    /// This is exactly what the binary does — its comparator never looks at
+    /// `+0x30` or `+0x48` — but it means `Session` does **not** satisfy the
+    /// `Ord`/`Eq` consistency requirement.  `sessions` merges on
+    /// `(name, stamp)`, so no two sessions it returns can collide; a caller
+    /// that puts `Session` in a `BTreeSet`/`BTreeMap` would silently drop the
+    /// second record.
+    #[test]
+    fn order_and_equality_disagree_on_the_ignored_fields() {
+        let mut a = Session {
+            name: "GS4".to_string(),
+            stamp: "2024-03-10_10-04-59".to_string(),
+            files: vec![PathBuf::from("/a-000.bytes")],
+            prefix: Some("Vaalor".to_string()),
+        };
+        let b = Session {
+            name: "GS4".to_string(),
+            stamp: "2024-03-10_10-04-59".to_string(),
+            files: vec![PathBuf::from("/a-001.bytes")],
+            prefix: None,
+        };
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert_ne!(a, b);
+        a.files = b.files.clone();
+        a.prefix = None;
+        assert_eq!(a, b);
+
+        // The consequence, pinned: a `BTreeSet` keeps only the first.
+        let set: std::collections::BTreeSet<Session> =
+            [a.clone(), b.clone()].into_iter().collect();
+        assert_eq!(set.len(), 1);
+    }
 }

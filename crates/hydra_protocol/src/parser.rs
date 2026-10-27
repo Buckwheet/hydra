@@ -16,7 +16,16 @@
 //! structural tags (dialogs, containers, menus, streams) are ignored for
 //! now; see the `UNKNOWN` notes on [`Parser::parse_line`].
 
+pub mod compass;
+pub mod inventory;
+pub mod markup;
 pub mod read;
+pub mod wire;
+
+/// `parser::is_paired` lives in [`markup`] in this reconstruction because it
+/// shares the tag-name tables with `is_markup`; the original had it directly
+/// in `parser`.
+pub use markup::is_paired;
 
 use crate::frame::payload::{Link, MerchantStatus};
 use crate::frame::Frame;

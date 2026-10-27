@@ -4,6 +4,12 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# `recorder::start` spawns the recording loop on the tokio runtime: the binary
+# calls `tokio::task::spawn::spawn` (`0x1012dccf0`) with a
+# `Pin<Box<recorder::start::{{closure}}>>` and drops the `JoinHandle`
+# (`tokio::runtime::task::state::State::drop_join_handle_fast`, `0x101e69b90`).
+# See NOTES.md.
+tokio = { workspace = true }
 hydra_net = { path = "../hydra_net" }
 hydra_model = { path = "../hydra_model" }
 hydra_ledger = { path = "../hydra_ledger" }

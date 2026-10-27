@@ -11,6 +11,32 @@ The stub file named four functions, but the symbol table has six: two private
 helpers (`attribute_of`, `gather`) and the `Session` record with its `Ord`
 comparator survive as inlined code.  All six are reconstructed here.
 
+**Full inventory (audit pass, both sources).** `symbols_demangled.txt` lists the
+same 6 global symbols; `nm -a | rustfilt` gives 28 lines naming `hydra_import`,
+which collapse to 6 crate functions, 1 record, and the drop glue / closure
+types of three functions that are **out of this crate's stub set**:
+
+| symbol | addr | size | status |
+|---|---|---|---|
+| `instance_of` (T) | `0x10026368c` | 384 | reconstructed |
+| `attribute_of` (t) | `0x10026380c` | 1792 | reconstructed |
+| `gather` (t) | `0x100263f0c` | 560 | reconstructed |
+| `name_of` (T) | `0x10026413c` | 724 | reconstructed |
+| `span_of` (T) | `0x100264410` | 760 | reconstructed |
+| `sessions` (T) | `0x100264708` | 1344 | reconstructed |
+| `drop_in_place<Session>` | `0x100264c80` + 7 ICF copies | 212/192 | gives the record layout (§2) |
+| `drop_in_place<Vec<Session>>` | `0x100264e88`, `0x1002663dc` | 196 | confirms `Vec<Session>` |
+| `import::{{closure}}` (drop glue) | 3 addresses (`0x10001c62c`, …) | 112 | out of scope |
+| `replay::{{closure}}` (drop glue) | 3 addresses (`0x10001c69c`, …) | 332 | out of scope |
+| `import_into::{{closure}}` | `0x1000058d8`, `0x100138b80`, `0x100162340` + 3 drop glues | 10456/13588/836 | out of scope |
+
+The two 10–13 KB `import_into::{{closure}}` symbols are the drop glue of an
+**`async` state machine** (a closure type of that size can only be captured
+`.await` state), which is consistent with `import_into` being an `async fn`;
+they are the only hint that the crate had async code at all, and no `tokio`
+symbol names them, so no async runtime is claimed for this crate. The published
+6-function surface is the whole of this crate's reconstructed API.
+
 Legend:
 
 * **ESTABLISHED** — read directly out of the instructions, the immediates or the
@@ -362,6 +388,22 @@ Phase 1 verified this from the call graph instead of trusting the note: every
 symbols, or that one sibling call — no registry crate is reachable (§0).  So the
 dependency set is unchanged and **no** `x = { workspace = true }` line was added.
 
+**Audit pass re-verification (third time, different method).** The whole `.text`
+range `0x10026368c..0x10026516c+` was disassembled and every `bl` target
+resolved against the full `nm -a` table and bucketed by crate prefix:
+`core` (37, plus 2 `<core…` generic impls), `rustc` shims (35, i.e.
+`__rust_alloc`/`__rust_dealloc`/`__rust_no_alloc_shim_is_unstable_v2`),
+`<local/unnamed>` intra-crate tail calls (24), `alloc` (14, plus 5 `<alloc…`),
+`std` (3, plus 9 `<std…`: `Path::{is_dir,extension,file_stem,to_path_buf,
+components}`, `std::path::compare_components`, `std::fs::read_dir`,
+`<std::fs::DirEntry>::path`), `hydra_import` itself (5), and exactly one
+sibling call — `hydra_net::gemstone::endpoint::instance` at `0x100263724`.
+Nothing else. Also searched the entire `nm -a` dump for any
+symbol naming a registry crate *and* a `hydra_import` type (the tell-tale for a
+trait impl or a monomorphisation) — there is none. Contrast `hydra_exp`, which
+has 15 `tokio`-naming symbols: this crate has zero. **Verdict: no third-party
+dependency, confirmed.**
+
 ---
 
 ## 4. Departures
@@ -411,7 +453,7 @@ agree with §1.1, restore the display-name signature; `hydra_import`'s
 
 ## 6. Tests
 
-`cargo test --offline -p hydra_import` runs 25 unit tests, all asserting
+`cargo test --offline -p hydra_import` runs 26 unit tests, all asserting
 recovered values:
 
 * `attribute_of`: first `<app …>` wins and stops at the closing quote; missing
@@ -446,3 +488,29 @@ recovered values:
 
 The scratch fixtures live in `std::env::temp_dir()` and are removed by a `Drop`
 guard; no fixture is written into the repository.
+
+---
+
+## 7. What changed in audit-core (Phase 2)
+
+The six functions and the record layout needed **no behavioural change**: they
+were re-derived from the disassembly once more (see the coverage table in the
+header and §3) and every recovered value in §1.1–§1.7 still holds. What changed
+is the bookkeeping and one pinned consequence:
+
+1. **Full symbol inventory added** (header table): 28 `nm -a` lines → 6
+   crate functions, 1 record + 8 drop-glue instantiations, and the closure/drop
+   types of the out-of-scope `import`/`import_into`/`replay`.
+2. **New observation**: `import_into`'s closure type is 10.5 KB / 13.6 KB, i.e.
+   an `async` state machine — recorded in the header table. It does not affect
+   this crate's dependency verdict (no runtime symbol names it).
+3. **Dependency verdict re-verified a third time** with a different method (see
+   §3): still `hydra_net` only, still no `x = { workspace = true }`.
+4. **One new test** (`order_and_equality_disagree_on_the_ignored_fields`) pins
+   the `Ord`/`Eq` contract divergence §1.7 flagged as UNKNOWN: `Ord` compares only
+   `(stamp, name)` while `Eq` is derived over all four fields, so a
+   `BTreeSet<Session>` silently collapses records that differ only in
+   `files`/`prefix`. That is what the binary's comparator does, and `sessions`
+   merges on `(name, stamp)` so it cannot hit the case — but the hazard is now
+   asserted rather than described.
+5. **Tests 25 → 26.** No existing test changed.

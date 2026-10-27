@@ -11,7 +11,7 @@
 //! * the original talked to the external `cena_map` crate (the room model and the
 //!   binary map format) — this build carries the slice of it `hydra_map` uses in
 //!   [`cena`], with the map-file decoder documented as a seam.
-#![allow(dead_code, unused)]
+#![allow(dead_code)]
 
 pub mod atlas;
 pub mod cena;

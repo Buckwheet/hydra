@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn next_door_names_the_area_and_the_room() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.put("North Blue", scene());
         let doors = atlas.next_door("North Blue@1010");
         assert!(!doors.is_empty());

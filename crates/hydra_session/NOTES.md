@@ -324,7 +324,7 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 
 ## 5. Tests
 
-`cargo test -p hydra_session` runs 157 tests with 599 assertions:
+`cargo test -p hydra_session` runs 158 tests with 600 assertions:
 
 * `store`: `safe_component` cases (`"Aelith's Cart"` → `aelithscart`, `".."` →
   `""`, non-ASCII dropped, case folded), both `character_path` outcomes, the
@@ -378,6 +378,6 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 * `password`: the variable name mapping, the prompt text, prompt recognition,
   and `kept` reading a real environment variable.
 
-Gates: `cargo check -p hydra_session`, `cargo test -p hydra_session` (157 tests
+Gates: `cargo check -p hydra_session`, `cargo test -p hydra_session` (158 tests
 passing) and `cargo check --workspace` are clean, and
-`grep -rn 'todo!' crates/hydra_session` is empty.
+`grep -rn 'todo!' crates/hydra_session/src` is empty.

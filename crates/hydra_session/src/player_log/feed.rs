@@ -215,16 +215,12 @@ impl Feed {
         if day.is_empty() {
             return Ok(0);
         }
-        let path = writer::day_path(
-            self.writer.directory(),
-            &day,
-            self.writer
-                .directory()
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-                .as_str(),
-        );
+        let Some((_day, path)) = writer::days(self.writer.directory())
+            .into_iter()
+            .find(|(d, _)| *d == day)
+        else {
+            return Ok(0);
+        };
         let text = std::fs::read_to_string(&path)?;
         let mut count = 0;
         for line in text.lines() {
@@ -300,6 +296,24 @@ mod tests {
         });
         assert_eq!(feed.frame("speech", "pw hunter2").lines, ["pw ***"]);
         assert!(feed.frame("combat", "a kobold attacks").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_hands_over_the_current_day() {
+        let root = dir("e");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut feed = Feed::new(&root, "Aelith");
+        feed.frame("speech", "one");
+        feed.frame("speech", "two");
+        let mut seen = Vec::new();
+        let count = feed.watch(&mut |line| seen.push(line.to_string())).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].contains("two"));
+        // a fresh feed with an empty day watches nothing
+        let mut empty = Feed::new(&dir("f"), "Aelith");
+        assert_eq!(empty.watch(&mut |_| {}).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

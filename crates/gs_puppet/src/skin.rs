@@ -124,6 +124,22 @@ impl SkinSurface {
         }
         Texture::from_rgba(self.width.max(1), self.height.max(1), data)
     }
+
+    /// The surface as the `epaint` image a painter uploads.
+    ///
+    /// This is the value the original handed to `wgpu` (`Context::load_texture` in
+    /// `gs_render`'s figure path): the same `255.0` fixed-point conversion as
+    /// [`SkinSurface::to_texture`], as straight (un-premultiplied) sRGB bytes, in
+    /// row-major `width * height` order.
+    pub fn color_image(&self) -> epaint::ColorImage {
+        let mut rgba = Vec::with_capacity(self.texels.len() * 4);
+        for t in &self.texels {
+            for k in 0..4 {
+                rgba.push((t[k].clamp(0.0, 1.0) * BYTE_SCALE).round() as u8);
+            }
+        }
+        epaint::ColorImage::from_rgba_unmultiplied([self.width as usize, self.height as usize], &rgba)
+    }
 }
 
 /// The light [`SkinSurface::scene_lit`] applies.
@@ -344,6 +360,46 @@ mod tests {
         assert_eq!(SCENE_AMBIENT, 0.25);
         assert_eq!(SCENE_HALF, 0.5);
         assert_eq!(SCENE_RIM, 1.25);
+    }
+
+    #[test]
+    fn the_surface_becomes_an_epaint_color_image() {
+        let mut surface = SkinSurface::blank(2, 2);
+        surface.set(0, 0, [1.0, 0.5, 0.25, 1.0]);
+        surface.set(1, 0, [0.0, 0.0, 0.0, 0.0]);
+        surface.set(0, 1, [0.2, 0.4, 0.6, 1.0]);
+        surface.set(1, 1, [1.0, 1.0, 1.0, 0.5]);
+        let image = surface.color_image();
+        assert_eq!(image.size, [2, 2]);
+        assert_eq!(image.pixels.len(), 4);
+        // Row-major, from the top: the recovered 255.0 fixed point, rounded.
+        assert_eq!(image.pixels[0].to_array(), [255, 128, 64, 255]);
+        assert_eq!(image.pixels[1].to_array(), [0, 0, 0, 0]);
+        assert_eq!(image.pixels[2].to_array(), [51, 102, 153, 255]);
+        // Translucent texels are premultiplied by `epaint` on the way in (the
+        // floats are straight albedo, as `fs_final`'s `acc.rgb / acc.a` recovers).
+        let [r, g, b, a] = image.pixels[3].to_array();
+        assert_eq!(a, 128);
+        assert_eq!(r, (255u32 * 128 / 255) as u8);
+        assert_eq!((r, g, b), (128, 128, 128));
+        // It agrees byte for byte with the crate's own 8-bit texture.
+        let tex = surface.to_texture();
+        for y in 0..2 {
+            for x in 0..2 {
+                let t = tex.texel(x, y);
+                let p = image.pixels[y as usize * 2 + x as usize].to_srgba_unmultiplied();
+                let bytes = (
+                    (t[0] * BYTE_SCALE).round() as u8,
+                    (t[1] * BYTE_SCALE).round() as u8,
+                    (t[2] * BYTE_SCALE).round() as u8,
+                );
+                assert_eq!((p[0], p[1], p[2]), bytes);
+            }
+        }
+        // A 0x0 surface is still a valid (empty) image.
+        let empty = SkinSurface::blank(0, 0).color_image();
+        assert_eq!(empty.size, [0, 0]);
+        assert!(empty.pixels.is_empty());
     }
 
     #[test]

@@ -48,6 +48,21 @@ pub const PARTICLE_DRIFT: [f32; 2] = [9.0, 11.0];
 /// Blend weights `0.25` / `0.5`.
 pub const PARTICLE_BIAS: f32 = 0.25;
 
+/// How long a fresh hit stays fresh, in seconds.
+///
+/// The literal is embedded in the splat WGSL of the binary, whose own comment
+/// names it: `// gs_puppet::layers::FRESH_SECS and FALL_FT_S2` /
+/// `const FRESH_SECS: f32 = 4.0;`, and the shader fades a hit out over
+/// `smoothstep(FRESH_SECS - 1.2, FRESH_SECS, age)` — the `0 ≤ age < 4` window the
+/// `gs_render` fresh-mask builder also uses.
+pub const FRESH_SECS: f32 = 4.0;
+
+/// Downward acceleration of a thrown dot, in feet per second squared.
+///
+/// From the same shader comment (`const FALL_FT_S2: f32 = 24.0;`), used as the
+/// `-0.5 * FALL_FT_S2 * age²` term of the ballistic fall.
+pub const FALL_FT_S2: f32 = 24.0;
+
 /// One dot of a status layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Dot {

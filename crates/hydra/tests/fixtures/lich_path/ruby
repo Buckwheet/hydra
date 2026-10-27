@@ -20,7 +20,9 @@
 #      loopback, no helper program);
 #   3. write one of its own lines and one 0x1F-prefixed forwarded chunk to
 #      stdout, the way Lich reports both;
-#   4. exit, so the test never waits on a parked child.
+#   4. read one line back from the socket, bounded, and report it (the
+#      game -> Lich direction `hydra play` relays); then
+#   5. exit, so the test never waits on a parked child.
 #
 # Exit codes: 1 when argv has no usable -g address, 2 when the connection is
 # refused.
@@ -54,5 +56,13 @@ printf '%s\n%s\n' "$token" "$client" >&3
 printf '%s\n' '--- synthetic Lich is active.'
 # ...and a forwarded game chunk starts with 0x1F (037 in octal).
 printf '\037<synthetic-forwarded-line/>\n'
+
+# Then report the first line the game sent, so a `play` run proves the
+# game -> Lich direction really carried something.  The read is bounded so a
+# caller that writes nothing (`hydra serve`, which has no game connection) is
+# not held up for longer than the timeout; a timeout is not an error here.
+if read -r -t 2 game <&3; then
+    printf -- '--- synthetic Lich read %s from the game.\n' "$game"
+fi
 
 exit 0

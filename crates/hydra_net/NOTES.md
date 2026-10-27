@@ -8,6 +8,10 @@ sibling modules that are *not* in the symbol table are named there too:
 `eaccess/handshake.rs`, `eaccess/game.rs`, `live.rs`.
 
 This crate was a **std-only** reconstruction; Phase 1 has put the real crates back.
+Phase 6 added the two modules the `__cstring` paths name but the symbol table does
+not: `eaccess/handshake.rs` (the login itself) and `eaccess/game.rs` (the game
+socket). **A TLS client now lives here** — see §6, which is the only part of
+this file that is not about the recovered binary.
 The original linked `tokio`, `tokio-rustls`, `rustls`, `reqwest`,
 `tokio-tungstenite`, `jiff`, `regex`, `base64` and `url`.  Of those, `tokio`,
 `tokio-tungstenite`, `reqwest`, `jiff`, `regex` and `base64` are reconnected here
@@ -348,6 +352,9 @@ eaccess request/response lines, tab separated:
 password hashing:  out[i] = ((pw[i] - 0x20) ^ key[i]) + 0x20
 ```
 
+The eight-stage login these lines carry is in §6.1; the game socket that
+follows the launch is in §6.2.
+
 Session log layout:
 
 ```
@@ -383,6 +390,12 @@ instead of panicking or deadlocking).  `reqwest`'s `cookies` feature is not
 pinned either, so the session cookie travels as the explicit `Cookie:` header the
 recovered code built.
 
+Phase 6 also added one **direct** dependency, for the login (§6):
+
+| crate | version | why |
+| --- | --- | --- |
+| `rustls` | `=0.23.46`, `default-features = false`, `features = ["ring", "std", "tls12"]` | the eaccess login is a real TLS client. It uses rustls's **synchronous** `ClientConnection` + `StreamOwned` over a `std::net::TcpStream`, so `tokio-rustls` (not in the offline registry) is not needed and the whole handshake stays blocking, like the rest of this crate's recovery. `aws-lc-rs`, rustls's default provider, is not in the registry either, so the `ring` provider is installed explicitly |
+
 `Cargo.lock` was pinned back to `hyper-util 0.1.20` (`cargo update -p hyper-util
 --precise 0.1.20 --offline`): resolving `reqwest` otherwise picked `hyper-util
 0.1.21`, which needs `base64 0.23.1` — not in the offline registry, and not the
@@ -406,11 +419,13 @@ No sibling Hydra crate is a dependency: nothing here needs `hydra_protocol` or
 
 ## 4. Tests
 
-`cargo test -p hydra_net --offline` — 146 tests, all green.  **No test touches the
-network**: every `reqwest` and `tokio-tungstenite` round trip is answered by a
-loopback socket the test itself opened (`http::loopback::serve_once`, a one-shot
-HTTP/1.1 server, or a `tokio::net::TcpListener` running the real
-`tokio_tungstenite::accept_async`).
+`cargo test -p hydra_net --offline` — 163 unit tests and 4 integration tests
+(`tests/login.rs`), all green.  **No test touches the network**: every `reqwest`
+and `tokio-tungstenite` round trip is answered by a loopback socket the test
+itself opened (`http::loopback::serve_once`, a one-shot HTTP/1.1 server, or a
+`tokio::net::TcpListener` running the real `tokio_tungstenite::accept_async`), and
+every TLS round trip is answered by `hydra_mocks::MockEaccess` on `127.0.0.1`
+(§6.4).
 
 The original 117 assertions are all still there:
 
@@ -483,7 +498,10 @@ Added in Phase 1, for what the real crates now provide:
    the struct shape and size are solid.
 2. The exact handshake sequencing (`eaccess/handshake.rs` is not in the symbol
    table; only its literals survive), so the stage order here is inferred from
-   those literals.
+   those literals.  Phase 6 implements the order `SPEC_P6.md` records from a real
+   login (`cert_pin`, `k_response`, `a_response`, `m_response`, `f_response`,
+   `g_response`, `c_response`, `l_response`) — see §6.1; the recovered literals
+   agree, but no capture of this reconstruction's own was taken.
 3. `SkillGoals::cost_of_next` — the per-skill cost table is a static array.
 4. The store's "next available" date parse (month-name and entity tables are
    inlined) — only numeric dates are handled.
@@ -493,3 +511,105 @@ Added in Phase 1, for what the real crates now provide:
 7. `Family::of`'s full phrase list.
 8. `endpoint::other_spelling`'s canonical table (the host/port compares are
    recovered; the rows are not).
+
+---
+
+## 6. Phase 6: the login (`eaccess/handshake.rs`) and the game socket (`eaccess/game.rs`)
+
+The `__cstring` source paths name `crates/hydra-net/src/eaccess/handshake.rs`,
+`…/eaccess/game.rs` and `…/live.rs`, but only `live.rs` is in the symbol table, so
+these two modules are reconstructed from the protocol rather than decompiled.
+Sources for the protocol: `SPEC_P6.md` §1-7 (a real login, structure only — the
+original's own `[login] [stage: …]` progress lines) and
+`https://github.com/elanthia-online/lich-5/blob/cec0f60e/docs/eaccess-protocol-analysis.md`
+for the framing.  Nothing in this section comes from a capture this
+reconstruction made, and **no test has ever talked to `eaccess.play.net`**.
+
+### 6.1 The eight stages
+
+`handshake::login_tls(host, port, &LoginConfig, &mut on_stage)` dials and then
+runs `login_with`, reporting each stage through the callback **before** the
+exchange it names, with the exact names the reference build printed:
+
+| stage (`Stage::name`) | client sends | server answers | what is checked |
+| --- | --- | --- | --- |
+| `cert_pin` | *(nothing)* | the TLS certificate | `eaccess::pin::verify`: missing pin → recorded (first use), different DER → `the eaccess server's certificate CHANGED: …`, and nothing at all has been written yet |
+| `k_response` | `K` | `K\t<key>` | the key is used whole (normally 32 bytes); no echo of it is ever made |
+| `a_response` | `A\t<account>\t<keyed password>` | `A\t<account>\tKEY\t<session key>\t<holder>` | `hash_password(password, key)` — its own short-key refusal (stage `hash`) is kept verbatim; any answer that is not an `A…KEY…` line (`PASSWORD`, `REJECT`, …) is a refusal, and only its *first field* is ever quoted |
+| `m_response` | `M` | `M\t<code>\t<name>\t…` | `(code, name)` pairs from field 1; the game asked for (case insensitive), else `GS3`, else the first offered; a game that is not offered is refused with the codes only |
+| `f_response` | `F\t<game>` | `F\t<NORMAL\|PREMIUM\|FREE\|TRIAL\|INTERNAL>` | `NEW_TO_GAME` and `UNKNOWN` are refusals with a sentence each; the five real tiers are accepted (so is a future word: only those two are refusals) |
+| `g_response` | `G\t<game>` | `G\t<…ROOT=…\tMKTG=…>` | the payload is kept as metadata and never printed |
+| `c_response` | `C` | `C\t<n>\t<n>\t0\t1` then `\t<code>\t<name>` per character | pairs from field **5**; the character is matched case insensitively; an unknown name is refused listing the **names** only (a code can carry the account) |
+| `l_response` | `L\t<code>\tSTORM` | `L\tOK\t…GAMEHOST=…\tGAMEPORT=…\tKEY=…` | `L\tPROBLEM\t<n>` → `refusal::describe_launch_refusal`; otherwise `wire::is_launch_ok` then `wire::parse_launch` for KEY/GAMEHOST/GAMEPORT/GAMECODE.  The line is never echoed: it is where the launch key lives |
+
+The C line is **one** line (`C\tN1\tN2\t0\t1` followed by two fields per
+character) — `wire::resolve_char_code` strides in threes and is *not* used here;
+`handshake::pairs(line, 5)` is.  Note that `hydra_mocks::MockEaccess` answers one
+`M` line per game (the mock's own framing, see its `NOTES.md`), which is
+compatible with the client: one `M` line carrying one pair.
+
+The result is a `handshake::Login`: account, holder, session key, game code and
+name, tier, the `G` metadata, every character, the chosen character and the
+`LaunchOwned` (`key`, `host`, `port`, `code`).  Its `Debug` is written by hand
+(`make_debug_redacted`) and masks the holder, the session key and the launch key;
+refusal messages come from `wire::Refusal` and carry the stage.
+
+### 6.2 TLS: no SNI, and trust on first use
+
+`TlsTransport::dial` connects with `TcpStream::connect((host, port))`, takes the
+**peer address** and builds the `ClientConnection` with
+`ServerName::IpAddress(peer.ip())`, so the ClientHello carries **no SNI** — this
+is what `MockEaccess::sni_seen()` asserts.  The handshake is forced
+(`conn.complete_io`) *before* anything is read.
+
+The certificate verifier (`TrustOnFirstUse`) does not check a chain — eaccess
+presents a self-signed certificate with no name a client could verify, and the
+reference build's trust decision is the pin file — but it *does* verify the
+handshake signature through `rustls::crypto::verify_tls12_signature` /
+`verify_tls13_signature` with `ring::default_provider().signature_verification_algorithms`,
+so a peer cannot present a certificate whose key it does not hold.  The pin
+(`eaccess::pin::verify`, §1.3) is then the whole trust decision: first use records
+`<data dir>/simu.pem`, every later login must present the same DER.
+
+`Transport` is the seam: `read_line`, `write_bytes` (byte-exact, because the keyed
+password is not UTF-8), `write_line` (text convenience over it), `certificate_der`
+and `complete_handshake`.  `login_with` runs the protocol over any
+implementation; `login_tls` is the real one.  I/O failures before the first
+response map to stage `connect`, with a message naming the endpoint and never a
+key.
+
+### 6.3 The game socket
+
+`game::connect(host, port, key)` (and `connect_to(SocketAddr, key)`) dials the
+launch's `GAMEHOST`/`GAMEPORT`, applies `live::configure_game_socket`
+(`TCP_NODELAY`) and writes exactly two lines — the launch `KEY`, then
+`handshake::CLIENT_IDENTIFICATION`
+(`/FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML`) — and flushes.  It returns
+the stream positioned at the game's XML.  Those two lines are the same two lines
+`hydra_lich` hands Lich on the keyed socket (`docs/LICH_WIRE.md` §2), which is why
+`hydra play` can pipe one into the other.  Nothing is printed.
+
+### 6.4 Tests
+
+`cargo test -p hydra_net --offline --test login` (4 tests, all loopback, all
+against `hydra_mocks`, whose certificate is generated at test time; every
+account, character, password and key is `EaccessScript::synthetic`):
+
+* `the_whole_login_runs_and_the_game_socket_opens` — the eight stages in order,
+  the account/game/character/tier/holder/launch as scripted, the pin file equal
+  to `MockEaccess::certificate_der()`, `sni_seen() == false`, the game mock's
+  `received()` equal to `[launch key, CLIENT_IDENTIFICATION]`, the XML byte for
+  byte, and the server's record of the sequence with the `A` line masked
+  (`A\tmain\t<key>`) and no error noted — i.e. no corrupt or wrong `A` line;
+* `a_changed_certificate_is_refused_before_anything_is_sent` — a second mock
+  server's fresh certificate with the same pin path is refused at `cert_pin` with
+  the pin module's `certificate CHANGED` sentence, and the second server's
+  `requests()` is empty (the pin is checked before `K`);
+* `a_wrong_password_is_refused_without_echoing_the_hash` — stage `a_response`,
+  and the refusal contains neither the password nor the script key;
+* `a_short_key_is_refused_by_the_hash_itself` — a 4-byte key and an 18-byte
+  password: stage `hash`, `key (4 bytes) shorter than password (18 bytes)`, and
+  the server never saw an `A` line.
+
+`eaccess::game`'s unit tests cover the two handshake lines (against a loopback
+`TcpListener`), `connect` by host and port, and a closed port being an error.

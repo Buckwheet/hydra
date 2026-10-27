@@ -27,14 +27,16 @@ depends on `hydra_protocol`, `hydra_session`, `hydra_lich`, `hydra_net`,
 `hydra_table`, `hydra_model`, `hydra_board`, `hydra_lookout`, `hydra_import`,
 `hydra_update`, `hydra_gui`, `hydra_ui` and `eframe`/`tokio`.
 
-**Phase 2 scope, updated by Phases 3 and 4.** The crate is recreated with path
-dependencies on `hydra_protocol`, `hydra_session` and `hydra_lich` plus the
+**Phase 2 scope, updated by Phases 3, 4 and 6.** The crate is recreated with
+path dependencies on `hydra_protocol`, `hydra_session` and `hydra_lich` plus the
 workspace-pinned `tokio`, and — since Phase 4 — on `hydra_gui` and `eframe`
-(see §5.1). `hydra gui …` now *builds and opens* the hub window, and `hydra
-play`/`hydra serve` start this character's Lich when `.lich on` is set (§6.4);
-everything that needs the game connection (`hydra_net`, `hydra_table`) or the
-ledger (`hydra_import`, `hydra_ledger`) is still *recognised and reported*,
-never faked — see [Wired vs not](#wired-vs-not).
+(see §5.1), and — since Phase 6 — on `hydra_net` and `hydra_table` (§8.1).
+`hydra gui …` now *builds and opens* the hub window, `hydra play`/`hydra serve`
+start this character's Lich when `.lich on` is set (§6.4), and `hydra login` /
+`hydra play` log in for real — the `hydra_net` eaccess handshake, then the game
+socket (§8.1-8.2). What is still *recognised and reported* rather than faked is
+the resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
+[Wired vs not](#wired-vs-not).
 
 ---
 
@@ -45,7 +47,7 @@ never faked — see [Wired vs not](#wired-vs-not).
 | `src/main.rs` (`0x103e21ab6`) | `hydra::main`, `hydra::started::*`, `hydra::startup::*`, `hydra::replay::*`, `hydra::render::*`, `hydra::status::*`, `hydra::lookout_seed` | `src/main.rs`, `src/started.rs`, `src/startup.rs`, `src/replay.rs`, `src/render.rs`, `src/cli.rs` |
 | `src/gui.rs` (`0x103e21a91`) | `hydra::gui::{run, start_next, seat, game_runtime, stop_on_ctrl_c}` | — (the GUI boundary, §5) |
 | `src/play.rs` (`0x103e21ad3`, `0x103e22b95`) | `hydra::play::{run, supervised}` | `src/session.rs` (the session half) + §6 |
-| `src/connect.rs` (`0x103e21b8d`) | `hydra::connect::{Target::*, game_and_name, run, send}` | — (`hydra_net`/`hydra_table` territory, §6) |
+| `src/connect.rs` (`0x103e21b8d`) | `hydra::connect::{Target::*, game_and_name, run, send}` | `src/login.rs` (the command line, the roster, `hydra_net`'s login and the game socket; §8.1) |
 | `src/rest.rs` (`0x103e22bae`) | `hydra::rest::{doing, watch}` | — (needs `hydra_table`, the web UI) |
 | `src/update.rs` (`0x103e22c3b`) | `hydra::update::{said, keep, fetch}` | — (needs `hydra_update`) |
 | `src/instance.rs` (`0x103e22d78`) | `hydra::instance::{claim, answer}` | — (§5.3, it is the GUI hub's single-instance lock) |
@@ -435,9 +437,11 @@ Facts, for a later pass:
 | `hydra --help`, `--version` | **runs** | additions (§4) |
 | `hydra gui …` | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe; §5.1 |
 | `hydra` (bare hub) | recognised, exit 1 | the same `gui::run` in the binary; deliberately left reporting here (§5.1) |
-| `hydra play …`, `hydra serve …` with `.lich on` | **runs** (the Lich side) | starts Lich with the observed semantics, prints the two recovered start lines, relays Lich's stdout until it exits, exit 0; no game connection exists yet (§6.4) |
-| `hydra play …`, `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character`, and the phase has no game connection (§6.4) |
-| `hydra login …` | recognised, exit 1 | needs the connector (`hydra_table`) and the login (`hydra_net`) |
+| `hydra login <char> [--account A] [--game G]` | **runs** | the real eaccess login (`hydra_net::eaccess::handshake`), then the game socket: the raw XML goes to stdout; §8.1 |
+| `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends; §8.1 |
+| `hydra play …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` — said before anything is dialled |
+| `hydra serve …` with `.lich on` | **runs** (the Lich side only) | starts Lich, prints the two start lines, relays Lich's stdout until it exits; **no login, no game socket** (§8.2) |
+| `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` (§6.4) |
 | `hydra import …` | recognised, exit 1 | needs `hydra_import` + `hydra_ledger` |
 | `hydra lookout seed` | recognised, exit 1 | needs `hydra_table::account::data_dir` + `hydra_net::sink::config` (§5.3) |
 
@@ -448,6 +452,71 @@ reports (`0x10021dffc`). `play`/`serve` with Lich off print
 `hydra <name>: Lich is off for this character, and this headless phase has no
 game connection; it needs …` instead: same channel, same status, and it names
 both missing halves.
+
+### 8.1 The login, and `play` through it (Phase 6)
+
+`src/login.rs` is the binary's half of the login
+(`hydra_net::eaccess::handshake` is the other half; `hydra_net/NOTES.md` §6):
+
+* **The command line.** `hydra login <char>` / `hydra play <char>`, with
+  `--account <account>` and `--game <code>` (the two options the recovered
+  `connect::Target::from_args` at `0x100113c00` compared, 9 and 6 bytes). The
+  first token that is not an option is the character; any other option is
+  refused rather than ignored (`--acount` must not log in as the wrong account).
+  The account defaults to `--account`, else the roster entry for the character
+  (`hydra_table::roster::find`), else the character's own name; the game to
+  `--game`, else that entry's `game_code`, else `GS3`.
+* **The seam.** `HYDRA_EACCESS_HOST` / `HYDRA_EACCESS_PORT` (defaults
+  `eaccess.play.net` / 7910). Every test points them at a loopback
+  `hydra_mocks::MockEaccess`; nothing in the crate resolves a game host by
+  itself.
+* **The data folder** is `hydra_table::account::data_dir()` (`HYDRA_DATA_DIR`,
+  else `data`), created if need be; the certificate pin is
+  `<data folder>/simu.pem`.
+* **The password** is `hydra_session::password::kept(account)` (the environment
+  only, never printed), else `hydra_table::account::password` (the keychain,
+  then the recovered `Password for account {account}: ` prompt). It reaches
+  nothing but `LoginConfig::password`.
+* **The stage lines**, on stderr, once per stage, exactly as the original
+  printed them: `[login] [stage: cert_pin]`, `k_response`, `a_response`,
+  `m_response`, `f_response`, `g_response`, `c_response`, `l_response`, then
+  `[login] [stage: game_connect]` before the game socket. Nothing else about a
+  login is printed: no account holder, no key, no hash, no `G` payload.
+* **`hydra login`** streams the game's raw XML to stdout (`io::copy` until the
+  game closes EOF) and exits 0.
+* **`hydra play`** keeps the Phase 3 gating order *without any network*: Lich
+  off → `lich::off_message`; no folder / no `lich.rbw` / no Ruby → the recovered
+  sentence. Only then: login, `lich::start`, the two start lines, the game
+  socket, and `lich::relay_game`.  (The `off_message` sentence still says the
+  phase has no game connection: it is the Phase 3 text, kept verbatim because
+  `serve` is exactly the command it is still true of, and because the recovered
+  sentences are quoted, not paraphrased.)
+
+### 8.2 What `play` relays, and what `serve` still does not
+
+`lich::relay_game` is the Phase 6 relay (§6.4 is the Lich-only one):
+
+* two reader threads — one over a `try_clone` of the game socket (lines), one
+  over a `try_clone` of Lich's accepted socket (`LichFrame::parse`) — feeding
+  `std::sync::mpsc` channels;
+* one loop: `relay.pump()` + `drain` (Lich's stdout still reaches this process's
+  stdout, 0x1F chunk byte stripped), game lines out through
+  `KeyedRelay::send_game`, Lich frames into the game as `frame.text()` + `\n`
+  (the `<c>` prefix stripped, a bare line unchanged);
+* it stops when the child is gone, the game reaches EOF, or the session stops;
+  then it gives Lich a bounded grace period for its last stdout lines, stops it,
+  shuts both sockets down (which unblocks the readers) and joins them. A write
+  that fails because Lich has already exited is ignored — that is what the fake
+  Ruby in `tests/fixtures/lich_path/ruby` looks like.
+
+`serve` is deliberately still Lich-only: it has no login, no game socket and no
+relay, and no test gives it one.
+
+**Not claimed:** nothing here has been run against a real eaccess server or a
+real game. Every test is a loopback mock (`hydra_mocks`), and the protocol shape
+comes from `SPEC_P6.md` and
+`https://github.com/elanthia-online/lich-5/blob/cec0f60e/docs/eaccess-protocol-analysis.md`,
+not from a capture this reconstruction made.
 
 ## 9. UNKNOWN / not recovered
 

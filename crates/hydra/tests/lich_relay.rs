@@ -9,8 +9,12 @@
 //! Nothing real is involved: `tests/fixtures/lich_path/ruby` is a synthetic
 //! shell script that plays Lich's half of the handshake (`docs/LICH_WIRE.md`
 //! §1-2) with bash's `/dev/tcp` built-in, `lich.rbw` is an empty placeholder,
-//! and every name, id and line of output is invented.  There is no game
-//! connection to make — this is the Lich side only.
+//! and every name, id and line of output is invented.  Since Phase 6 `hydra
+//! play` also logs in for real, so its runs point `HYDRA_EACCESS_HOST`/`PORT` at
+//! `hydra_mocks::MockEaccess` and the launch at `hydra_mocks::MockGame` — both
+//! on `127.0.0.1`, with a certificate generated at test time and a synthetic
+//! password in `HYDRA_PASSWORD_MAIN`.  `hydra serve` is still the Lich side
+//! only: no login, no game socket, so its tests need no mock at all.
 //!
 //! Every wait is bounded: [`WAIT`] caps a whole run, and a run that overruns
 //! fails the test instead of parking it.
@@ -20,6 +24,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use hydra_mocks::{EaccessScript, MockEaccess, MockGame};
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_hydra")
@@ -106,11 +112,21 @@ struct Finished {
 /// Run the binary with `HYDRA_DATA_DIR` and a `PATH` that holds only
 /// `path_dir`, waiting at most [`WAIT`].
 fn run(args: &[&str], data: &TempDir, path_dir: &Path) -> Finished {
-    let mut child: Child = Command::new(binary())
+    run_with(args, data, path_dir, &[])
+}
+
+/// [`run`] with extra environment values (the Phase 6 login seam).
+fn run_with(args: &[&str], data: &TempDir, path_dir: &Path, envs: &[(&str, String)]) -> Finished {
+    let mut command = Command::new(binary());
+    command
         .args(args)
         .env("HYDRA_DATA_DIR", &data.path)
         .env("PATH", path_dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let mut child: Child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -159,13 +175,63 @@ fn start_lines(folder: &Path) -> (String, String) {
     )
 }
 
+/// The synthetic game stream `MockGame` writes for the `play` tests.
+const STREAM: &str = "<settings/>\r\n<room>synthetic</room>\r\n";
+
+/// The environment that points `hydra play` at the two mocks: the loopback
+/// eaccess endpoint and the synthetic account password.  The game socket needs
+/// no variable — the launch the mock answers with already names it.
+fn mocks_for_play(eaccess_port: u16, password: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("HYDRA_EACCESS_HOST", "127.0.0.1".to_string()),
+        ("HYDRA_EACCESS_PORT", eaccess_port.to_string()),
+        ("HYDRA_PASSWORD_MAIN", password.to_string()),
+    ]
+}
+
+/// Start a `MockGame` and a `MockEaccess` whose launch points at it, and return
+/// the environment `play` needs.  Both serve on `127.0.0.1`.
+fn start_mocks() -> (MockGame, MockEaccess, Vec<(&'static str, String)>) {
+    let game = MockGame::start(STREAM).expect("the mock game server starts");
+    let mut script = EaccessScript::synthetic();
+    script.launch.host = "127.0.0.1".to_string();
+    script.launch.port = game.addr().port();
+    let eaccess = MockEaccess::start(script.clone()).expect("the mock eaccess server starts");
+    let envs = mocks_for_play(eaccess.addr().port(), &script.password);
+    (game, eaccess, envs)
+}
+
 #[test]
 fn play_starts_lich_relays_its_stdout_and_exits_cleanly() {
     let (data, folder) = TempDir::with_lich("play");
-    let finished = run(&["play", "Aelith"], &data, &fake_path());
+    let (game, eaccess, envs) = start_mocks();
+    let finished = run_with(
+        &["play", "Aelith", "--account", "main", "--game", "GS3"],
+        &data,
+        &fake_path(),
+        &envs,
+    );
 
     assert_eq!(finished.code, Some(0), "stderr: {}", finished.stderr);
-    assert_eq!(finished.stderr, "");
+
+    // The login said its stages, in order, on stderr — and nothing else.
+    let mut at = 0;
+    for stage in [
+        "[login] [stage: cert_pin]",
+        "[login] [stage: k_response]",
+        "[login] [stage: a_response]",
+        "[login] [stage: m_response]",
+        "[login] [stage: f_response]",
+        "[login] [stage: g_response]",
+        "[login] [stage: c_response]",
+        "[login] [stage: l_response]",
+        "[login] [stage: game_connect]",
+    ] {
+        let found = finished.stderr[at..]
+            .find(stage)
+            .unwrap_or_else(|| panic!("{stage} missing: {}", finished.stderr));
+        at += found + stage.len();
+    }
 
     let (at, starting) = start_lines(&folder);
     assert!(finished.stdout.contains(&at), "{}", finished.stdout);
@@ -187,6 +253,19 @@ fn play_starts_lich_relays_its_stdout_and_exits_cleanly() {
         "the 0x1F chunk byte reached the output: {:?}",
         finished.stdout
     );
+    // The game's first line reached Lich, which read it back: the game -> Lich
+    // direction of the relay really carried something.
+    assert!(
+        finished.stdout.contains("--- synthetic Lich read <settings/> from the game."),
+        "{}",
+        finished.stdout
+    );
+
+    // The login itself carried the two handshake lines to the game.
+    assert_eq!(game.received().len(), 2, "{:?}", game.received());
+    assert!(!eaccess.sni_seen());
+    eaccess.join().expect("the mock eaccess server ends cleanly");
+    game.join().expect("the mock game server ends cleanly");
 }
 
 #[test]

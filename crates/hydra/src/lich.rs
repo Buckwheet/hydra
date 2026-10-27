@@ -34,21 +34,28 @@
 //! `lich.rbw` in it (`<dir> has no lich.rbw in it`), or no Ruby
 //! (`Lich needs Ruby, …`).
 //!
-//! # What this does *not* do
+//! # Two relays
 //!
-//! There is no game connection here (Phase 3 is the Lich side only): nothing is
-//! written to the accepted socket, and Lich's own commands
-//! (`<c>`-prefixed and bare lines) are not read back.  Lich's stdout is relayed
-//! to this process's stdout with the 0x1F chunk byte stripped
-//! ([`hydra_lich::wire::LichOut`]) until Lich exits or the session stops.
+//! * [`relay`] is the Lich-only relay `hydra serve` still uses: Lich's stdout is
+//!   relayed to this process's stdout with the 0x1F chunk byte stripped
+//!   ([`hydra_lich::wire::LichOut`]) until Lich exits or the session stops, and
+//!   nothing is written to the accepted socket or read back from it.
+//! * [`relay_game`] is the whole session `hydra play` runs once a real login has
+//!   named the game socket: the game's lines go to Lich, Lich's frames go to the
+//!   game, and Lich's stdout still reaches this process's stdout.  See its own
+//!   documentation for what ends it.
 
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use hydra_lich::{find_ruby, start_keyed_minted, KeyedRelay, Launch, LichOut};
+use hydra_lich::{find_ruby, start_keyed_minted, KeyedRelay, Launch, LichFrame, LichOut};
 use hydra_session::command::SessionHandle;
 use hydra_session::lich_command::{
     has_no_lich_rbw, lich_at_for_every_character, lich_starting, script_path, LichSettings,
@@ -194,6 +201,169 @@ pub fn relay(
             return Ok(keyed.relay.status());
         }
     }
+}
+
+/// How long [`relay_game`] lets Lich's last stdout lines arrive after the game
+/// has gone before it stops the child.
+const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
+
+/// Relay a real game connection and this session's Lich to each other until one
+/// of them ends.
+///
+/// This is the last hop of `hydra play`: the login named the game socket
+/// ([`hydra_net::eaccess::game::connect`]) and Lich has already connected back
+/// on the keyed socket ([`start`]).  Two reader threads feed channels — one over
+/// a clone of the game socket (line by line), one over a clone of Lich's socket
+/// ([`LichFrame`], so a `<c>` command and a bare line stay distinguishable) —
+/// and the loop below moves what is pending each way while Lich's stdout is
+/// still printed through [`drain`]:
+///
+/// * game → Lich: [`KeyedRelay::send_game`], one line at a time;
+/// * Lich → game: [`LichFrame::text`] (the `<c>` prefix stripped, a bare line
+///   unchanged) + `\n`, flushed.
+///
+/// It stops when the child is gone, the game reaches EOF, or the session stops
+/// ([`SessionHandle::stopping`]); then it stops Lich, shuts both sockets down
+/// (which is what unblocks the reader threads) and joins them.  A write that
+/// fails because the other side has already closed is *not* an error: that is
+/// what a Lich that exits immediately looks like.
+pub fn relay_game(
+    keyed: &mut KeyedRelay,
+    game: &mut TcpStream,
+    out: &mut dyn Write,
+    session: &SessionHandle,
+) -> io::Result<()> {
+    // The keyed accept left a 60-second read timeout on Lich's socket, and this
+    // loop reads for as long as the session lasts: clear it on both sockets.
+    let _ = keyed.socket.set_read_timeout(None);
+    let _ = game.set_read_timeout(None);
+
+    let (game_sender, game_lines) = mpsc::channel::<String>();
+    let game_socket = game.try_clone()?;
+    let game_reader = thread::Builder::new()
+        .name("hydra-game-reader".to_string())
+        .spawn(move || read_into(game_socket, game_sender, |line| line))?;
+
+    let (lich_sender, lich_frames) = mpsc::channel::<LichFrame>();
+    let lich_socket = keyed.socket.try_clone()?;
+    let lich_reader = thread::Builder::new()
+        .name("hydra-lich-reader".to_string())
+        .spawn(move || read_into(lich_socket, lich_sender, |line| LichFrame::parse(&line)))?;
+
+    let mut printed = 0usize;
+    let mut game_open = true;
+    let mut lich_open = true;
+    let outcome = loop {
+        if session.stopping() {
+            break Ok(());
+        }
+        let alive = match keyed.relay.pump() {
+            Ok(alive) => alive,
+            Err(error) => break Err(error),
+        };
+        if let Err(error) = drain(keyed, out, &mut printed) {
+            break Err(error);
+        }
+        // game -> Lich
+        loop {
+            match game_lines.try_recv() {
+                Ok(line) => {
+                    let _ = keyed.send_game(&line);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    game_open = false;
+                    break;
+                }
+            }
+        }
+        // Lich -> game.  A Lich that has closed its socket is not a reason to
+        // stop on its own: the child's exit shows up in `pump`, and its stdout
+        // may still be arriving.
+        loop {
+            if !lich_open {
+                break;
+            }
+            match lich_frames.try_recv() {
+                Ok(frame) => {
+                    let _ = write_game_line(game, &frame);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    lich_open = false;
+                    break;
+                }
+            }
+        }
+        if !alive || !game_open {
+            break Ok(());
+        }
+    };
+
+    // Teardown.  Lich may still have stdout in flight, so give it a bounded
+    // grace period before the child is stopped (pump drains what has arrived).
+    if outcome.is_ok() && keyed.relay.status().is_none() {
+        let deadline = Instant::now() + TEARDOWN_GRACE;
+        while keyed.relay.status().is_none() && Instant::now() < deadline {
+            match keyed.relay.pump() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => break,
+            }
+            // A stdout write that fails here ends the grace period; the child
+            // is stopped below either way.
+            if drain(keyed, out, &mut printed).is_err() {
+                break;
+            }
+        }
+    }
+    let _ = keyed.relay.stop();
+    let _ = drain(keyed, out, &mut printed);
+    let _ = keyed.socket.shutdown(Shutdown::Both);
+    let _ = game.shutdown(Shutdown::Both);
+    let _ = game_reader.join();
+    let _ = lich_reader.join();
+    outcome
+}
+
+/// Read CRLF-stripped lines from `socket` into `sender` until EOF, mapping each
+/// line with `map` (a plain game line, or a parsed [`LichFrame`]).
+fn read_into<T: Send + 'static>(
+    socket: TcpStream,
+    sender: mpsc::Sender<T>,
+    map: impl Fn(String) -> T,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(socket);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(_) => {
+                while bytes.last() == Some(&b'\n') || bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+                let line = String::from_utf8_lossy(&bytes).into_owned();
+                if sender.send(map(line)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Write one Lich frame to the game socket: the `<c>` prefix stripped, the bare
+/// line unchanged, then a newline and a flush.
+fn write_game_line(game: &mut TcpStream, frame: &LichFrame) -> io::Result<()> {
+    let text = frame.text();
+    if text.is_empty() {
+        return Ok(());
+    }
+    game.write_all(text.as_bytes())?;
+    game.write_all(b"\n")?;
+    game.flush()
 }
 
 /// Print the relay's stdout lines this call has not printed yet.

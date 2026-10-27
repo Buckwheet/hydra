@@ -236,13 +236,10 @@ fn the_unwired_subcommands_say_what_they_still_need() {
     // `the_gui_subcommand_builds_the_recovered_hub_window` asserts the built
     // plan (`"Hydra"`, 660 × 520, wgpu) without launching it.  `play` and
     // `serve` are wired since Phase 3 (the Lich side); they are covered by
-    // `play_and_serve_say_that_lich_is_off` and `tests/lich_relay.rs`.
-    for args in [
-        &[][..],
-        &["login", "Aelith"][..],
-        &["import", "x.bytes"][..],
-        &["lookout", "seed"][..],
-    ] {
+    // `play_and_serve_say_that_lich_is_off` and `tests/lich_relay.rs`.  `login`
+    // is wired since Phase 6 (the real game login) and is covered end to end by
+    // `tests/login.rs`, so it is no longer in this list.
+    for args in [&[][..], &["import", "x.bytes"][..], &["lookout", "seed"][..]] {
         let output = run(args);
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         let err = stderr(&output);

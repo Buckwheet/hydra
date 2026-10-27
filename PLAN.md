@@ -46,3 +46,34 @@ single-instance/session plumbing.
 
 ## Phase 5: improvements
 Backlog is the user to define; start by listing the pain points in Hydra, then one issue/spec per change.
+
+## Phase 6: real game login (done)
+
+The login is real and `hydra` is a game client for the first time, though only
+ever against loopback mocks — nothing here has been run against `eaccess.play.net`
+or a live game.
+  * `hydra_mocks` (test-only): a real-`rustls` scripted eaccess server with a
+    certificate generated at test time, and a game server that reads the two-line
+    handshake and writes a synthetic XML stream. Both on `127.0.0.1:0`.
+  * `hydra_net::eaccess::handshake`: the eight stages (`cert_pin`, `k_response`,
+    `a_response`, `m_response`, `f_response`, `g_response`, `c_response`,
+    `l_response`), each named as the original printed it, over a synchronous
+    `rustls` client that sends **no SNI**. Trust is trust-on-first-use: the first
+    certificate is recorded in `<data dir>/simu.pem` and a *changed* one is
+    refused before a single byte of the login is sent. The password is keyed with
+    the server's key (`hash_password`, short-key refusal kept) and no key, hash
+    or holder name is ever printed.
+  * `hydra_net::eaccess::game`: the game socket — the launch `KEY` then
+    `/FE:WRAYTH /VERSION:1.0.1.28 /P:WIN_UNKNOWN /XML`, then the XML stream.
+  * `hydra login <char> [--account A] [--game G]` streams the raw XML on stdout;
+    `hydra play` keeps Phase 3's Lich gating (off / no folder / no `lich.rbw` / no
+    Ruby are reported with no network at all), then logs in, starts Lich, says
+    the two recovered start lines, opens the game and relays both ways
+    (`lich::relay_game`). `serve` is still Lich-only. `HYDRA_EACCESS_HOST`/`_PORT`
+    are the test seam; the data folder, roster and password come from
+    `hydra_table`/`hydra_session`.
+  * Tests: the full happy path, a changed-certificate refusal, a wrong password and
+    the short-key refusal in `crates/hydra_net/tests/login.rs`, and the binary end
+    to end (stage lines in order, XML byte for byte, pin recorded, changed
+    certificate refused) in `crates/hydra/tests/login.rs` plus the updated
+    `tests/lich_relay.rs`. All loopback, all bounded.

@@ -8,8 +8,15 @@ Hydra's SQLite-backed ledger: pulses, snapshots, the `names` interning table, th
 thread that owns the database.
 
 Status: `cargo check -p hydra_ledger` and `cargo test -p hydra_ledger` pass
-(**40 tests**); `grep -rn 'todo!()\|unimplemented!()' crates/hydra_ledger/src` is
+(**51 tests**); `grep -rn 'todo!()\|unimplemented!()' crates/hydra_ledger/src` is
 empty.
+
+**Phase 1 (dependency reconnection):** `rusqlite` 0.37.0 (`bundled`) and
+`tokio` 1.53.1 (`full`) are back, so this is a real SQLite `hydra.db` again —
+the three recovered batches migrate it, the readers run the recovered `SELECT`s
+through rusqlite's statement cache, and the writer is the recovered
+`tokio::sync::mpsc` + `oneshot` pipeline behind a blocking façade. §6 records
+what was a stand-in and is now real, and what is still a departure.
 
 ---
 
@@ -422,27 +429,70 @@ in `Writer::dropped()`.
 
 ---
 
-## 6. `std`-only departures
+## 6. Dependencies: reconnected (Phase 1), and what is still a departure
 
-| original | recovered use | what this build does |
+### 6.1 Reconnected
+
+| departure (pre-Phase-1) | original | now |
 |---|---|---|
-| `rusqlite` (`Connection`, `Statement`, `StatementCache`, `query_row`, `query_map`, `execute`, `execute_batch`, `pragma_update`, `busy_timeout`, `Transaction`) | every read and write in the crate | [`store::Connection`]: the recovered schema as typed row vectors, every recovered statement as a typed operation, and the SQL text kept verbatim in `src/schema.rs` beside each operation. There is **no SQL engine** — statements are dispatched by identity (`Connection::execute_batch`), never parsed, and an unknown text is an `Error::Unsupported` rather than a silent no-op. |
-| `rusqlite::Error` (`Display` into the caller's text) | `Ledger::connect`/`reader`/`note_import`/`prune_pulses`, `Writer` | [`Error`] with `Sqlite`/`Io`/`Message`/`ReadOnly`/`Unsupported`/`Constraint` arms; `Display` is what the original prints. |
-| the SQLite file `hydra.db` | `path_in`, `connect` | **not reproduced.** No SQLite file format is read or written. `Connection::commit`/the auto-commit path write a documented line format (`store.rs`, `hydra-ledger <version>` header, `\t` separated with `\\`,`\t`,`\n`,`\r` escaped, empty field = `NULL`). A real `hydra.db` is *refused*, not mis-parsed: `Connection::open` rejects a file whose first record is not the header, and `ledger::is_this_builds_store` answers the question explicitly. A tiny SQLite reader/writer was judged out of scope. |
-| SQLite's auto-commit | every `execute` | every mutating `store::Connection` method persists when the connection is file-backed, so a row written by one `Ledger::connect` is visible to the next — the behaviour the crate's own call pattern (open, write, drop) relies on. `commit()` is only the explicit end of a transaction (`migrate`, the writer's batch). |
-| `tokio::sync::mpsc::channel(1024)` + `try_send` | `Ledger::writer`, `Writer::try_record` | `std::sync::mpsc::sync_channel(1024)` — same bound, same full/closed distinction. |
-| `tokio::sync::oneshot` for the flush ack | `Sent`'s second variant | a zero-capacity `std::sync::mpsc::sync_channel`. |
-| `async fn record` / `async fn flush` | `Writer::record`/`flush` | blocking. |
-| `std::thread::Builder::spawn_unchecked` | `Ledger::writer` | `Builder::spawn` (same name, `hydra-ledger`). The `format!("ledger thread: {}")` error text is kept. |
-| `hydration` of `PRAGMA journal_mode = WAL` / `synchronous = NORMAL` | `connect` | recorded in the docs; nothing to do without SQLite. |
+| `store::Connection` as typed row vectors over `Db`, statements dispatched by identity, unknown text → `Error::Unsupported` | `rusqlite` (`Connection`, `Statement`/`CachedStatement`, `StatementCache`, `query_row`, `query_map`, `execute`, `execute_batch`, `pragma_update`, `busy_timeout`, `Transaction`) | **`rusqlite` 0.37.0, `bundled`.** `store::Connection` wraps a real `rusqlite::Connection`. `Connection::open` is the recovered `Ledger::connect` body: the `0x8001`/`0x8006` open flags, `busy_timeout(5 s)`, and — writable only — `pragma_update(None, "journal_mode", "WAL")` + `pragma_update(None, "synchronous", "NORMAL")`. `migrate` opens a `Transaction` per step (`unchecked_transaction` = `BEGIN DEFERRED`, the recovered text), `execute_batch`es the batch, `pragma_update`s `user_version` and commits. Readers `prepare_cached` their recovered SQL (rusqlite's `StatementCache`, the cache the binary keeps at connection `+0x20`), `query_map`/`query_row` the rows, and `Reader::hunt_overlapping` consumes `query_map(...).next().transpose()`. The writer's four `INSERT`s go through `execute` inside one `Transaction` per batch. |
+| a `hydra-ledger` line file pretending to be the store | the SQLite file `hydra.db` | **a real SQLite database.** WAL, `synchronous = NORMAL`, `user_version` 0 → 3, and the recovered tables/indexes/views created by the recovered batches. A pre-Phase-1 line file is now simply a file that is not a database: `Connection::open` refuses it (the `journal_mode` pragma makes SQLite read the header) and `is_this_builds_store` answers `false`. |
+| `std::sync::mpsc::sync_channel(1024)` + `try_send` | `tokio::sync::mpsc::channel(1024)` | **`tokio` 1.53.1, `full`.** `Writer` holds a `tokio::sync::mpsc::Sender<Sent>`; `try_record` is the recovered `try_send` (`false` only for `TrySendError::Closed`, `true` for queued *and* for full, drops counted in `Writer::dropped`). |
+| a zero-capacity `std::sync::mpsc::sync_channel` for the flush ack | `tokio::sync::oneshot` | **`tokio::sync::oneshot`**: `Sent::Flush(oneshot::Sender<()>)`, answered after the batch is committed. |
+| blocking `record`/`flush` | `async fn record` / `async fn flush` | **`record_async`/`flush_async`** are the recovered async functions (`tx.send(..).await`, then `ack.await`); `record`/`flush` remain as blocking wrappers for synchronous siblings, driving the future on this crate's tokio runtime (`src/runtime.rs`, the same seam `hydra_lich` uses). |
+| nothing (no SQLite to configure) | `PRAGMA journal_mode = WAL`, `synchronous = NORMAL` | applied by `Connection::open` for writable connections and asserted by a test (`journal_mode` = `wal`, `synchronous` = 1, `busy_timeout` = 5000 ms). |
 
-### What this build cannot do
+### 6.2 Kept, with the reason
 
-* open a real `hydra.db` (no SQLite file format);
-* run SQL that is not one of the recovered statements;
-* share one database between two live connections other than through the file
-  (each `Connection` holds its own row vectors; writes are persisted, so a later
-  connection sees them, but two *open* connections do not see each other's).
+| item | why |
+|---|---|
+| `std::thread::Builder::spawn` (not `spawn_unchecked`) | `spawn_unchecked` is unsafe and buys nothing here; the thread is still named `hydra-ledger` and a failed spawn still produces the recovered `format!("ledger thread: {}", io_error)`. The thread's body drives `tokio`'s `writer::run_async`. |
+| `store::Db` and `Connection::db()` | not a recovered type — the binary has none. Kept because the crate's tests (and, in principle, a sibling) express expectations as `conn.db().pulses.len()`. It is now a **view**: `db()` runs `SELECT {recovered column list}, id FROM … ORDER BY id` over every table on each call, so it mirrors SQLite and can never be stale. It is not used by `Reader` any more. |
+| `Connection::open` creating the parent directory | SQLite answers `SQLITE_CANTOPEN` for a missing directory; the original relied on `Ledger::open`'s `create_dir_all`. Doing it here too keeps `Ledger::writing()`/`Ledger::writer()` usable on a fresh directory, which is what the writer tests (and `hydra`'s startup order) rely on. |
+| `Error::Unsupported` | kept so the public enum stays source-compatible, but **nothing produces it now**: there is a SQL engine, so a bad statement is `Error::Sqlite`. |
+| `Connection::commit()` | every statement is in auto-commit, so there is nothing left to flush; it stays because `Ledger::{open, prune_pulses, note_import}` call it. |
+| `Stamp`'s two unnamed fields, `Reward`'s string offsets, `migrate`'s `BEGIN` byte, the writer's batching rule | still unknown (§5.2–§5.5); no dependency change affects them. |
+
+### 6.3 Not pinned
+
+No crate outside the workspace pins was needed: `rusqlite` 0.37.0 and
+`tokio` 1.53.1 are both in the root `[workspace.dependencies]`, and `rusqlite`'s
+`bundled` feature compiles SQLite from the amalgamation in `libsqlite3-sys`
+0.35.0 offline. Nothing was substituted.
+
+### 6.4 API changes for the parent
+
+Source-compatible for the crate's own callers, with these removals/changes:
+
+* **removed** `Connection::save_to` (the line-format writer) — it existed only
+  for the stand-in;
+* **changed** `Connection::execute_batch`: it now runs whatever SQL it is
+  given, so it no longer refuses unknown text;
+* **changed** `is_this_builds_store`: answers for SQLite's header
+  (`"SQLite format 3\0"`) instead of the old `hydra-ledger` header. Any SQLite
+  database answers `true`; `migrate` is what refuses `user_version > 3`;
+* **changed** `writer::Sent::Flush` now carries a `tokio::sync::oneshot::Sender`,
+  and `writer::run` takes a `tokio::sync::mpsc::Receiver<Sent>`;
+* **added** `Connection::raw()`, `Connection::try_user_version()`,
+  `Writer::{record_async, flush_async}`, `writer::run_async`,
+  `schema::STORE_VISIT_COLUMNS`, and `impl From<rusqlite::Error> for Error`;
+* `Writer::{try_record, record, flush, dropped, close}`, the row types, the
+  `Reader` methods and `Ledger::{connect, path_in, writing, reader, writer,
+  note_import, prune_pulses, open}` are unchanged in signature.
+
+**Precondition worth knowing:** `Ledger::connect` does not migrate (the binary
+opens the ledger with `Ledger::open`, which does). A `Writer` or an `insert_*`
+on an unmigrated database now fails with SQLite's `no such table` — the writer
+swallows it (a lost row, like the recovered `run`), so anything that starts a
+writer must `Ledger::open` first. The crate's tests were adjusted to do that.
+
+### 6.5 What this build still cannot do
+
+* open a ledger written by the pre-Phase-1 stand-in (the `hydra-ledger` line
+  file). It is not a SQLite database and is refused; the real `hydra.db` — the
+  one the binary wrote — is the format this build reads.
+* recover the four unknowns listed in §6.2 (they need more disassembly, not
+  another dependency).
 
 ---
 

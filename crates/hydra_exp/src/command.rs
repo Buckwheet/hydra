@@ -12,10 +12,11 @@
 //!
 //! `read` and `answer` both open the ledger (`hydra_ledger::Ledger::reader`),
 //! map a `rusqlite::error::Error` to its `Display` text (tag `1`) and otherwise
-//! dispatch on the byte at `&Parsed + 0` through a nine-entry jump table at
-//! `0x10240cff0`. The original read its rows through `hydra_ledger::reader`;
-//! that crate is still a stub, so this build takes a [`Source`] instead (see
-//! `NOTES.md` for the departure).
+//! dispatch on the byte at `&Parsed + 0` — `read` through the ten-entry jump
+//! table at `0x10240cff0`, `answer` through a chain of compares for the four
+//! mutating variants and a `bl read` for everything else. The original read its
+//! rows through `hydra_ledger::reader`; that crate is still a stub, so this
+//! build takes a [`Source`] instead (see `NOTES.md` for the departure).
 
 use hydra_net::eastern;
 
@@ -37,17 +38,20 @@ pub trait Source {
     fn latest_snapshots(&self) -> Result<Vec<Snapshot>, String>;
     /// Snapshots of one kind in `[from, to]` (`Reader::snapshots`).
     fn snapshots(&self, which: u8, from: i64, to: i64) -> Result<Vec<Snapshot>, String>;
-    /// Append a pulse (`exp addgain`).
-    fn add_pulse(&mut self, pulse: Pulse) -> Result<(), String>;
-    /// Drop rows that gained nothing (`exp clean`).
-    fn clean(&mut self) -> Result<usize, String>;
-    /// Delete every row of this character (`exp reset`).
-    fn reset(&mut self) -> Result<usize, String>;
+    /// Append a pulse (`hydra_ledger::writer::Writer::try_record`,
+    /// `0x10169398c`); the error is the writer's `Closed` `Display` text.
+    fn try_record(&mut self, pulse: Pulse) -> Result<(), String>;
+    /// `hydra_ledger::Ledger::prune_pulses(drop_all)` (`0x10168e4ec`): with
+    /// `false` it drops the rows that gained nothing, with `true` every row of
+    /// this character. Returns how many rows went.
+    fn prune_pulses(&mut self, drop_all: bool) -> Result<usize, String>;
 }
 
-/// What `exp <text>` means. The binary's `Parsed` is 24 bytes and `read`
-/// dispatches on nine discriminants; the variants below cover the twelve help
-/// lines (`0x10442dc00`) and the report calls that were recovered.
+/// What `exp <text>` means. The binary's `Parsed` is 24 bytes: `read`
+/// dispatches on ten discriminants (`0x0`…`0x9`) and `answer` on four more
+/// (`0xa` `addgain`, `0xb` `clean`, `0xc` `reset`, `0xd` `confirm_reset`).
+/// The variants below cover the twelve help lines (`0x10442dc00`) and every
+/// report call that was recovered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parsed {
     /// `exp` alone / `exp help`: the twelve usage lines.
@@ -85,8 +89,10 @@ pub enum Parsed {
     AddGain(i64),
     /// `exp clean`.
     Clean,
-    /// `exp reset`.
+    /// `exp reset` — only asks; it prints the confirmation prompt.
     Reset,
+    /// `exp confirm_reset` — the second step `reset` asks for.
+    ConfirmReset,
 }
 
 /// What a command produces: either one line to print, or a report.
@@ -172,6 +178,7 @@ pub fn parse(rest: &str, now: i64) -> Result<Parsed, String> {
         },
         "clean" => Parsed::Clean,
         "reset" => Parsed::Reset,
+        "confirm_reset" => Parsed::ConfirmReset,
         "help" => Parsed::Help,
         _ => return Err(format!("{} is not an experience report.", word)),
     };
@@ -338,21 +345,25 @@ pub fn read(src: &dyn Source, who: &Who, parsed: &Parsed, now: i64) -> Reply {
     match parsed {
         Parsed::Help => Reply::Lines(HELP.iter().map(|line| line.to_string()).collect()),
         Parsed::Snapshots { which } => {
-            // The binary fetches `latest_snapshots()` (0x10168c174) *and*
-            // `snapshots(which, since, until)` (0x10168cdac); only the window is
-            // used to build the lines.
-            let snaps = match src.snapshots(*which, midnight, i64::MAX) {
+            // The binary fetches `latest_snapshots()` (0x10168c174) for the
+            // "as of" rows and `snapshots(which, since, until)`
+            // (0x10168cdac) for today's movement.
+            let latest = match src.latest_snapshots() {
                 Ok(snaps) => snaps,
                 Err(message) => return Reply::Say(message),
             };
-            Reply::Lines(report::snapshots(*which, &snaps, midnight, now))
+            let today = match src.snapshots(*which, midnight, i64::MAX) {
+                Ok(snaps) => snaps,
+                Err(message) => return Reply::Say(message),
+            };
+            Reply::Lines(report::snapshots(*which, &latest, &today))
         }
         // The three mutating commands are `answer`'s business (the binary's
         // `read` never sees them: they carry a 24-byte payload of their own);
         // showing the usage line is the safest answer here.
         Parsed::AddGain(_) => Reply::Lines(vec![HELP[9].to_string()]),
         Parsed::Clean => Reply::Lines(vec![HELP[10].to_string()]),
-        Parsed::Reset => Reply::Lines(vec![HELP[10].to_string()]),
+        Parsed::Reset | Parsed::ConfirmReset => Reply::Lines(vec![HELP[10].to_string()]),
         _ => {
             let fetched = match parsed {
                 Parsed::Session => src.pulses_between(now - 86_400, i64::MAX),
@@ -406,40 +417,68 @@ pub fn read(src: &dyn Source, who: &Who, parsed: &Parsed, now: i64) -> Reply {
 }
 
 /// `command::answer(src, who, parsed, now) -> Reply` — `@0x1012cc990`
-/// (**unknown** beyond the entry contract).
+/// (**full**).
 ///
-/// The binary's body is 33 KB: it opens the ledger reader exactly like `read`
-/// (`hydra_ledger::Ledger::reader`, tag `3` = the `rusqlite` error, whose
-/// `Display` text goes into the `String` variant), takes five arguments (`x1`…
-/// `x4` live across the dispatch and `x4` is the same "now" `run` passes) and
-/// returns the same 32-byte tagged value.
+/// A second dispatcher that `run` does not use: it opens the ledger reader
+/// (`hydra_ledger::Ledger::reader`, tag `3` = the `rusqlite` error) and then
+/// switches on the *same* `Parsed` discriminant (`ldrb w8, [x24]`) for the four
+/// mutating commands; everything else falls through to [`read`]
+/// (`0x1012cb42c`, the `bl` at `0x1012ccc10`). The four arms, verbatim:
 ///
-/// `// UNKNOWN:` which commands it handles and what it prints. The help table
-/// says `exp clean` and `exp reset` "ask first", which needs a second step and
-/// therefore a dispatcher besides `read`; this build performs the three
-/// mutating commands through [`Source`] and prints nothing on success, because
-/// the confirmation text is not in the binary's recoverable literals.
+/// * `addgain n` — `Reader::last_pulses(1)` for the current absorbed figures
+///   (`Pulse + 0xa0`/`+0xa8`, zero when there is no row yet: the cold block at
+///   `0x1012cce7c` sets both to 0), then a fresh row
+///   `{ at: now, exp, axp, exp_gained: n, axp_gained: 0, bonus: 0, source: 4 }`
+///   (`strb w8, #0x4` at `+0xc8` — source `manual`) through
+///   `Writer::try_record`. Reply: `Added an experience gain of {n} by hand.`
+///   (`0x103e647ac`), or the writer's `Closed` text.
+/// * `clean` — `prune_pulses(false)`; reply
+///   `Dropped {n} rows with no experience gained.` (`0x103e647d5`).
+/// * `reset` — no write at all: the two-line prompt
+///   `This drops every experience row of this character's, for good.`
+///   (`0x10240d4b4`, 62 B) and `To go on, say: exp confirm_reset`
+///   (`0x10240d4f2`, 32 B).
+/// * `confirm_reset` — `prune_pulses(true)`; reply
+///   `Dropped {n} rows; the next bar starts over.` (`0x103e64801`).
 pub fn answer(src: &mut dyn Source, who: &Who, parsed: &Parsed, now: i64) -> Reply {
-    let _ = who;
     match parsed {
         Parsed::AddGain(gain) => {
+            let latest = src.last_pulses(1).unwrap_or_default();
+            let (exp, axp) = match latest.first() {
+                Some(pulse) => (pulse.exp, pulse.axp),
+                None => (0, 0),
+            };
             let pulse = Pulse {
                 at: now,
+                exp,
+                axp,
                 exp_gained: *gain,
+                axp_gained: 0,
+                bonus: 0,
                 source: PulseSource::Manual,
                 ..Pulse::default()
             };
-            match src.add_pulse(pulse) {
-                Ok(()) => Reply::Lines(Vec::new()),
+            match src.try_record(pulse) {
+                Ok(()) => Reply::Say(format!("Added an experience gain of {} by hand.", gain)),
                 Err(message) => Reply::Say(message),
             }
         }
-        Parsed::Clean => match src.clean() {
-            Ok(_) => Reply::Lines(Vec::new()),
+        Parsed::Clean => match src.prune_pulses(false) {
+            Ok(dropped) => Reply::Say(format!(
+                "Dropped {} rows with no experience gained.",
+                dropped
+            )),
             Err(message) => Reply::Say(message),
         },
-        Parsed::Reset => match src.reset() {
-            Ok(_) => Reply::Lines(Vec::new()),
+        Parsed::Reset => Reply::Lines(vec![
+            "This drops every experience row of this character's, for good.".to_string(),
+            "To go on, say: exp confirm_reset".to_string(),
+        ]),
+        Parsed::ConfirmReset => match src.prune_pulses(true) {
+            Ok(dropped) => Reply::Say(format!(
+                "Dropped {} rows; the next bar starts over.",
+                dropped
+            )),
             Err(message) => Reply::Say(message),
         },
         other => read(src, who, other, now),
@@ -483,14 +522,18 @@ mod tests {
             let _ = (which, from, to);
             Ok(self.snaps.clone())
         }
-        fn add_pulse(&mut self, _pulse: Pulse) -> Result<(), String> {
+        fn try_record(&mut self, pulse: Pulse) -> Result<(), String> {
+            self.pulses.push(pulse);
             Ok(())
         }
-        fn clean(&mut self) -> Result<usize, String> {
-            Ok(0)
-        }
-        fn reset(&mut self) -> Result<usize, String> {
-            Ok(0)
+        fn prune_pulses(&mut self, drop_all: bool) -> Result<usize, String> {
+            let before = self.pulses.len();
+            if drop_all {
+                self.pulses.clear();
+            } else {
+                self.pulses.retain(|p| p.exp_gained != 0);
+            }
+            Ok(before - self.pulses.len())
         }
     }
 
@@ -545,6 +588,54 @@ mod tests {
         );
         // "exp" alone prints the help.
         assert_eq!(run(&src, &who, ".exp", T), Reply::Say(HELP.join("\n")));
+    }
+
+    #[test]
+    fn answer_records_a_manual_gain_on_top_of_the_latest_row() {
+        let mut src = Fake {
+            pulses: vec![Pulse {
+                at: T - 60,
+                exp: 1_000,
+                axp: 44,
+                exp_gained: 100,
+                ..Pulse::default()
+            }],
+            ..Fake::default()
+        };
+        let who = Who::new("Sindar");
+        assert_eq!(
+            answer(&mut src, &who, &Parsed::AddGain(500), T),
+            Reply::Say("Added an experience gain of 500 by hand.".to_string())
+        );
+        let recorded = src.pulses.last().expect("a row");
+        assert_eq!(recorded.at, T);
+        assert_eq!(recorded.exp, 1_000);
+        assert_eq!(recorded.axp, 44);
+        assert_eq!(recorded.exp_gained, 500);
+        assert_eq!(recorded.axp_gained, 0);
+        assert_eq!(recorded.source, PulseSource::Manual);
+    }
+
+    #[test]
+    fn answer_asks_before_resetting() {
+        let mut src = Fake::default();
+        let who = Who::new("Sindar");
+        assert_eq!(
+            answer(&mut src, &who, &Parsed::Reset, T),
+            Reply::Lines(vec![
+                "This drops every experience row of this character's, for good.".to_string(),
+                "To go on, say: exp confirm_reset".to_string(),
+            ])
+        );
+        assert_eq!(
+            answer(&mut src, &who, &Parsed::Clean, T),
+            Reply::Say("Dropped 0 rows with no experience gained.".to_string())
+        );
+        assert_eq!(
+            answer(&mut src, &who, &Parsed::ConfirmReset, T),
+            Reply::Say("Dropped 0 rows; the next bar starts over.".to_string())
+        );
+        assert_eq!(parse("confirm_reset", T), Ok(Parsed::ConfirmReset));
     }
 
     #[test]

@@ -89,25 +89,37 @@ pub struct Pulse {
     pub source: Source,
 }
 
-/// One snapshot reading (`hydra_ledger::row::Snapshot`, 144 bytes).
+/// One snapshot reading (`hydra_ledger::row::Snapshot`, 144 bytes, stride
+/// `0x90`).
 ///
-/// Only four offsets are established: `+0x10` and `+0x20` hold `Option` tags
-/// (each compared against `1`), `+0x60` holds an `Option<String>` (capacity word
-/// `isize::MIN` = `None`) and `+0x80` holds the unix timestamp handed to
-/// `report::stamp`. Which of the two tagged values is "weekly" and which is
-/// "total" is `// UNKNOWN:` — [`Snapshot::weekly`] is the `+0x10` word and
-/// [`Snapshot::total`] the `+0x20` word because `report::snapshots` prints
-/// weekly before total.
+/// Every offset below is established from `report::snapshots`
+/// (`0x1012b4d94`) and its two closures (`0x1012bcf64`, `0x1012bcd1c`):
+///
+/// | offset | field |
+/// |---|---|
+/// | `+0x00` tag (`u32` = 1) / `+0x08` | [`Snapshot::value`] |
+/// | `+0x10` tag (== 1) / `+0x18` | [`Snapshot::weekly`] |
+/// | `+0x20` tag (== 1) / `+0x28` | [`Snapshot::total`] |
+/// | `+0x60` cap (`isize::MIN` = `None`), `+0x68` ptr, `+0x70` len | [`Snapshot::label`] |
+/// | `+0x80` | [`Snapshot::at`] |
+/// | `+0x88` | [`Snapshot::kind`] |
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// `+0x10` (printed as the weekly figure).
-    pub weekly: Option<u64>,
-    /// `+0x20` (printed as the lifetime figure).
-    pub total: Option<u64>,
-    /// `+0x60`, the free text a snapshot carries (its "as of" label).
-    pub text: Option<String>,
-    /// `+0x80`, unix seconds.
+    /// `+0x00`/`+0x08` — the reading itself (Voln favor, suffused experience).
+    pub value: Option<i64>,
+    /// `+0x10`/`+0x18` — the weekly figure (`{}/50,000 weekly`).
+    pub weekly: Option<i64>,
+    /// `+0x20`/`+0x28` — the lifetime figure (`{}/200,000 total`).
+    pub total: Option<i64>,
+    /// `+0x60` — the reading's own name; `None` falls back to the kind's
+    /// capitalised name (`"Resource"`) or `"resource"`.
+    pub label: Option<String>,
+    /// `+0x80` — unix seconds.
     pub at: i64,
+    /// `+0x88` — which kind this row is; matches the `which` byte
+    /// [`crate::report::snapshots`] is called with (`0` favor, `1` resource,
+    /// `2` suffused).
+    pub kind: u8,
 }
 
 /// The character a report is about (`hydra_ledger::row::Who`).

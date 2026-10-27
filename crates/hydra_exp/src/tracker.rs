@@ -70,13 +70,15 @@ pub struct Watch {
 pub type SnapshotKey = (u8, Option<String>);
 
 /// Value of the map [`Tracker::knows`] fills: the snapshot's leading `0x30`
-/// bytes, i.e. the two tagged figures it carries.
+/// bytes, i.e. the three tagged figures it carries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Known {
-    /// First tagged figure (the snapshot's `+0x10`).
-    pub weekly: Option<u64>,
-    /// Second tagged figure (the snapshot's `+0x20`).
-    pub total: Option<u64>,
+    /// The reading itself (the snapshot's `+0x00`/`+0x08`).
+    pub value: Option<i64>,
+    /// First tagged figure (the snapshot's `+0x10`/`+0x18`).
+    pub weekly: Option<i64>,
+    /// Second tagged figure (the snapshot's `+0x20`/`+0x28`).
+    pub total: Option<i64>,
     /// The reading's timestamp.
     pub at: i64,
 }
@@ -162,10 +164,10 @@ impl Tracker {
     /// the binary, so the raw byte is kept.
     pub fn knows(&mut self, snaps: &[Snapshot]) {
         for snap in snaps {
-            let kind = snapshot_kind(snap);
             self.known.insert(
-                (kind, snap.text.clone()),
+                (snap.kind, snap.label.clone()),
                 Known {
+                    value: snap.value,
                     weekly: snap.weekly,
                     total: snap.total,
                     at: snap.at,
@@ -189,16 +191,17 @@ impl Tracker {
         out: &mut Vec<Snapshot>,
         kind: u8,
         label: Option<&str>,
-        weekly: Option<u64>,
-        total: Option<u64>,
+        weekly: Option<i64>,
+        total: Option<i64>,
         at: i64,
     ) {
-        let _ = kind;
         out.push(Snapshot {
+            value: weekly,
             weekly,
             total,
-            text: label.map(|text| text.to_string()),
+            label: label.map(|text| text.to_string()),
             at,
+            kind,
         });
     }
 
@@ -229,8 +232,8 @@ impl Tracker {
                 &mut out,
                 0,
                 Some(&name),
-                Some(u64::from(watch.exp)),
-                Some(u64::from(watch.axp)),
+                Some(i64::from(watch.exp)),
+                Some(i64::from(watch.axp)),
                 at,
             );
             if let Some(mind) = watch.mind_percent {
@@ -238,7 +241,7 @@ impl Tracker {
                     &mut out,
                     1,
                     Some(&name),
-                    Some(u64::from(mind)),
+                    Some(i64::from(mind)),
                     None,
                     at,
                 );
@@ -248,7 +251,7 @@ impl Tracker {
                     &mut out,
                     2,
                     Some(&name),
-                    Some(u64::from(pool)),
+                    Some(i64::from(pool)),
                     None,
                     at,
                 );
@@ -256,19 +259,6 @@ impl Tracker {
         }
         self.pending.extend(out.iter().cloned());
         out
-    }
-}
-
-/// The snapshot kind byte the binary reads at `+0x88`.
-///
-/// `// UNKNOWN:` the row's kind enum is not in the binary; this build derives a
-/// stable byte from the snapshot text so `knows` still keys deterministically.
-fn snapshot_kind(snap: &Snapshot) -> u8 {
-    match snap.text.as_deref() {
-        Some("favor") => 0,
-        Some("resource") => 1,
-        Some("suffused") => 2,
-        _ => 3,
     }
 }
 
@@ -304,15 +294,18 @@ mod tests {
     fn knows_indexes_snapshots_by_kind_and_text() {
         let mut tracker = Tracker::new(Who::new("Sindar"));
         tracker.knows(&[Snapshot {
+            value: Some(12_000),
             weekly: Some(12_000),
             total: Some(240_000),
-            text: Some("resource".to_string()),
+            label: Some("resource".to_string()),
             at: 1_784_567_152,
+            kind: 1,
         }]);
         let known = tracker
             .known
             .get(&(1, Some("resource".to_string())))
             .expect("entry");
+        assert_eq!(known.value, Some(12_000));
         assert_eq!(known.weekly, Some(12_000));
         assert_eq!(known.total, Some(240_000));
         assert_eq!(known.at, 1_784_567_152);

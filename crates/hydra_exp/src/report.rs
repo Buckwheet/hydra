@@ -629,53 +629,85 @@ pub fn range(name: &str, pulses: &[Pulse], from: i64, to: i64) -> Vec<String> {
 /// `0x10240cf10`): `favor`, `resource`, `suffused`.
 pub const SNAPSHOT_KINDS: [&str; 3] = ["favor", "resource", "suffused"];
 
-/// `report::snapshots(which: u8, snaps: &[Snapshot], from: i64, to: i64)
-/// -> Vec<String>` — `@0x1012b4d94` (**partly**).
+/// `report::snapshots(which: u8, snaps: &[Snapshot], today: &[Snapshot])
+/// -> Vec<String>` — `@0x1012b4d94` (**full**).
 ///
-/// `which` indexes [`SNAPSHOT_KINDS`]; each snapshot contributes one line, and
-/// an empty slice gives `No {kind} data captured yet.` (`0x103e64665`). The
-/// three formats are recovered:
+/// `which` selects the kind ([`SNAPSHOT_KINDS`], used both as the label and as
+/// the filter byte the first closure (`0x1012bcf64`) compares against
+/// `Snapshot + 0x88`). The second slice is *today's* snapshots: the second
+/// closure (`0x1012bcd1c`) walks it looking for rows of the same kind **and the
+/// same label**, collects their values, and the loop then sorts them and prints
+/// `max - min` as the day's movement.
 ///
-/// * `favor`    — `Voln Favor: {} (as of {})` (`0x103e6467f`);
-/// * `resource` — `{}: {}/50,000 weekly, {}/200,000 total (as of {})`
-///   (`0x103e6469a`);
-/// * `suffused` — `Suffused {}: {} (as of {})` (`0x103e646cc`).
+/// Two lines per snapshot, and `No {kind} data captured yet.` (`0x103e64665`)
+/// when nothing matches:
 ///
-/// plus `  {} movement today: {:+}` (`0x10240cec5`) for a signed daily delta.
-/// `partly` because only four offsets of a snapshot row are established (see
-/// [`Snapshot`]): the value each placeholder takes is mapped `// UNKNOWN:`.
-pub fn snapshots(which: u8, snaps: &[Snapshot], from: i64, to: i64) -> Vec<String> {
+/// ```text
+/// Voln Favor: 1234 (as of 2026-07-20 13:05:52)              // which = 0
+///   Favor movement today: +234
+/// Resource: 12000/50,000 weekly, 240000/200,000 total (as of …)   // which = 1
+///   Resource movement today: +1000
+/// Suffused Essence: 5000 (as of …)                          // which = 2
+///   Suffused Essence movement today: +300
+/// ```
+///
+/// The labels are the three blobs `0x103e6467f`, `0x103e6469a`, `0x103e646cc`
+/// plus `0x10240cec5` (`"  {} movement today: {:+}"`). A snapshot without a
+/// label prints `"Resource"` (`0x10213c7c8`) for `resource` and `"resource"`
+/// (`0x10206b390`) for `suffused`; the movement label is the five-byte literal
+/// `"Favor"` for `favor` and the snapshot's own label otherwise (empty when it
+/// has none).
+pub fn snapshots(which: u8, snaps: &[Snapshot], today: &[Snapshot]) -> Vec<String> {
     let kind = SNAPSHOT_KINDS
         .get(which as usize)
         .copied()
         .unwrap_or("experience");
-    let _ = (from, to);
-    if snaps.is_empty() {
+    let matching: Vec<&Snapshot> = snaps.iter().filter(|snap| snap.kind == which).collect();
+    if matching.is_empty() {
         return vec![format!("No {} data captured yet.", kind)];
     }
-    let mut out: Vec<String> = Vec::with_capacity(snaps.len() + 1);
-    for snap in snaps {
+    let mut out: Vec<String> = Vec::with_capacity(matching.len() * 2);
+    for snap in matching {
         let as_of = stamp(snap.at);
         match kind {
             "favor" => out.push(format!(
                 "Voln Favor: {} (as of {})",
-                snap.weekly.unwrap_or_default(),
+                snap.value.unwrap_or_default(),
                 as_of
             )),
             "resource" => out.push(format!(
                 "{}: {}/50,000 weekly, {}/200,000 total (as of {})",
-                snap.text.as_deref().unwrap_or(kind),
+                snap.label.as_deref().unwrap_or("Resource"),
                 snap.weekly.unwrap_or_default(),
                 snap.total.unwrap_or_default(),
                 as_of
             )),
             _ => out.push(format!(
                 "Suffused {}: {} (as of {})",
-                snap.text.as_deref().unwrap_or(kind),
-                snap.weekly.unwrap_or_default(),
+                snap.label.as_deref().unwrap_or("resource"),
+                snap.value.unwrap_or_default(),
                 as_of
             )),
         }
+        let mut values: Vec<i64> = today
+            .iter()
+            .filter(|row| row.kind == which && row.label == snap.label)
+            .map(|row| row.value.unwrap_or_default())
+            .collect();
+        values.sort_unstable();
+        let movement = match (values.first(), values.last()) {
+            (Some(first), Some(last)) => last - first,
+            _ => 0,
+        };
+        let movement_label = if which == 0 {
+            "Favor".to_string()
+        } else {
+            snap.label.clone().unwrap_or_default()
+        };
+        out.push(format!(
+            "  {} movement today: {:+}",
+            movement_label, movement
+        ));
     }
     out
 }
@@ -907,6 +939,76 @@ mod tests {
         assert_eq!(
             timing(&pulses[..1]),
             vec!["Not enough pulse data found for timing analysis."]
+        );
+    }
+
+    #[test]
+    fn snapshots_prints_one_as_of_and_one_movement_line_per_row() {
+        use crate::row::Snapshot;
+        // 05:05:52 and 13:05:52 Eastern on the same day: +234 of Voln favor.
+        let today = vec![
+            Snapshot {
+                value: Some(1_000),
+                at: T - 8 * 3_600,
+                kind: 0,
+                ..Snapshot::default()
+            },
+            Snapshot {
+                value: Some(1_234),
+                at: T,
+                kind: 0,
+                ..Snapshot::default()
+            },
+        ];
+        let lines = snapshots(0, &today[1..], &today);
+        assert_eq!(
+            lines,
+            vec![
+                "Voln Favor: 1234 (as of 2026-07-20 13:05:52)",
+                "  Favor movement today: +234",
+            ]
+        );
+        // No rows of this kind at all.
+        assert_eq!(
+            snapshots(1, &today, &today),
+            vec!["No resource data captured yet."]
+        );
+    }
+
+    #[test]
+    fn snapshots_resource_and_suffused_use_their_label_or_the_default() {
+        use crate::row::Snapshot;
+        let owned = vec![Snapshot {
+            value: Some(5_000),
+            weekly: Some(12_000),
+            total: Some(240_000),
+            label: Some("Guild".to_string()),
+            at: T,
+            kind: 1,
+        }];
+        assert_eq!(
+            snapshots(1, &owned, &owned)[0],
+            "Guild: 12000/50,000 weekly, 240000/200,000 total (as of 2026-07-20 13:05:52)"
+        );
+        assert_eq!(snapshots(1, &owned, &owned)[1], "  Guild movement today: +0");
+        // Without a label the resource row says "Resource", the suffused row
+        // "resource" (the two fallback literals differ in case on purpose).
+        let bare = vec![Snapshot {
+            value: Some(7),
+            at: T,
+            kind: 1,
+            ..Snapshot::default()
+        }];
+        assert!(snapshots(1, &bare, &bare)[0].starts_with("Resource: 0/50,000 weekly"));
+        let suffused = vec![Snapshot {
+            value: Some(7),
+            at: T,
+            kind: 2,
+            ..Snapshot::default()
+        }];
+        assert_eq!(
+            snapshots(2, &suffused, &suffused)[0],
+            "Suffused resource: 7 (as of 2026-07-20 13:05:52)"
         );
     }
 

@@ -93,8 +93,8 @@ thousands of unnamed outlined functions belonging to other crates (their literal
 pools contain `hydra_combat_log` SQL, `image-0.25.10/src/images/buffer.rs`,
 `JoinHandle polled after completion`, `__TEXT`, …). The real bodies were found by
 locating the entry's epilogue: `matches` is `0x1012ec37c .. 0x1012ecdf4`
-(2,680 B), `answer`'s prologue is at `0x1012cc990` and `knows`' `ret` at
-`0x1012de020`.
+(2,680 B), `answer` is `0x1012cc990 .. 0x1012cce7c` (1,260 B, with a cold block
+after its `ret`) and `knows`' `ret` is at `0x1012de020`.
 
 Surviving symbol names are the only ones in the crate — there are no
 `drop_in_place<hydra_exp::…>` symbols, so the field sets below come from the
@@ -120,12 +120,12 @@ offset arithmetic, not from drop glue.
 | `report` | `timing` | `0x1012b41f0` | **full** |
 | `report` | `bonuses` | `0x1012b480c` | **full** |
 | `report` | `session` | `0x1012b4ae0` | **full** |
-| `report` | `snapshots` | `0x1012b4d94` | partly (three formats recovered, value mapping UNKNOWN) |
+| `report` | `snapshots` | `0x1012b4d94` | **full** |
 | `command` | `parse_time` | `0x1012ca8f4` | partly |
 | `command` | `run` | `0x1012cb100` | full (prefix parse) / partly (dispatch) |
 | `command` | `read` | `0x1012cb42c` | partly (jump table + windows recovered, `Parsed` enum partly) |
 | `command` | `parse` | `0x1012cbe60` | partly (word split + quoted argument recovered) |
-| `command` | `answer` | `0x1012cc990` | **unknown** (entry contract only) |
+| `command` | `answer` | `0x1012cc990` | **full** |
 | `tracker` | `Tracker::heard` | `0x1012ddf00` | **full** (control flow) |
 | `tracker` | `Tracker::new` | `0x1012dcf60` | partly |
 | `tracker` | `Tracker::look` | `0x1012dd0dc` | partly |
@@ -172,10 +172,24 @@ sources 2 and 3 add `+0xc0`.
 
 ### Snapshot rows (144 bytes, stride `0x90`)
 
-`+0x10` and `+0x20` are `Option` tags (each compared with `1`), `+0x60` is an
-`Option<String>` (capacity word `isize::MIN` = `None`), `+0x80` is the unix
-timestamp handed to `report::stamp`. Which tagged word is "weekly" and which is
-"total" is `// UNKNOWN:` (see `report::snapshots`).
+Established from `report::snapshots` (`0x1012b4d94`) and its two closures
+(`0x1012bcf64` filters on the kind byte, `0x1012bcd1c` matches kind + label):
+
+| offset | field |
+|---|---|
+| `+0x00` tag (`u32`, bit 0 set = some) / `+0x08` | `value` — the reading (Voln favor, suffused experience) |
+| `+0x10` tag (== 1) / `+0x18` | `weekly` |
+| `+0x20` tag (== 1) / `+0x28` | `total` |
+| `+0x60` capacity (`isize::MIN` = `None`), `+0x68` ptr, `+0x70` len | `label`: `Option<String>` |
+| `+0x80` | `at` — the unix timestamp handed to `report::stamp` |
+| `+0x88` | `kind` — the byte `report::snapshots`' `which` argument is compared with |
+
+`report::snapshots(which, snaps, today)` prints **two** lines per row: the
+"as of" line and `  {} movement today: {:+}`, where the movement is
+`max - min` over *today's* rows of the same kind and label. A row without a
+label prints `"Resource"` (`0x10213c7c8`) for `resource` and `"resource"`
+(`0x10206b390`) for `suffused`; the movement label is the five-byte literal
+`"Favor"` for `favor` and the row's own label otherwise.
 
 ### Strings and formats (all quoted text is verbatim)
 
@@ -284,19 +298,22 @@ hydra_gui's catalogue): `Today/today`, `Hour/hour`, `Daily/daily`,
 4. **`report::timing`'s "Pulses analyzed"** prints the number of **gaps**, not
    pulses (`sp+0x68` is the gap vector length), and the median is
    `gaps[len / 2]` (the upper middle element, no averaging). Both are kept.
-5. **`report::snapshots` value mapping.** Three formats and the kind table
-   (`favor`, `resource`, `suffused`) are exact; which snapshot word feeds which
-   placeholder is `// UNKNOWN:` (four offsets in a 144-byte row).
-6. **`command`'s `Parsed` enum.** `read` dispatches through a nine-entry jump
-   table at `0x10240cff0`; the nine targets give the windows above, but two of
-   the twelve help lines (`clean`, `reset`) have no recovered variant, so
-   `Parsed` here has thirteen variants and `read` shows the usage line for the
-   three mutating ones (the binary routes them to `answer`).
-7. **`command::answer`** — 33 KB, no literals of its own that could be isolated
-   from the inlined foreign code; only the entry contract is recovered
-   (5 arguments, opens the ledger reader, tag `3` = error → `Display` text,
-   same 32-byte tagged reply). Implemented as the mutating-command dispatcher
-   and marked `unknown`.
+5. **`report::snapshots` takes three slices, not a window.** The kind filter and
+   the "movement today" both come from the snapshot rows themselves: the third
+   argument is *today's* snapshots (`report::snapshots(which, &latest,
+   &today)`). `command::read` therefore fetches `latest_snapshots()` **and**
+   `snapshots(which, midnight, i64::MAX)`.
+6. **`command`'s `Parsed` enum.** The discriminant mapping is only partly
+   established: `read`'s ten-entry jump table at `0x10240cff0` gives its windows,
+   `answer`'s compare chain gives `0xa`…`0xd`, but which of `0`…`9` is which
+   command is read off the jump targets, not off the `parse` body (which is a
+   chain of `str` compares). `parse` therefore maps command words to variants
+   directly; only the *set* of commands is certain (it is the help table).
+7. **`command::answer` needs `&mut`.** Its four arms write: `addgain` builds a
+   `source = manual` row on top of the last absorbed figures and calls
+   `Writer::try_record`, `clean`/`confirm_reset` call `Ledger::prune_pulses(0/1)`.
+   `read` takes `&dyn Source`, so a caller that wants the mutating commands must
+   go through `answer` (as the binary does) — `read` only prints their usage line.
 8. **`Tracker::{new,look,seed,knows}`** — field *offsets* are established
    (`+0x0`, `+0x180`, `+0x198`, `+0x1a8`, `+0x1b8`, `+0x1d0`, `+0x1e8`,
    `+0x208`/`+0x210` RandomState keys, `+0x218`, `+0x220`/`+0x224`), the snapshot

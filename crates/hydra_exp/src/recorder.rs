@@ -62,7 +62,7 @@ pub fn start(sink: &mut dyn Sink, who: &Who, at: i64) -> Result<usize, String> {
     let mut written = 0usize;
     for snap in &snaps {
         let named = snap
-            .text
+            .label
             .as_deref()
             .map(names_a_snapshot)
             .unwrap_or(false);
@@ -123,14 +123,17 @@ mod tests {
                 Snapshot {
                     weekly: Some(12_000),
                     total: Some(240_000),
-                    text: Some("resource".to_string()),
+                    label: Some("resource".to_string()),
                     at: 1_784_567_152,
+                    kind: 1,
+                    ..Snapshot::default()
                 },
                 Snapshot {
-                    weekly: Some(1_234),
-                    total: None,
-                    text: Some("Voln Favor: 1234".to_string()),
+                    value: Some(1_234),
+                    label: Some("Voln Favor: 1234".to_string()),
                     at: 1_784_567_152,
+                    kind: 0,
+                    ..Snapshot::default()
                 },
             ],
             written: RefCell::new(Vec::new()),
@@ -139,7 +142,7 @@ mod tests {
         assert_eq!(start(&mut sink, &who, 1_784_567_152).unwrap(), 1);
         let written = sink.written.borrow();
         assert_eq!(written.len(), 1);
-        assert_eq!(written[0].0.weekly, Some(1_234));
+        assert_eq!(written[0].0.value, Some(1_234));
         assert_eq!(written[0].1, "Sindar");
     }
 }

@@ -50,11 +50,23 @@ pub struct Route {
 
 /// The saved routes (`route::table`, 2824 bytes at `0x10154fd24`).
 ///
-/// **Partly recovered**: the body reads the saved targets out of the travel
-/// file (`file::Spot::targets`) and turns each into a route; the recovered
-/// nav words `weapon`, `right`, `store`, `get`, `remove` and the
-/// `; (through the urchins)` / `(through the urchins)` suffixes
-/// (`0x10241ef80`) are what a route's saved steps look like.
+/// **Re-checked: partial, and not what the earlier note said.** The body is not a
+/// route builder at all — it renders a **report**:
+///
+/// * `cena_map::map::Map::room` (`0x10154fd54`) for the room it starts from;
+/// * the header literal at `0x10241efc0` is `"STEP      TRIP    TIME  "`;
+/// * the second header, from the piece run at `0x103e23aeb`, is
+///   `"[status] " | HP " | MP " | RT " | CT " | L " | R "` — the same
+///   `[status] … | HP …` header shape the rest of Hydra prints;
+/// * `format_inner` is called four times, and the pieces it formats into are
+///   `… is a room, not a name: .go2 …` and `… goes there. Give it a word:
+///   .go2 save den=…` (`0x10241f03a`, decoded);
+/// * it walks a list of 0x78-byte (120) records and grows a `Vec` of them
+///   (`0x10154ff68`..), so the "table" is one row per saved route.
+///
+/// This build keeps the plain `Route` list: the original's row type lives in
+/// `cena_map::route` (`Routes::seconds_to` is what `drive::walk` calls at
+/// `0x10110c538`), and its 120-byte shape is not reconstructible from here.
 pub fn table(saved: &std::collections::BTreeMap<String, Vec<u32>>) -> Vec<Route> {
     saved
         .iter()
@@ -75,12 +87,16 @@ pub fn table(saved: &std::collections::BTreeMap<String, Vec<u32>>) -> Vec<Route>
         .collect()
 }
 
-/// The places a route can be asked for (`route::places`, 3592 bytes at
+/// The places a route can be asked for (`route::places`, 2912 bytes at
 /// `0x10155082c`).
 ///
-/// The recovered body walks the map's room titles and keeps the ones the walker
-/// can reach; this build returns the room titles of the rooms that carry no
-/// un-priceable exit.
+/// **Partly recovered.** The body builds a `BTreeMap<&str, String>`
+/// (`or_insert_with`, `BTreeMap::remove`, and a `&str` key — the drop shim is
+/// `drop_in_place<BTreeMap<&str, String>>`), folds a `Map<I,F>` over it
+/// (`unicode::uppercase::lookup` — so something is upper-cased), takes the keys
+/// off with `Map::routes` in the loop, and returns a `Vec<String>`. This build
+/// returns the room titles of the rooms that carry a priced exit, which is the
+/// recovered "priced rooms" half and not the `BTreeMap` de-duplication.
 pub fn places(map: &Map) -> Vec<&str> {
     map.rooms()
         .iter()
@@ -89,13 +105,16 @@ pub fn places(map: &Map) -> Vec<&str> {
         .collect()
 }
 
-/// The room a place name means (`route::destination`, 4444 bytes at
+/// The room a place name means (`route::destination`, 2840 bytes at
 /// `0x10154ebc4`).
 ///
-/// **ESTABLISHED (shape)**: the body trims and ASCII-lowercases the name
-/// (`<str>::trim_matches` then `<str>::to_lowercase` at `0x10154ec0c`), splits
-/// it on `.` (the closure at `0x10154f6dc`) and looks each part up in the map,
-/// answering with the niche-encoded `Option<RoomId>`.
+/// **ESTABLISHED (shape)**: the body trims and lower-cases the name
+/// (`<str>::trim_matches` then `<str>::to_lowercase`), calls [`described`] to
+/// split it, and looks the parts up through **three** doors, in this order:
+/// `cena_map::map::Map::ids_for_uid`, `cena_map::map::Map::room` and
+/// `cena_map::route::<impl Map>::routes` (`0x10154e`..), answering with the
+/// niche-encoded `Option<RoomId>`. The `Vec` collect in the middle is the
+/// `.`-split (the closure at `0x10154f6dc`).
 pub fn destination(map: &Map, name: &str) -> Option<RoomId> {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty() {
@@ -168,10 +187,20 @@ pub fn how(steps: &[Step]) -> String {
 /// Why a route is shut for this walker (`route::why_shut`, 680 bytes at
 /// `0x10155138c`).
 ///
-/// **ESTABLISHED (literals)**: the body asks the exit's condition
-/// (`cena_map::cond::Cond::ask` at `0x101551534`) and the exit's price
-/// (`cena_map::exit::Cost::price` at `0x1015513d0`), and reports
-/// [`NOT_FOR_THIS_CHARACTER`], [`DOES_NOT_WALK`] or [`NO_COST`].
+/// **Seam.** Recovered: it builds a `Vec` of **pointers to conditions**
+/// (8-byte elements, `ldr x23, [x20, x26]` at `0x101551528`) from a slice of
+/// 0x40-byte records (`add x9, x23, x8, lsl #6` at `0x1015514f0`), asks each one
+/// with `cena_map::cond::Cond::ask` (`0x101551534`), and for the ones that answer
+/// `2` calls [`not_known`] and formats a sentence (`format_inner` at
+/// `0x10155157c`);
+/// the exit's price comes from `cena_map::exit::Cost::price`. The three
+/// [`NOT_FOR_THIS_CHARACTER`]/[`DOES_NOT_WALK`]/[`NO_COST`] literals are in the
+/// crate's pool but the branch that selects them was not found in this function's
+/// dump, so the mapping below is this build's.
+///
+/// `Cond` is a `cena_map` type with no counterpart here (this crate's
+/// conditions are `Option<String>`), which is why the original's argument list
+/// cannot be reproduced.
 pub fn why_shut(step: &Step, condition_met: bool) -> Option<&'static str> {
     if !condition_met && step.when.is_some() {
         return Some(NOT_FOR_THIS_CHARACTER);
@@ -185,15 +214,27 @@ pub fn why_shut(step: &Step, condition_met: bool) -> Option<&'static str> {
     None
 }
 
-/// The answer when a place is not known (`route::not_known`, 9748 bytes at
+/// The answer when a place is not known (`route::not_known`, **160 bytes** at
 /// `0x101551ccc`).
 ///
-/// **Partly recovered**: the body is the "not known" branch of the destination
-/// lookup; it asks the condition walker (`Cond::ask`) and lists the candidate
-/// names it does know.
+/// **Re-checked: this is a predicate, not a sentence.** Every earlier claim about
+/// it (9 748 bytes, "lists the candidate names") was an artifact of taking
+/// function extents from the globals-only symbol file. The recovered body is:
 ///
-/// // UNKNOWN: the exact sentence is not in the binary's literal pool; the
-/// recovered pieces are the place name and the list of known names.
+/// * it walks its argument as a **condition tree** — while the discriminator at
+///   `[x0]` is in `2..4` it follows the child at `[x0, #8]` (`0x101551ce0`…);
+/// * at a `w8 < 2` node it recurses into the children held at
+///   `[x0, #0x10]`/`[x0, #0x18]` as 0x38-byte records, returning the first
+///   child that answers yes (`0x101551d0c`…);
+/// * at a leaf it calls `cena_map::cond::Cond::ask` and answers
+///   `ask() == 2` (`cnd w8, #0x2; csel x0, x20, xzr, eq` at `0x101551d44`).
+///
+/// So `not_known(&Cond) -> bool`. This build's `Cond` is an `Option<String>`
+/// condition word, which has no tree to walk: the function below is a **seam**
+/// that answers the same yes/no question about the only condition shape this
+/// crate carries, and its phrasing is this build's, not the binary's.
+///
+/// // UNKNOWN: the sentence the original formatted at `0x10155157c`.
 pub fn not_known(map: &Map, name: &str) -> String {
     let known = places(map);
     if known.is_empty() {

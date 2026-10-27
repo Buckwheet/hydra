@@ -142,14 +142,28 @@ impl Trip {
         !saved.is_empty() && saved == self.path
     }
 
-    /// Build the path from one room to another (`Trip::path_from`, 24504 bytes
+    /// Build the path from one room to another (`Trip::path_from`, **488 bytes**
     /// at `0x101542dbc`).
     ///
-    /// **Partly recovered**: the body is the whole A* over the map with the
-    /// `cena_map::exit::Cost` prices and the routine rooms removed (the
-    /// `Vec<Vec<RoomId>>` drop glue in the same region is the rejected-run
-    /// bookkeeping). This build walks the map breadth-first, refusing routine
-    /// rooms, and keeps the first path it finds.
+    /// **Re-checked: the search is not in this crate.** The earlier note's
+    /// "24 504 bytes: the A* with `Cost` prices" was an artifact of taking
+    /// function extents from the globals-only symbol file; with the local symbol
+    /// table the function is 488 bytes and does exactly this:
+    ///
+    /// * seeds a one-element `Vec<u32>` with the starting room
+    ///   (`str w21, [x22]` at `0x101542e14`);
+    /// * calls `cena_map::route::<impl Map>::routes` (`0x101542df8`) to build the
+    ///   route graph from the map and the walker;
+    /// * calls `cena_map::route::Routes::path_to` (`0x101542e30`) with the
+    ///   destination and that seed;
+    /// * answers the `Option<Vec<RoomId>>` the call gives back — the `isize::MIN`
+    ///   niche in the capacity slot is the `None` arm (`0x101542e38`).
+    ///
+    /// The cost metric (and the routine-room exclusion the earlier note attributed
+    /// to this function) lives in `cena_map::route`, which is not in this
+    /// workspace. This build therefore keeps a breadth-first search over
+    /// [`Map`], refusing rooms that carry a routine, as a documented stand-in for
+    /// `Routes::path_to` — the exclusions are the same idea, the metric is not.
     pub fn path_from(map: &Map, from: RoomId, to: RoomId) -> Option<Vec<RoomId>> {
         if from == to {
             return Some(vec![from]);

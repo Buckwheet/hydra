@@ -79,37 +79,50 @@ fn courses() -> std::sync::MutexGuard<'static, HashMap<String, Arc<ShownCourse>>
     COURSES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The key both caches use: the name lower-cased. All four entry points call
+/// `<str>::to_lowercase` before they touch the map
+/// (`0x1015af0d8`, `0x1015af46c`, `0x1015af7c8`, `0x1015afa68`), so `"Bank"`
+/// and `"bank"` are one entry.
+fn cache_key(key: &str) -> String {
+    key.to_lowercase()
+}
+
 /// @0x1015af084 — remember `route` under `key`, so the map can draw it.
+///
+/// The body removes any entry already under that key
+/// (`hashbrown::raw::RawTable::remove_entry`) and then inserts
+/// (`HashMap::insert`); with one value per key the remove is not observable.
 pub fn show_route(key: &str, route: ShownRoute) {
-    board().insert(key.to_string(), Arc::new(route));
+    board().insert(cache_key(key), Arc::new(route));
 }
 
 /// @0x1015af774 — the route stored under `key`, cloned out of the cache.
 pub fn shown_route(key: &str) -> Option<Arc<ShownRoute>> {
-    board().get(key).cloned()
+    board().get(&cache_key(key)).cloned()
 }
 
 /// @0x1015af418 — remember `course` under `key`.
 pub fn show_course(key: &str, course: ShownCourse) {
-    courses().insert(key.to_string(), Arc::new(course));
+    courses().insert(cache_key(key), Arc::new(course));
 }
 
 /// @0x1015afa14 — the course stored under `key`, cloned out of the cache.
 ///
-/// **Partly recovered.** At 4 520 bytes this is the largest of the four and the
-/// only one that was not dumped line by line; it locks `COURSES`, looks the key
-/// up and clones the `Arc`, which is the behaviour implemented here. The body may
-/// additionally build a course from the ocean on a miss (it has the room for it),
-/// but that could not be established.
+/// **Re-checked: full.** This function is 672 bytes, exactly the size of
+/// [`shown_route`], and its call set is the same one for one —
+/// `Mutex::lock`/`unlock`, `<str>::to_lowercase`, `BuildHasher::hash_one`,
+/// `OnceLock::initialize`, `Arc` drop. There is **no** insert, no ocean call and
+/// no `cena_map` call in it, so a miss is a miss: the earlier note's "it may
+/// build a course from the ocean on a miss" is refuted.
 pub fn shown_course(key: &str) -> Option<Arc<ShownCourse>> {
-    courses().get(key).cloned()
+    courses().get(&cache_key(key)).cloned()
 }
 
 /// Forget everything shown. Not in the stubs; provided so callers (and tests)
-/// can reset the two caches.
+/// can reset the two caches. The lower-cased key is the one to forget.
 pub fn forget(key: &str) {
-    board().remove(key);
-    courses().remove(key);
+    board().remove(&cache_key(key));
+    courses().remove(&cache_key(key));
 }
 
 #[cfg(test)]
@@ -153,5 +166,23 @@ mod tests {
         forget("bank");
         assert!(shown_route("bank").is_none());
         assert!(shown_course("bank").is_none());
+    }
+
+    /// Every entry point lower-cases its key (`<str>::to_lowercase` in all four
+    /// functions, `0x1015af0d8`/`0x1015af46c`/`0x1015af7c8`/`0x1015afa68`), so
+    /// the name the walker types and the name stored are the same entry.
+    #[test]
+    fn keys_are_lower_cased() {
+        show_route("Bank", ShownRoute { rooms: vec![7] });
+        assert!(shown_route("bank").is_some());
+        assert!(shown_route("BANK").is_some());
+        assert_eq!(shown_route(" bAnk ").map(|r| r.rooms.clone()), None);
+        forget("bAnK");
+        assert!(shown_route("bank").is_none());
+
+        show_course("Kraken", ShownCourse { rooms: vec![42] });
+        assert_eq!(shown_course("kraken").unwrap().rooms, vec![42]);
+        forget("KRAKEN");
+        assert!(shown_course("kraken").is_none());
     }
 }

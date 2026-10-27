@@ -26,47 +26,90 @@ pub struct Found {
 ///
 /// **Partly recovered.** Recovered:
 ///
-/// * the input is `trim()`ed, an optional leading `u`/`U` is stripped, and the
-///   rest is parsed as an `i64` with an optional sign (`0x1015b0bf4`..), so
-///   `"u7116001"` and `"7116001"` are the same search;
-/// * the input is then lower-cased (`0x1015b0cb8`) and every room is visited
-///   (`madd x9, x9, #0x180, x8` — a 384-byte stride);
-/// * the hits are sorted, and a small result is sorted with the insertion sort
+/// * the input is `trim()`ed (`0x1015b0bec`); an empty needle answers the empty
+///   list (`cbz x1` at `0x1015b0bf0`) and a lone `+`/`-` does too
+///   (`0x1015b0c9c`..`0x1015b0cac`);
+/// * an optional leading `u`/`U` is stripped (`cmp w11, #0x55` at
+///   `0x1015b0c7c`) and the rest is parsed as an `i64` with an optional sign;
+/// * **numeric needle** — when the number fits in a `u32` *and* the needle had
+///   no `u`/`U` prefix, the map-id lookup runs first
+///   (`cena_map::map::Map::room` at `0x1015b0eac`, push at `0x1015b0ec0`);
+///   either way every room the number names as a **uid** is added afterwards
+///   (`cena_map::map::Map::ids_for_uid` at `0x1015b0f00`), skipping ids already
+///   collected (`ldr w11, [x10, #0x30]` scan at `0x1015b0f74`);
+/// * **word needle** — the trimmed input is lower-cased (`<str>::to_lowercase`
+///   at `0x1015b0cb8`) and every room is visited (`madd x9, x9, #0x180, x8` — a
+///   384-byte stride) through a `filter().map()` whose `Found` arm is the
+///   closure at `0x1015b1090`;
+/// * the hits are sorted, a small result with the insertion sort
 ///   (`0x1015b0ff4`).
 ///
-/// Not recovered: the predicate that decides which rooms are kept, and the third
-/// argument. Since the closure that builds each [`Found`] captures nothing, the
-/// predicate was inlined into the collection loop; the third argument is stored
-/// beside the lower-cased needle in the iterator environment. This build treats
-/// it as `numbered` — the same flag [`described`] takes — and keeps a room when
-/// its id equals the parsed number, or (when no number was given) its title,
-/// area path or note contains every whitespace-separated word of the needle.
-pub fn found(map: &Map, text: &str, numbered: bool) -> Vec<Found> {
-    let needle = text.trim().to_lowercase();
-    let number = parse_number(text);
+/// Not recovered: the keep-predicate of the word half — it is inlined into
+/// `Map<I,F>::next` (`0x10158fa3c`) and `FnMut::call_mut` (`0x1015afd30`) as a
+/// chain of `to_lowercase().contains(..)` tests over the room's string lists
+/// plus one equality test — and the third argument, which is stored beside the
+/// lower-cased needle in the iterator environment. This build keeps a
+/// `contains`-every-word predicate over the title, the area names and the note,
+/// The third argument is carried but **not read** by either half here: the
+/// original stores it beside the lower-cased needle in the iterator environment
+/// (`stp x22, x21, [sp, #0x60]` at `0x1015b0ccc`) and this build's reading of the
+/// inlined predicate did not find the site that consumes it, so nothing is
+/// invented for it. It keeps its place in the signature so the call shape stays
+/// the recovered one.
+pub fn found(map: &Map, text: &str, _numbered: bool) -> Vec<Found> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let needle = trimmed.to_lowercase();
+    let number = parse_number(trimmed);
     let words: Vec<&str> = needle.split_whitespace().collect();
     let mut hits: Vec<Found> = Vec::new();
-    for room in map.rooms() {
-        let keep = match number {
-            Some(n) => i64::from(room.id) == n || (!numbered && matches_words(room, &words)),
-            None => matches_words(room, &words),
-        };
-        if !keep {
-            continue;
+
+    match number {
+        Some(n) => {
+            // A bare number may also be a map id; a `u`-prefixed one is a uid
+            // only (`b.eq 0x1015b0ef8` at `0x1015b0ea0`).
+            let u_prefixed = trimmed.starts_with(['u', 'U']);
+            if !u_prefixed && (0..=i64::from(u32::MAX)).contains(&n) {
+                if let Some(room) = map.room(n as RoomId) {
+                    hits.push(found_row(room));
+                }
+            }
+            for id in map.ids_for_uid(n) {
+                if hits.iter().any(|hit| hit.id == id) {
+                    continue;
+                }
+                if let Some(room) = map.room(id) {
+                    hits.push(found_row(room));
+                }
+            }
         }
-        let path = room
-            .areas
-            .first()
-            .map(|a| a.trim_matches(['[', ']']).to_string())
-            .unwrap_or_default();
-        hits.push(Found {
-            path,
-            title: room.title.clone(),
-            id: room.id,
-        });
+        None => {
+            for room in map.rooms() {
+                if matches_words(room, &words) {
+                    hits.push(found_row(room));
+                }
+            }
+        }
     }
     hits.sort_by(|a, b| a.id.cmp(&b.id));
     hits
+}
+
+/// One room as the recovered closure (`0x1015b1090`) builds it: the first of the
+/// room's area paths, trimmed of `[`/`]`, the title, and the id (`+0x178`).
+fn found_row(room: &crate::cena::Room) -> Found {
+    let path = room
+        .areas
+        .first()
+        .map(|a| a.trim_matches(['[', ']']).to_string())
+        .unwrap_or_default();
+    Found {
+        path,
+        title: room.title.clone(),
+        id: room.id,
+    }
 }
 
 fn matches_words(room: &crate::cena::Room, words: &[&str]) -> bool {
@@ -171,16 +214,29 @@ mod tests {
                 note: None,
                 exits: Vec::new(),
             },
+            // Its map id and its game uid differ: uid `7116002`, id `500`.
+            Room {
+                id: 500,
+                title: "A Weathered Pier".into(),
+                paths: vec![7116001, 7116002],
+                areas: vec!["[North Blue]".into()],
+                specs: Vec::new(),
+                note: None,
+                exits: Vec::new(),
+            },
         ])
     }
 
     #[test]
     fn searching_by_number_and_by_word() {
         let m = map();
-        let by_number = found(&m, "u7116002", true);
+        // A bare number is a map id *and* a uid: `7116001` is room 7116001's id
+        // and the last element of its uid chain, so the two halves agree and the
+        // id is only collected once (`0x1015b0f74`).
+        let by_number = found(&m, "7116001", true);
         assert_eq!(by_number.len(), 1);
-        assert_eq!(by_number[0].id, 7116002);
-        assert_eq!(by_number[0].title, "A Dusty Road");
+        assert_eq!(by_number[0].id, 7116001);
+        assert_eq!(by_number[0].title, "The Tenebrous Cauldron");
         assert_eq!(by_number[0].path, "North Blue", "brackets are trimmed");
 
         let by_word = found(&m, "cauldron", false);
@@ -190,8 +246,44 @@ mod tests {
         // Every word has to match.
         assert_eq!(found(&m, "cauldron dusty", false).len(), 0);
         assert_eq!(found(&m, "  ", false).len(), 0);
-        // A number that is not in the map finds nothing by id …
+        // A number that is in neither the id index nor a uid chain finds nothing.
         assert_eq!(found(&m, "5", true).len(), 0);
+    }
+
+    /// `found`'s numeric half is two lookups: `Map::room` for a bare number and
+    /// `Map::ids_for_uid` for either shape. Room `500` carries uid `7116002`, so
+    /// `u7116002` finds it and `500` finds it by id; a `u`-prefixed number is
+    /// never taken as a map id (`b.eq 0x1015b0ef8` at `0x1015b0ea0`).
+    #[test]
+    fn a_number_is_looked_up_as_a_map_id_and_as_a_uid() {
+        let m = map();
+        assert_eq!(m.ids_for_uid(7116002), vec![500]);
+
+        let by_uid = found(&m, "u7116002", true);
+        assert_eq!(by_uid.len(), 1);
+        assert_eq!(by_uid[0].id, 500, "the uid names the room, not its id");
+        assert_eq!(by_uid[0].title, "A Weathered Pier");
+
+        // Bare, the number is looked up twice: room `7116002` carries it as its
+        // map id, and room `500` carries it as its uid, so both come back,
+        // ordered by id.
+        let bare = found(&m, "7116002", false);
+        assert_eq!(
+            bare.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![500, 7116002]
+        );
+
+        // `500` is a map id; no room has uid 500.
+        let by_id = found(&m, "500", false);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, 500);
+
+        // `u500` asks only the uid index, so it finds nothing here.
+        assert!(found(&m, "u500", true).is_empty());
+
+        // A number that is too large for a `u32` never reaches `Map::room`
+        // (`lsr x9, x22, #32; cbnz` at `0x1015b0e78`).
+        assert!(found(&m, "7116002".repeat(2).as_str(), false).is_empty());
     }
 
     #[test]

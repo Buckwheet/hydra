@@ -140,6 +140,28 @@ impl Map {
         self.by_id.get(&id).map(|&i| &self.rooms[i])
     }
 
+    /// `cena_map::map::Map::ids_for_uid` (`0x101662d94`) — every room whose game
+    /// number is `uid`.
+    ///
+    /// The original keeps a `u64 → ids` index beside the room list and answers
+    /// with a slice; here the uid chain lives in [`Room::paths`] (its last
+    /// element is the room's own game number — that is what
+    /// [`crate::room::described`] formats as `" (u{})"`), so the answer is built
+    /// from the room list. The two call sites in the binary are
+    /// `room::found`'s numeric half and `walk::preflight::gigas_way`, both of
+    /// which only want "the rooms with this number".
+    pub fn ids_for_uid(&self, uid: i64) -> Vec<RoomId> {
+        if !(0..=i64::from(u32::MAX)).contains(&uid) {
+            return Vec::new();
+        }
+        let uid = uid as RoomId;
+        self.rooms
+            .iter()
+            .filter(|room| room.paths.last() == Some(&uid))
+            .map(|room| room.id)
+            .collect()
+    }
+
     pub fn rooms(&self) -> &[Room] {
         &self.rooms
     }

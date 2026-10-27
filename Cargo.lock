@@ -13,6 +13,9 @@ version = "0.0.0"
 [[package]]
 name = "gs_render"
 version = "0.0.0"
+dependencies = [
+ "gs_base",
+]
 
 [[package]]
 name = "hydra_board"

@@ -234,12 +234,12 @@ fn the_unwired_subcommands_say_what_they_still_need() {
     // `gui` is wired since Phase 4: it opens the eframe window, so it is not
     // exercised here — `main`'s unit test
     // `the_gui_subcommand_builds_the_recovered_hub_window` asserts the built
-    // plan (`"Hydra"`, 660 × 520, wgpu) without launching it.
+    // plan (`"Hydra"`, 660 × 520, wgpu) without launching it.  `play` and
+    // `serve` are wired since Phase 3 (the Lich side); they are covered by
+    // `play_and_serve_say_that_lich_is_off` and `tests/lich_relay.rs`.
     for args in [
         &[][..],
-        &["play", "Aelith"][..],
         &["login", "Aelith"][..],
-        &["serve", "--detach"][..],
         &["import", "x.bytes"][..],
         &["lookout", "seed"][..],
     ] {
@@ -247,5 +247,26 @@ fn the_unwired_subcommands_say_what_they_still_need() {
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         let err = stderr(&output);
         assert!(err.contains("not wired up in this headless phase"), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn play_and_serve_say_that_lich_is_off() {
+    // `HYDRA_LICH_SETTINGS` points at a file that is not there, so this reads
+    // the defaults (`on: false`) whatever the working directory holds.
+    for args in [&["play", "Aelith"][..], &["serve", "Aelith", "--detach"][..]] {
+        let output = Command::new(binary())
+            .args(args)
+            .env("HYDRA_LICH_SETTINGS", "/nonexistent/hydra/lich.json")
+            .output()
+            .expect("the hydra binary runs");
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(stdout(&output), "", "{args:?}");
+        let err = stderr(&output);
+        assert!(
+            err.starts_with(&format!("hydra {}: Lich is off for this character", args[0])),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains("no game connection"), "{args:?}: {err}");
     }
 }

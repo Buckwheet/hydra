@@ -40,12 +40,15 @@
 //!
 //! # What this phase runs
 //!
-//! `hydra replay <file>` (the phase gate), `hydra --help`, `hydra --version`
-//! and `hydra gui …` (the hub window, through eframe's wgpu renderer — see
-//! [`gui`]).  Every other subcommand is *recognised* — the recovered word table
-//! and the usage text are exact — and then reports what it still needs, on
-//! stderr, with status 1.  Nothing is stubbed out silently: see `NOTES.md` for
-//! the per-command state and for the GUI boundary.
+//! `hydra replay <file>` (the phase gate), `hydra --help`, `hydra --version`,
+//! `hydra gui …` (the hub window, through eframe's wgpu renderer — see
+//! [`gui`]), and — since Phase 3 — the Lich half of `hydra play` / `hydra
+//! serve`: with `.lich on` they start this character's Lich with the observed
+//! semantics ([`lich`]) and relay its stdout; with `.lich` off they say so.
+//! The remaining subcommands are *recognised* — the recovered word table and
+//! the usage text are exact — and then report what they still need, on stderr,
+//! with status 1.  Nothing is stubbed out silently: see `NOTES.md` for the
+//! per-command state and for the GUI boundary.
 //!
 //! The window is *built* as an [`hydra_gui::app::Launch`] value first, which
 //! touches no device and no event loop, so the tests can assert the recovered
@@ -55,6 +58,7 @@
 #![allow(dead_code)]
 
 mod cli;
+mod lich;
 mod render;
 mod replay;
 mod session;
@@ -142,15 +146,69 @@ fn run(command: &Command) -> Option<String> {
         // `hydra gui …` → `connect::Target::many` + `hydra::gui::run`
         // (`0x10021deb8`, `0x10021e144`).
         Command::Gui { targets } => gui(targets),
+        // `play` and `serve` start this character's Lich when `.lich` is on
+        // (Phase 3: the Lich side of the session, with no game connection).
+        Command::Play { targets } => {
+            let label = command.label();
+            match lich::load_settings() {
+                Ok(settings) => lich_side(label, &lich::character_of(targets), &settings),
+                Err(err) => Some(format!("{label}: {err}")),
+            }
+        }
+        Command::Serve { args } => {
+            let label = command.label();
+            match lich::load_settings() {
+                Ok(settings) => lich_side(label, &lich::character_of(args), &settings),
+                Err(err) => Some(format!("{label}: {err}")),
+            }
+        }
         // The bare hub reaches the same `gui::run` in the recovered dispatch
         // (`0x10021dd40`), but this headless phase keeps it reporting rather
         // than opening a window; only the explicit `gui` word launches.
-        Command::Hub
-        | Command::Play { .. }
-        | Command::Login { .. }
-        | Command::Serve { .. }
-        | Command::Import { .. }
-        | Command::LookoutSeed => Some(not_wired(command)),
+        Command::Hub | Command::Login { .. } | Command::Import { .. } | Command::LookoutSeed => {
+            Some(not_wired(command))
+        }
+    }
+}
+
+/// The Lich side of `hydra play` / `hydra serve`: start Lich with the observed
+/// semantics when `.lich on` is set, say the two recovered start lines, relay
+/// Lich's stdout until it exits or the session stops, and return.
+///
+/// With `.lich` off there is nothing this headless phase can do — no game
+/// connection exists — so it says so rather than doing nothing.  A refusal
+/// reports one of the recovered sentences (`Where Lich is has not been said…`,
+/// `… has no lich.rbw in it`, `Lich needs Ruby…`) on stderr with status 1.
+///
+/// The settings are an argument (not read here) so the tests can drive every
+/// branch without touching the filesystem.
+fn lich_side(
+    label: &str,
+    character: &str,
+    settings: &hydra_session::lich_command::LichSettings,
+) -> Option<String> {
+    if !settings.on {
+        return Some(lich::off_message(label));
+    }
+    let plan = match lich::plan(settings) {
+        Ok(plan) => plan,
+        Err(refusal) => return Some(refusal.message()),
+    };
+    // The session owns the cancellation token the relay watches; there is no
+    // game connection in this phase, so nothing else touches it.
+    let session = session::Headless::new(character);
+    let mut keyed = match lich::start(&plan) {
+        Ok(keyed) => keyed,
+        Err(err) => return Some(format!("{label}: Lich could not be started: {err}")),
+    };
+    let mut out = std::io::stdout();
+    if let Err(err) = lich::announce(&plan, &mut out) {
+        let _ = keyed.relay.stop();
+        return Some(format!("{label}: {err}"));
+    }
+    match lich::relay(&mut keyed, &mut out, session.handle()) {
+        Ok(_status) => None,
+        Err(err) => Some(format!("{label}: {err}")),
     }
 }
 
@@ -186,17 +244,19 @@ fn gui_launch(targets: &[String]) -> hydra_gui::app::Launch {
 }
 
 /// Why a recognised subcommand does not run in this phase.
+///
+/// `play` and `serve` are no longer here: since Phase 3 they start Lich when
+/// `.lich on` is set ([`lich_side`]) and report [`lich::off_message`] when it is
+/// not.  What they still lack is the game connection.
 fn not_wired(command: &Command) -> String {
     let needs = match command {
         Command::Hub => {
             "the window (egui/eframe: hydra_gui, hydra_ui, hydra_board, gs_render)"
         }
         Command::Play { .. } | Command::Login { .. } => {
-            "a live game connection (hydra_table's connector, hydra_net's login, the Lich relay's keyed handshake)"
+            "a live game connection (hydra_table's connector, hydra_net's login)"
         }
-        Command::Serve { .. } => {
-            "the resting/serve window (hydra_web, hydra_table) and the Lich relay's keyed handshake"
-        }
+        Command::Serve { .. } => "the resting/serve window (hydra_web, hydra_table)",
         Command::Import { .. } => "the ledger (hydra_import, hydra_ledger)",
         Command::LookoutSeed => "the data folder and the player logs (hydra_table, hydra_net)",
         _ => "nothing: it is wired",
@@ -238,9 +298,7 @@ mod tests {
     fn every_unwired_command_says_what_it_needs() {
         for command in [
             Command::Hub,
-            Command::Play { targets: vec![] },
             Command::Login { targets: vec![] },
-            Command::Serve { args: vec![] },
             Command::Import { paths: vec![] },
             Command::LookoutSeed,
         ] {
@@ -250,6 +308,53 @@ mod tests {
         }
         assert!(not_wired(&Command::Hub).contains("eframe"));
         assert!(not_wired(&Command::LookoutSeed).contains("hydra_table"));
+        assert!(not_wired(&Command::Play { targets: vec![] }).contains("game connection"));
+        assert!(not_wired(&Command::Serve { args: vec![] }).contains("hydra_web"));
+    }
+
+    #[test]
+    fn play_and_serve_start_lich_only_when_it_is_on() {
+        use hydra_session::lich_command::{LichSettings, WHERE_NOT_SAID_SENTENCE};
+        let off = LichSettings::default();
+        for label in ["hydra play", "hydra serve"] {
+            let message = lich_side(label, "Aelith", &off).expect("a message");
+            assert!(message.starts_with(&format!("{label}: Lich is off")), "{message}");
+        }
+        // On, but nothing says where Lich is: the recovered sentence, no spawn.
+        let on = LichSettings {
+            on: true,
+            ..LichSettings::default()
+        };
+        assert_eq!(
+            lich_side("hydra play", "Aelith", &on).unwrap(),
+            WHERE_NOT_SAID_SENTENCE
+        );
+        // On with a folder that is known but has no `lich.rbw` in it.
+        let folder = std::env::temp_dir().join(format!("hydra-main-lich-{}", std::process::id()));
+        let on = LichSettings {
+            on: true,
+            folder: Some(folder.clone()),
+            ..LichSettings::default()
+        };
+        assert_eq!(
+            lich_side("hydra play", "Aelith", &on).unwrap(),
+            format!("{} has no lich.rbw in it", folder.display())
+        );
+    }
+
+    #[test]
+    fn the_lich_settings_file_is_read_from_the_configured_place() {
+        // `HYDRA_LICH_SETTINGS` and `HYDRA_DATA_DIR` are the two seams; the
+        // path function is pure, so the test never mutates the environment.
+        assert_eq!(lich::DATA_DIR_ENV, "HYDRA_DATA_DIR");
+        assert_eq!(lich::SETTINGS_ENV, "HYDRA_LICH_SETTINGS");
+        assert_eq!(
+            lich::settings_path_from(
+                None,
+                Some(std::ffi::OsString::from("/synthetic/data"))
+            ),
+            std::path::PathBuf::from("/synthetic/data").join("lich.json")
+        );
     }
 
     #[test]

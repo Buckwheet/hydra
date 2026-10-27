@@ -532,8 +532,10 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
 
 ## 5. Tests
 
-`cargo test -p hydra_session` runs **186** tests with ~750 assertions (it was
-158 with 600 before Phase 1; the new tests are the ones marked *Phase 1* below):
+`cargo test -p hydra_session` runs **217** tests with ~800 assertions (194
+before Phase 3, 158 with 600 before Phase 1 — the 186 this section was written
+with did not include Phase 3's wire tests; the new tests are the ones marked
+*Phase 1* / *Phase 3* below):
 
 * `store`: `safe_component` cases (`"Aelith's Cart"` → `aelithscart`, `".."` →
   `""`, non-ASCII dropped, case folded), both `character_path` outcomes, the
@@ -606,6 +608,8 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
   truncated handshake; `connect_keyed` round-tripping against a real loopback
   listener; `<c>`/bare `LichFrame` framing and `command_frame`; and the 0x1F
   game-chunk prefix helpers.
+* `lich_command` (*Phase 3*): the 23 tests listed in §8.4 — the `.lich` family,
+  `lich.json`, the recovered sentences and the taker guarantee.
 * `command`: the basics, `say` vs `say_unlogged`, subscriber cursors,
   `chain_stopped` at level 1, `run_steps` through the taker, the broken-alias
   path, `command_words`, `fold_in`, `clip`, `stop`, and (*Phase 1*) the
@@ -621,7 +625,7 @@ Everything marked `// UNKNOWN:` in the source expands the points above.
   and `kept` reading a real environment variable.
 
 Gates (all with `--offline`): `cargo check -p hydra_session`, `cargo test -p
-hydra_session` (186 tests passing) and `cargo check --workspace` are clean, and
+hydra_session` (217 tests passing) and `cargo check --workspace` are clean, and
 `grep -rn 'todo!\|unimplemented!' crates/hydra_session/src` is empty.
 
 ## 6. Audit pass (verification batch)
@@ -710,3 +714,117 @@ Behaviour that changed as a direct result of using the real crates:
 4. `Pattern::regex` accepts the whole `regex` language, so a rule that the hand
    engine used to accept as a literal (`a{2}`, `\b`) now behaves as the crate
    does.  The three broken-pattern cases the crate tests stayed broken.
+
+## 8. Phase 3: the `.lich` command family
+
+`crates/hydra_session/src/lich_command.rs` is new: the `.lich` commands, the
+`lich.json` settings and the recovered sentences around them.  The words are
+**RECOVERED** from the local reference binary's string table; what is
+**INFERRED** is only which recovered sentence answers which situation (§8.3).
+
+### 8.1 The settings file — `lich.json`
+
+Global, not per character (the recovered help line says "for every character"),
+with the three recovered keys `folder`, `on` and `view` (`lich`/`game`):
+
+```rust
+pub struct LichSettings { pub folder: Option<PathBuf>, pub on: bool, pub view: LichView }
+pub enum LichView { Lich, Game }        // `Game` is the default
+```
+
+* `LichSettings::path(dir)` → `<dir>/lich.json`; `SETTINGS_FILE = "lich.json"`,
+  `LICH_SCRIPT = "lich.rbw"`.
+* `from_json`/`to_json` (pretty, key order `folder`, `on`, `view`; `folder` is
+  omitted when unset), `load(path)`/`save(path)` through `serde_json`.  A file
+  that is not there is the defaults; a broken one is
+  `"<path> cannot be read: <serde_json error>"` (`InvalidData`).
+* Defaults: `on: false`, `view: Game`, no folder.
+* `LichView::from_on(bool)`/`is_lich()` are the mapping the old
+  `SessionHandle::set_lich_view(bool)` API keeps: **Lich view = true, Game view
+  = false**.  `SessionHandle::set_lich_view` now also writes the settings'
+  `view`, and `set_lich_settings` applies the view through `set_lich_view`, so
+  the flag and the file cannot disagree; the generation is only advanced when
+  the view really changed.
+* `LichSettings::script()` / `has_script()` answer `<folder>/lich.rbw` and "is
+  that a file?", which is the only filesystem access this crate makes for the
+  command.
+
+### 8.2 The commands
+
+```rust
+LichCommand::parse(".lich on")     // -> Some(LichCommand::On)
+LichCommand::parse("lich help")    // -> Some(LichCommand::Help); the bare word is accepted too
+LichCommand::parse("look")         // -> None: not ours
+session.lich_command(".lich folder /synthetic/lich")  // -> Some(LichOutcome)
+```
+
+Every sub-command, and the recovered text each one answers with:
+
+| line | effect | notice (**RECOVERED** text) |
+|---|---|---|
+| `.lich` | status | `Lich is not running for this character` (off) / `Lich runs for this character, and is off, and starts with it` (on), then `where Lich is has not been said: lich folder <folder>` or `Lich is at <dir>.` |
+| `.lich on` | `on = true` if a folder with `lich.rbw` is known | `Lich is starting, from <dir>\lich.rbw.`; `Lich already runs for this character.`; `Where Lich is has not been said: lich folder <folder>.`; `<dir> has no lich.rbw in it` |
+| `.lich off` | `on = false` | `Lich is stopping, and stays off for this character.` (it was running) / `Lich stays off for this character.` |
+| `.lich folder` | report the folder | `Lich is at <dir>, for every character.` / `where Lich is has not been said: lich folder <folder>` |
+| `.lich folder <dir>` | set the folder if `<dir>/lich.rbw` is a file | `Lich is at <dir>, for every character.` / `<dir> has no lich.rbw in it` |
+| `.lich view lich` | `view = Lich`, `set_lich_view(true)` | `While Lich runs, this window shows what Lich shows.` |
+| `.lich view game` | `view = Game`, `set_lich_view(false)` | `While Lich runs, this window shows the game's own text, and Lich's own lines beside it.` |
+| `.lich help` | the help block | the recovered paragraph, then the six recovered lines (quiet, `Kind::Help`) |
+| anything else | nothing changes | the recovered usage line: `say lich on, lich off, lich folder <folder>, lich view lich\|game, or lich help` (level 1) |
+
+Notes on the shape:
+
+* **Parsing** is exact: `on`/`off`/`help` take no argument, `view` takes
+  `lich`/`game` and nothing else, and anything else after the word is
+  `LichCommand::Unknown`, which answers the usage line.  `folder` takes the rest
+  of the line, so a path with spaces survives.  `.lichx` and `..lich` are not
+  commands.
+* **The folder is validated** only where it must be: `.lich folder <dir>` and
+  `.lich on` both refuse a folder whose `lich.rbw` is not a file, and the folder
+  is left as it was.
+* **`LichOutcome`** carries the notices, the settings after the command,
+  `changed` (write `lich.json` back), `start` (the folder a caller should start
+  Lich from) and `stop` (it was running).  The session applies the settings and
+  says the notices itself; it cannot spawn a process (`hydra_lich` depends on
+  nothing here), so the binary does that — see `crates/hydra/NOTES.md` §6.4.
+* **Nothing reaches the taker.**  No path here calls `SessionHandle::to_game`;
+  `lich_command::tests::a_lich_line_never_reaches_the_taker` asserts that for
+  every sub-command, including the unknown one.
+* Levels: status/help/`on`/`off`/`folder`/`view` are informational (2); the
+  usage line, the missing folder and the missing `lich.rbw` are warnings (1);
+  the help block is quiet (3), so it never enters the player log.
+
+### 8.3 UNKNOWN / INFERRED
+
+1. The reference binary has one string table, not one call site per sentence, so
+   *which recovered sentence belongs to which moment* is INFERRED.  In
+   particular the status notice is composed of two sentences (on/off, then
+   where), the lower-case `where Lich is has not been said: …` is used inside a
+   line and the capitalised `Where Lich is has not been said: ….` stands alone.
+2. `Lich is at <dir>.` versus `Lich is at <dir>, for every character.`: the
+   first is the status answer, the second the answer/announcement of the folder
+   itself.  Both are recovered; the split is ours.
+3. Whether `.lich on` starts Lich immediately or only at the next character
+   start: "start it, and start it whenever this character starts" fits both.
+   This crate reports `Lich is starting, from …` and hands the caller
+   `LichOutcome::start`.
+4. `hydra_table::lich_command::family()` (`0x1011f1944`) lists the earlier guess
+   `lich start` / `lich stop`; the recovered usage line says `on`/`off`, so
+   `on`/`off` is what is implemented and the old names now answer the usage
+   line.  That crate is untouched by this phase.
+5. The `folder` sub-command's own path (`hydra_table::lich_command::folder`,
+   `0x1011f2b6c`, a per-character folder under the data directory) is a
+   different, earlier reconstruction; `lich.json`'s `folder` is a plain
+   directory the player names, which is what the recovered help line describes.
+
+### 8.4 Tests
+
+23 unit tests in `lich_command`, all in the module: the settings defaults, JSON
+round trip (pretty and compact, unknown members ignored, a bad `view` refused), a
+missing file loading the defaults and saving back, the view mapping in both
+directions (including through `set_lich_view`), every sub-command's parse (with
+the space-bearing folder and the half-arguments), the exact text of every
+recovered sentence, the usage/help block byte for byte, the status composition,
+`on`/`off`/`folder`/`view`/`help`/unknown behaviour with a real temp folder
+holding (or not holding) `lich.rbw`, the `start`/`stop`/`changed` outcome
+fields, and that no `.lich` line reaches the taker.

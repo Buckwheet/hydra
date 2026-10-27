@@ -1,9 +1,10 @@
 //! Streaming parser and wire-format helpers for the GemStone IV text protocol.
 //!
-//! The crate was recovered from the arm64 Hydra binary.  It is deliberately
-//! `std`-only: the original used a few small helper crates for the parser
-//! internals, but none of that leaks into the public behaviour implemented
-//! here.
+//! The crate was recovered from the arm64 Hydra binary.  Every call target of
+//! the 27 recovered functions lands in `core`, `alloc` or `std` (the byte scans
+//! are `core::slice::memchr`, the string comparisons `bcmp`, the tables plain
+//! sorted arrays), so this reconstruction is `std`-only too and no dependency
+//! had to be reconnected.  `NOTES.md` records the evidence and the departures.
 //!
 //! Layout notes (from the recovered binary, arm64 ABI):
 //!   * `Vec<T>` is `(cap, ptr, len)` on this toolchain.

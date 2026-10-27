@@ -70,16 +70,22 @@ pub fn parse_amount(text: &str) -> Option<(i32, i32)> {
 
 /// Parse a duration into whole seconds.
 ///
-/// The binary's recovered implementation handles colon forms only:
-///   * `"m:ss"` (two segments)
-///   * `"h:mm:ss"` (three segments)
+/// Recovered from `numbers::parse_duration_secs` (`0x101c2e244`, 588 bytes).
+/// The binary trims the input, splits on `:` with `core`'s `memchr`, and:
+///   * accepts exactly **two** (`"m:ss"`) or **three** (`"h:mm:ss"`) segments
+///     (`and w8, w22, #0xfffffffe; cmp w8, #2`) — one segment (`"30"`) and
+///     four or more are rejected;
+///   * parses each segment as digits with an optional leading `+` (`-` is
+///     rejected);
+///   * accumulates `total = total * 60 + value` in **`u32`** arithmetic and
+///     returns `None` on overflow (`umull` + `tst` / `adds` + `b.hs`), so a
+///     total above `u32::MAX` is rejected rather than wrapped.
 ///
-/// A single segment (`"30"`) is rejected, as are four or more segments.
-///
-/// `// UNKNOWN:` the binary did **not** contain unit-suffix handling, but the
-/// task specification asks for `"5m"`, `"30s"` and `"2h 15m"`.  Unit parsing
-/// is therefore implemented additively (it cannot change the result of any
-/// input the binary handled, because such input contains `:`).
+/// `// UNKNOWN:` the binary has no unit-suffix handling (the whole function is
+/// 588 bytes and contains no unit table); the additive `"5m"`/`"2h 15m"` form
+/// is an addition of this reconstruction, kept because the task specification
+/// asks for it.  It cannot change the result of any input the binary handled,
+/// because such input contains `:`.
 pub fn parse_duration_secs(text: &str) -> Option<u64> {
     let text = text.trim();
     if text.is_empty() {
@@ -93,7 +99,9 @@ pub fn parse_duration_secs(text: &str) -> Option<u64> {
         }
         let mut nums = Vec::with_capacity(parts.len());
         for part in parts {
-            nums.push(unsigned(part)?);
+            // The binary's segment parser is 32-bit; a segment that does not
+            // fit in a `u32` fails to parse.
+            nums.push(u32::try_from(unsigned(part)?).ok()?);
         }
         let total = match nums.as_slice() {
             [secs] => *secs,
@@ -104,7 +112,7 @@ pub fn parse_duration_secs(text: &str) -> Option<u64> {
                 .checked_add(*secs)?,
             _ => return None,
         };
-        return Some(total);
+        return Some(total as u64);
     }
 
     // Unit-suffix form: a sequence of `<digits><unit>` tokens, optionally
@@ -188,6 +196,20 @@ mod tests {
         assert_eq!(parse_duration_secs("1:02:03"), Some(3723));
         assert_eq!(parse_duration_secs(" 0:30 "), Some(30));
         assert_eq!(parse_duration_secs("12:00:00"), Some(43200));
+        // A leading `+` is stripped per segment; a leading `-` is not.
+        assert_eq!(parse_duration_secs("+1:+02"), Some(62));
+    }
+
+    #[test]
+    fn colon_durations_overflow_in_32_bits() {
+        // Recovered: `total = total * 60 + value` is 32-bit with a checked
+        // `umull`/`adds`, so an overflow yields `None` instead of wrapping.
+        assert_eq!(parse_duration_secs("2000000:00:00"), None);
+        assert_eq!(parse_duration_secs("71582789:00"), None);
+        // A single segment that does not fit in a `u32` is rejected too.
+        assert_eq!(parse_duration_secs("4294967296:00"), None);
+        // Just below the limit still parses.
+        assert_eq!(parse_duration_secs("1193046:28:15"), Some(u32::MAX as u64));
     }
 
     #[test]

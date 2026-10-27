@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gs_base","crates/gs_puppet","crates/gs_render","crates/hydra","crates/hydra_board","crates/hydra_cast","crates/hydra_combat_log","crates/hydra_exp","crates/hydra_gui","crates/hydra_host","crates/hydra_import","crates/hydra_ledger","crates/hydra_lich","crates/hydra_lookout","crates/hydra_map","crates/hydra_model","crates/hydra_net","crates/hydra_protocol","crates/hydra_rewards","crates/hydra_session","crates/hydra_survey","crates/hydra_table","crates/hydra_travel","crates/hydra_ui","crates/hydra_update","crates/hydra_web"]
+members = ["crates/gs_base","crates/gs_puppet","crates/gs_render","crates/hydra","crates/hydra_board","crates/hydra_cast","crates/hydra_combat_log","crates/hydra_exp","crates/hydra_gui","crates/hydra_host","crates/hydra_import","crates/hydra_ledger","crates/hydra_lich","crates/hydra_lookout","crates/hydra_map","crates/hydra_mocks","crates/hydra_model","crates/hydra_net","crates/hydra_protocol","crates/hydra_rewards","crates/hydra_session","crates/hydra_survey","crates/hydra_table","crates/hydra_travel","crates/hydra_ui","crates/hydra_update","crates/hydra_web"]
 
 [workspace.dependencies]
 tokio = { version = "=1.53.1", features = ["full"] }

@@ -1,0 +1,16 @@
+[package]
+name = "hydra_mocks"
+version = "0.0.0"
+edition = "2021"
+# Test-only helper: never shipped, never uploaded anywhere.
+publish = false
+
+[dependencies]
+# Phase 6 wants the login client tested against *real* TLS, not a framing-level
+# stand-in, so the mock eaccess server is a real rustls server.  rustls's default
+# provider is `aws-lc-rs`, which is not in the offline registry, so the `ring`
+# provider is selected explicitly (and the default features are off).
+# Neither of these is a workspace pin: nothing else in the workspace speaks TLS
+# itself yet, and pinning them at the root would suggest it does.  See NOTES.md.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "=0.17.14"

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use crate::{Error, Result};
+use crate::Result;
 
 /// Environment variable consulted when no base directory has been set.
 /// The literal `VELLUM_FE_DIR` (13 bytes) sits at 0x1021f0ea0.
@@ -80,7 +80,8 @@ pub fn base_generation() -> u64 {
 ///
 /// The `anyhow::Error` built when `home_dir()` is `None` carries the literal
 /// `Could not find home directory` (29 bytes) @0x1021f0ead — reproduced verbatim
-/// below.  **std departure:** `dirs::home_dir` becomes `$HOME`/`$USERPROFILE`.
+/// below.  **std departure:** `dirs::home_dir` becomes `$HOME`/`$USERPROFILE`
+/// (`dirs` is not in the workspace pins).
 pub fn base_dir() -> Result<PathBuf> {
     if let Ok(slot) = BASE_DIR.read() {
         if let Some(dir) = slot.as_ref() {
@@ -92,7 +93,7 @@ pub fn base_dir() -> Result<PathBuf> {
             return Ok(PathBuf::from(v));
         }
     }
-    let home = home_dir().ok_or_else(|| Error::msg("Could not find home directory"))?;
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
     Ok(home.join(BASE_DIR_NAME))
 }
 
@@ -192,7 +193,7 @@ mod tests {
             );
             std::env::remove_var("HOME");
             let err = base_dir().unwrap_err();
-            assert_eq!(err.message(), "Could not find home directory");
+            assert_eq!(err.to_string(), "Could not find home directory");
         });
     }
 

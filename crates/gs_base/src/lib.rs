@@ -1,11 +1,19 @@
 #![allow(dead_code, unused)]
-//! `gs_base` — small, dependency-free foundations shared by the Hydra front end.
+//! `gs_base` — small foundations shared by the Hydra front end.
 //!
 //! Recovered from the arm64 Hydra binary; see `NOTES.md` for the evidence behind
 //! every function, constant and the `established` / `INFERRED` / `UNKNOWN`
-//! legend. Only `std` is used: the original crate leaned on `anyhow`, `toml`,
-//! `zip`, `sha2`, `dirs` and an internal `vellum_light` helper crate; each of
-//! those has a hand-written std equivalent here.
+//! legend.
+//!
+//! ## Dependencies (Phase 1)
+//!
+//! The original crate leaned on `anyhow`, `toml` + `serde`, `zip` (with its
+//! vendored inflater) and `dirs`, plus an internal `vellum_light` helper crate.
+//! Phase 1 reconnected the registry crates at the pinned workspace versions:
+//! `anyhow` ([`Error`] / [`Result`]), `toml` + `serde` ([`packs`]) and `zip` +
+//! `flate2` ([`packs`]). `dirs` is not pinned, so [`data_dirs::home_dir`] stays a
+//! std stand-in; the SHA-256 in [`packs`] stays hand-written because the original
+//! had no `sha2` dependency (see `PLAN.md` and `NOTES.md`).
 
 pub mod body;
 pub mod data_dirs;
@@ -16,39 +24,48 @@ pub mod sky;
 pub mod sky_light;
 pub mod status;
 
-use std::fmt;
-
-/// Error type standing in for the `anyhow::Error` the original crate used.
+/// The error type the original crate used: `anyhow::Error`.
 ///
 /// The binary carries `anyhow::Error` payloads (8-byte non-null pointers built by
-/// `anyhow::__private::format_err`), and every recovered message is a plain
-/// `format!` string, so a boxed message reproduces the observable behaviour
-/// without the dependency.  **std departure.**
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(String);
+/// `anyhow::__private::format_err`) and calls `anyhow::Context::with_context` in
+/// `data_dirs` and `packs`, so the real crate is reconnected directly rather
+/// than imitated. Every recovered message is a plain `format!` string produced
+/// verbatim by the call sites, so the observable text is unchanged.
+pub use anyhow::Error;
 
-impl Error {
-    pub fn msg(m: impl Into<String>) -> Self {
-        Error(m.into())
-    }
-    pub fn message(&self) -> &str {
-        &self.0
+/// `anyhow::Result<T>`.
+///
+/// `anyhow::Error` is neither `Clone` nor `PartialEq`, so the recovered
+/// assertions compare `Error::to_string()` instead of a hand-rolled
+/// `Error::message()`; the expected strings are unchanged. Use `{:?}` (or
+/// `{:#}`) to see the whole context chain.
+pub type Result<T> = anyhow::Result<T>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Error`] and [`Result`] really are the crate's types.
+    #[test]
+    fn error_is_anyhow_error() {
+        fn takes_anyhow(_: &anyhow::Error) {}
+
+        let e: Error = anyhow::anyhow!("boom");
+        takes_anyhow(&e);
+        assert_eq!(e.to_string(), "boom");
+
+        // `?` on any std error lands in `Result<T>` with no conversion code, and
+        // the original error stays downcastable — the two properties the
+        // hand-rolled `Error(String)` could not offer.
+        fn fails() -> Result<()> {
+            let _: u8 = "not a number".parse()?;
+            Ok(())
+        }
+        let err = fails().unwrap_err();
+        assert!(
+            err.downcast_ref::<std::num::ParseIntError>().is_some(),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "invalid digit found in string");
     }
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error(e.to_string())
-    }
-}
-
-/// `anyhow::Result` stand-in.
-pub type Result<T> = std::result::Result<T, Error>;

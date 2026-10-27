@@ -7,7 +7,16 @@ The crate is the vendored `gs_studio` leaf crate
 document records what each one does, which constants were read out of the
 disassembly, and what could not be established.
 
-Everything is `std`-only. There are no unimplemented stubs and no dependencies.
+The crate has no unimplemented stubs. It was recovered `std`-only; after Phase 1
+it depends on `anyhow`, `serde`, `toml`, `zip` and `flate2` at the pinned
+workspace versions (see **Phase 1 reconnection**).
+
+> **Phase 1 update.** Four of the six departures below are gone: `anyhow`, `zip`
+> (+`flate2`), `toml` and `serde` are reconnected at the pinned workspace
+> versions. The SHA-256 stays hand-written (the original had **no** `sha2`
+> crate — `PLAN.md` line 12), `dirs` stays a std stand-in (not pinned) and
+> `vellum_light::phase_keyframes` stays recovered (vendored, not on the
+> registry). See **Phase 1 reconnection** at the end of this file.
 
 ---
 
@@ -150,14 +159,76 @@ directory `.vellum-fe` (10 bytes @ `0x1021f0eca`), `global` (6 @ `0x1021f0e9a`),
 
 ## std departures
 
-| original dependency | replacement | notes |
+Rows struck out are the ones Phase 1 removed; the section at the end of the file
+records what replaced them.
+
+| original dependency | replacement | status |
 |---|---|---|
-| `anyhow` | `gs_base::Error` (boxed `String`) + `Result<T>` alias | The binary really does build `anyhow::Error` values (`anyhow::__private::format_err`, `anyhow::Context::with_context`), and `data_dirs`, `packs` return them. The observable message text is preserved exactly. |
-| `sha2::Sha256` | `packs::Sha256` | Written from scratch; `compress256` is inlined in the binary, so the IV and `K` are recoverable. |
-| `zip` crate (`zlib_rs` inflate) | `packs::ZipArchive` + `packs::inflate` | EOCD → CDFH → local header, stored and raw-DEFLATE (fixed and dynamic Huffman) blocks. ZIP64 locators are recognised but not parsed. CRC-32 is *not* verified (the binary does not appear to either). |
-| `toml` + `serde` | `packs::parse_toml` | Only the subset `pack.toml` / `installed.toml` need: `key = "str" / int / bool / [array]` under optional `[section]` headers, with `#` comments. |
-| `dirs::home_dir` | `data_dirs::home_dir` | `$HOME` (and `$USERPROFILE` on Windows). |
-| `vellum_light::phase_keyframes` (vendored crate) | `sky_light::phase_keyframes` | Fully recovered from `0x100ac3dcc`; returns `Vec<Keyframe>` with the same 8-byte elements. |
+| ~~`anyhow`~~ | ~~`gs_base::Error` (boxed `String`) + `Result<T>` alias~~ | **gone** — real `anyhow` 1.0.104 (`pub use anyhow::Error` + `pub type Result<T>`). The observable message text is preserved exactly; only `Error::message()` became `Error::to_string()` in the assertions, because `anyhow::Error` is neither `Clone` nor `PartialEq`. |
+| `sha2::Sha256` | **`packs::Sha256` (kept)** | Not a departure to undo: `PLAN.md` records that the original had **no** `sha2` crate, and `compress256` is inlined in the binary. Written from scratch from the recovered IV and `K`. |
+| ~~`zip` crate (`zlib_rs` inflate)~~ | ~~`packs::ZipArchive` + `packs::inflate`~~ | **gone** — real `zip` 9.0.0 behind `packs::ZipArchive`, and `packs::inflate` now wraps `flate2` 1.1.10. |
+| ~~`toml` + `serde`~~ | ~~`packs::parse_toml`~~ | **gone** — real `toml` 1.1.6 + `serde` 1.0.229; `Manifest`/`Ledger`/`Installed` derive `Deserialize`, `parse_toml` maps `toml::Table` onto `TomlValue`. |
+| `dirs::home_dir` | **`data_dirs::home_dir` (kept)** | `dirs` is not in the root `[workspace.dependencies]` pins, so the `$HOME`/`$USERPROFILE` stand-in stays. |
+| `vellum_light::phase_keyframes` (vendored crate) | **`sky_light::phase_keyframes` (kept)** | `vellum_light` is a vendored crate, not a registry crate, so there is no version to pin. Fully recovered from `0x100ac3dcc`; returns `Vec<Keyframe>` with the same 8-byte elements. |
+
+---
+
+## Phase 1 reconnection
+
+Registry crates are pinned in the root `Cargo.toml` `[workspace.dependencies]`;
+this crate asks for them with `x = { workspace = true }`. Versions are the ones
+recorded in `~/Code/hydra-inspect/crate_versions.txt`.
+
+| real crate | pinned version | what it replaced |
+|---|---|---|
+| `anyhow` | `=1.0.104` | `gs_base::Error` (boxed `String`) and the hand-rolled `Result<T>`; now `pub use anyhow::Error` + `pub type Result<T> = anyhow::Result<T>` |
+| `zip` | `=9.0.0` | the hand-written ZIP reader (EOCD → CDFH → local header) behind `packs::ZipArchive` / `packs::ZipEntry` |
+| `flate2` | `=1.1.10` | the hand-written DEFLATE decoder behind `packs::inflate` (fixed *and* dynamic Huffman blocks) |
+| `toml` | `=1.1.6` | the hand-written TOML subset in `packs::parse_toml` / `Manifest::from_toml` / `ledger` |
+| `serde` | `=1.0.229` | the hand-written field-by-field readers for `Manifest`, `Ledger`, `Installed` (all three now derive `Deserialize`; `Installed`/`Ledger` also `Serialize`) |
+
+Feature notes: `zip` takes the workspace default feature set (all compression
+methods). Its `default-features` cannot be trimmed from a member while the root
+pin leaves it unspecified, and the full set is what the original binary was
+built with, so nothing is disabled here. `flate2` is taken with its defaults
+(`miniz_oxide` backend); `zip` additionally turns on `flate2/zlib-rs`, which is
+also pure Rust.
+
+Behaviour that the real crates changed (all *not* recovered literals):
+
+* **`toml` error text.** A syntax error in `pack.toml` / `installed.toml` now
+  reads `TOML parse error at line …, column …` (with a caret snippet) instead of
+  the hand parser's `pack.toml: cannot parse line '…'` /
+  `pack.toml: unterminated string`. The *validation* messages
+  (`pack.toml: id '{}' is not lower snake case`,
+  `pack '{}' is format {}, newer than this build understands ({})`,
+  `pack file '{}' is not under global/`, `no pack '{}' is installed`) are
+  unchanged to the character.
+* **`format` may be written as a string.** The recovered reader accepted both
+  `format = 1` and `format = "1"` (and fell back to `0` for a negative value),
+  so `Manifest::format` keeps a small `deserialize_with` that accepts an integer
+  or a numeric string. A non-numeric string is now a deserialization error
+  (`format 'soon' is not a number`) rather than the "newer than this build
+  understands" message.
+* **CRC-32 is now verified** on entry reads (the `zip` crate checks it; the
+  hand-written reader did not). Malformed archives therefore fail earlier.
+* **`inflate` error text** is `flate2`'s `io::Error`; the old
+  `not a zip: bad deflate block` wording was never recovered.
+* **`packs::ZipArchive::read(&self, …)`** still takes `&self`: the wrapper
+  re-opens the archive (the `zip` crate wants `&mut` for a read) so the public
+  API stays as it was. `install_zip` uses the crate directly and reads entries
+  from the single open archive, so installation is not quadratic.
+* **`TomlValue` gained `Float(f64)` and `Datetime(String)`** (the real parser
+  produces both), so the enum is `PartialEq` but no longer `Eq`.
+
+Kept by hand, with the reason:
+
+| stand-in | reason |
+|---|---|
+| `packs::Sha256` / `sha256_hex` | `PLAN.md` line 12 is authoritative: the original had **no** `sha2` crate, and `compress256` is inlined in the binary. The earlier claim in this file that the original used `sha2` was wrong and is corrected above. |
+| `data_dirs::home_dir` | `dirs` is not in `[workspace.dependencies]` (not pinned, not pre-fetched). |
+| `sky_light::phase_keyframes` | `vellum_light` is a vendored crate, not on the registry. |
+| `packs::safe_relative`, the entry/size guards, `MAX_ENTRIES` / `MAX_UNPACKED_BYTES` | recovered Hydra policy, not something a crate provides. |
 
 ---
 
@@ -202,7 +273,7 @@ directory `.vellum-fe` (10 bytes @ `0x1021f0eca`), `global` (6 @ `0x1021f0e9a`),
 
 ## Tests
 
-`cargo test -p gs_base` — **51 tests**, all passing. Coverage of the
+`cargo test -p gs_base --offline` — **63 tests**, all passing. Coverage of the
 high-value areas:
 
 * **SHA-256** — four NIST vectors (`""`, `"abc"`, the 56-byte message, one
@@ -224,9 +295,15 @@ high-value areas:
   missing-home error text, and `set_base_dir`'s generation bump.
 * **`packs`** — manifest accept/reject with the recovered message wording, the
   `lower_snake_case` rules, `Report::summary` with and without the "kept" tail,
-  a hand-built ZIP round-trip, hand-built DEFLATE streams, the path-traversal and
-  symlink rejections, an end-to-end install → re-install (kept) → remove cycle
-  against a real directory, and the TOML subset.
+  the TOML subset (now via the real crate, including floats, date-times and
+  nested headers), a ZIP round-trip written by the real `zip` writer for both
+  stored and deflated entries (with the recovered `PK` markers checked on its
+  output, and CRC-32 read back from the central directory), an `inflate`
+  round-trip against the real `flate2` encoder, the path-traversal and symlink
+  rejections, an end-to-end install → re-install (kept) → remove cycle against a
+  real directory, a deflated pack installed end to end, ledger round-trips
+  through the real `toml` writer, both ledger table shapes (`[packs.…]` and
+  `[installed.…]`), and the typed `anyhow` chain on an io error.
 * **`png_meta`** — hand-built PNG byte vectors covering `tEXt` extraction, other
   chunk types, keyword length mismatch, truncated input, missing NUL, non-UTF-8
   payloads and the chunk walk.
@@ -237,8 +314,8 @@ high-value areas:
 Verification commands (all clean in this worktree):
 
 ```
-cargo check -p gs_base
-cargo test  -p gs_base
-cargo check --workspace
+cargo check -p gs_base --offline
+cargo test  -p gs_base --offline
+cargo check --workspace --offline
 grep -rn 'unimplemented' crates/gs_base   # empty
 ```

@@ -2,3 +2,11 @@
 name = "hydra_travel"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+# Recovered sibling crates, reused rather than duplicated:
+#   hydra_model    - `state::GameState`, `state::lines::ChunkLine`, `spells::{spell_named,Spell}`
+#   hydra_protocol - `runs::Runs` (line text, via hydra_model)
+#   hydra_session  - `store::safe_component` (used by `file::spot_name`)
+hydra_model = { path = "../hydra_model" }
+hydra_session = { path = "../hydra_session" }

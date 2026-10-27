@@ -2,3 +2,10 @@
 name = "hydra_web"
 version = "0.0.0"
 edition = "2021"
+
+# The original linked tokio, tokio-tungstenite, serde/serde_json, mdns-sd and
+# rustls.  Nothing outside `std` is used here; the two path dependencies are
+# sibling crates that were already recovered from the same binary.
+[dependencies]
+hydra_model = { path = "../hydra_model" }
+hydra_session = { path = "../hydra_session" }

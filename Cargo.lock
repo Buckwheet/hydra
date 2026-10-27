@@ -126,3 +126,7 @@ version = "0.0.0"
 [[package]]
 name = "hydra_web"
 version = "0.0.0"
+dependencies = [
+ "hydra_model",
+ "hydra_session",
+]

@@ -25,20 +25,22 @@ mod textfmt;
 
 /* Unresolved symbols in the original binary (trait impls, closures, generics).
    They are listed so the recovery is auditable; all of them are now covered
-   here, either by hand or by the std-only replacements documented in NOTES.md:
+   here, either by hand or by the real crates documented in NOTES.md §4:
 
    hydra_session::notes::<impl From<notes::Refused> for std::io::Error>::from  @0x101a527c8
        -> notes::Refused + `impl From<Refused> for io::Error`               (recovered)
    <impl Deserialize for notes::File / notes::Note / notes::Clipped>::…__Visitor
-       -> textfmt::parse_json + notes::Notes::from_json                       (replaced)
+       -> serde_json + textfmt::Value + notes::Notes::from_json               (Phase 1)
    <impl Deserialize for alias::AliasFile>::…__Visitor
-       -> textfmt::parse_json + alias::AliasFile::absorb                      (replaced)
+       -> serde_json + textfmt::Value + alias::AliasFile::absorb              (Phase 1)
    <impl Deserialize for claimant::Settings>::…__Visitor
        -> claimant::Settings (a plain Option<Desk>)                           (replaced)
    <impl Deserialize for settings_store::SettingsFile>::…__Visitor
-       -> textfmt::parse_json + settings_store::SettingsFile::from_json       (replaced)
+       -> a derived helper + a hand-written serde::Serialize (key order)      (Phase 1)
    <impl Deserialize for player_log::links::{LogLink, Does}>::…__Visitor
-       -> textfmt::parse_json + player_log::links::{read, Does::of}            (replaced)
+       -> `#[derive(Serialize, Deserialize)]` on both types                    (Phase 1)
    <impl Deserialize for player_log::feed::LogSettings>::…__Visitor
        -> player_log::feed::LogSettings (plain fields)                        (replaced)
+   <impl Deserialize for stream_rules::Rules / Rule>::…__Visitor
+       -> derived RulesDoc / RuleDoc read by `toml::from_str`                 (Phase 1)
 */

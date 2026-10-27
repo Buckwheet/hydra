@@ -11,6 +11,6 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 regex = { workspace = true }
-flate2 = { workspace = true }
+flate2 = { workspace = true, features = ["zlib-rs"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

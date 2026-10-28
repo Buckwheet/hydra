@@ -828,4 +828,3 @@ mod tests {
         assert_eq!(session.status(), "connected");
     }
 }
-

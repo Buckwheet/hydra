@@ -251,7 +251,11 @@ fn the_unwired_subcommands_say_what_they_still_need() {
 fn play_and_serve_say_that_lich_is_off() {
     // `HYDRA_LICH_SETTINGS` points at a file that is not there, so this reads
     // the defaults (`on: false`) whatever the working directory holds.
-    for args in [&["play", "Aelith"][..], &["serve", "Aelith", "--detach"][..]] {
+    //
+    // `serve` without `--detach`: with `--detach` the parent spawns the child
+    // and exits 0 by design (the recovered behaviour; `tests/serve.rs` covers
+    // that path against the loopback mocks).
+    for args in [&["play", "Aelith"][..], &["serve", "Aelith"][..]] {
         let output = Command::new(binary())
             .args(args)
             .env("HYDRA_LICH_SETTINGS", "/nonexistent/hydra/lich.json")

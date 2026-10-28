@@ -1374,6 +1374,7 @@ dependencies = [
  "hydra_protocol",
  "hydra_session",
  "hydra_table",
+ "hydra_web",
  "tokio",
 ]
 

@@ -11,7 +11,7 @@
 //! ```text
 //! stage          client sends                     server answers
 //! cert_pin       —                                the TLS certificate, pinned by TOFU
-//! k_response     K                                K\t<32-byte key>
+//! k_response     K                                <32-byte key> — bare: no `K\t`, no newline
 //! a_response     A\t<account>\t<keyed password>   A\t<account>\tKEY\t<session key>\t<holder>
 //! m_response     M                                M\t<code>\t<name>\t<code>\t<name>…
 //! f_response     F\t<game>                        F\t<NORMAL|PREMIUM|FREE|TRIAL|INTERNAL>
@@ -33,12 +33,11 @@
 //! # Transport
 //!
 //! Everything works over [`Transport`], whose real implementation is
-//! [`TlsTransport`]: **synchronous** `rustls` (`ClientConnection` +
-//! `StreamOwned`) over a `std::net::TcpStream`, dialled by IP so the
-//! ClientHello carries no SNI.  The certificate verifier deliberately accepts
-//! any certificate — pinning is the trust decision, and it happens one layer up
-//! — but it *does* check the handshake signature, so a peer that cannot prove
-//! it holds the key it presented is still refused.
+//! [`TlsTransport`]: **synchronous** `native-tls` over a `std::net::TcpStream`
+//! (eaccess offers only TLS 1.2 with static-RSA key exchange, which `rustls`
+//! never does), with SNI switched off so the ClientHello names no host.  The
+//! certificate *chain* and the hostname are accepted unchecked — pinning is the
+//! trust decision, and it happens one layer up, before anything is sent.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -299,7 +298,7 @@ pub trait Transport {
     fn complete_handshake(&mut self) -> io::Result<()>;
 }
 
-/// A real eaccess connection: synchronous `rustls` over a `TcpStream`.
+/// A real eaccess connection: synchronous `native-tls` over a `TcpStream`.
 pub struct TlsTransport {
     stream: BufReader<TlsStream<TcpStream>>,
 }
@@ -307,10 +306,10 @@ pub struct TlsTransport {
 impl TlsTransport {
     /// Dial `host:port`, complete the handshake and return the open channel.
     ///
-    /// The connection is made **by address**: the TLS server name is the peer
-    /// IP, so the ClientHello carries no SNI — which is what a real login does
-    /// and what `hydra_mocks::MockEaccess::sni_seen` checks.  Every failure here
-    /// is the `connect` stage.
+    /// SNI is switched off (`use_sni(false)`), so the ClientHello names no host
+    /// — which is what a real login does and what `hydra_mocks::MockEaccess::sni_seen`
+    /// checks.  The chain and the hostname are not checked here: the pin is the
+    /// trust decision.  Every failure here is the `connect` stage.
     pub fn dial(host: &str, port: u16) -> Result<TlsTransport, Refusal> {
         let stream = TcpStream::connect((host, port)).map_err(|error| {
             Refusal::new(
@@ -536,10 +535,18 @@ fn exchange_bytes(
 }
 
 /// The key from the `K` response, used whole (normally 32 bytes).
+///
+/// The real server answers `K` with the **bare** key — no `K\t` prefix, no field
+/// before it and nothing after it — so every non-empty byte of the answer is key
+/// material.  (A leading `K\t` is still stripped if a server ever sends one;
+/// nothing requires it.)  Nothing is refused for being merely short: a short key
+/// is returned as it is, and refusing to truncate it is [`wire::hash_password`]'s
+/// job, at stage `hash`, where the password's length is known.
 fn sge_key(line: &str) -> Result<Vec<u8>, Refusal> {
     let trimmed = line.trim_end_matches(['\n', '\r']);
     // The real server answers K with the bare key line; a "K\t" prefix is tolerated.
     let key = trimmed.strip_prefix("K\t").unwrap_or(trimmed);
+    // An empty answer, or one that is only a terminator, carries no key at all.
     if key.is_empty() {
         return Err(Refusal::new(
             "k_response",
@@ -777,15 +784,38 @@ mod tests {
     }
 
     #[test]
-    fn the_key_is_used_whole() {
-        assert_eq!(sge_key("K\tabcdef").unwrap(), b"abcdef".to_vec());
+    fn the_bare_key_answer_is_used_whole() {
+        // The real server answers K with the bare key and nothing else: no
+        // "K\t" prefix, no field before it.  The whole answer is key material.
+        assert_eq!(sge_key("abcdef").unwrap(), b"abcdef".to_vec());
         assert_eq!(
-            sge_key("K\t0123456789abcdef0123456789abcdef").unwrap().len(),
-            32
+            sge_key("0123456789abcdef0123456789abcdef").unwrap(),
+            b"0123456789abcdef0123456789abcdef".to_vec()
         );
-        // An empty key is not a key.
-        assert_eq!(sge_key("K\t").unwrap_err().stage, "k_response");
-        assert_eq!(sge_key("REJECT").unwrap_err().stage, "k_response");
+        // A terminator that rode along is not part of the key.
+        assert_eq!(sge_key("abcdef\r\n").unwrap(), b"abcdef".to_vec());
+        // "K\t" is still tolerated, but it is not required and not key material.
+        assert_eq!(sge_key("K\tabcdef").unwrap(), b"abcdef".to_vec());
+
+        // An empty answer, and one that is only a terminator, are not keys.
+        assert_eq!(sge_key("").unwrap_err().stage, "k_response");
+        assert_eq!(sge_key("\r\n").unwrap_err().stage, "k_response");
+
+        // A short key is handed back as it is: the refusal belongs to the
+        // password hash, which will not truncate a key shorter than the password.
+        let short = sge_key("abcd").unwrap();
+        assert_eq!(short, b"abcd".to_vec());
+        let password = b"eighteen-byte-pass";
+        assert_eq!(password.len(), 18);
+        let refusal = wire::hash_password(password, &short).unwrap_err();
+        assert_eq!(refusal.stage, "hash");
+        assert!(
+            refusal
+                .detail
+                .starts_with("key (4 bytes) shorter than password (18 bytes)"),
+            "{}",
+            refusal.detail
+        );
     }
 
     #[test]

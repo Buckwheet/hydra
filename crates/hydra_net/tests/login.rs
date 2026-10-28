@@ -11,6 +11,9 @@
 //! * `the_whole_login_runs_and_the_game_socket_opens` — all eight stages, in
 //!   order, with no SNI, the pin recorded, the launch honoured and the game
 //!   socket's two handshake lines exactly right;
+//! * `a_two_game_script_logs_in_to_the_second_game` — a two-game list answered
+//!   as ONE `M` record: the second game is chosen and the session stays in
+//!   step (the record-per-game framing desynced here);
 //! * `a_changed_certificate_is_refused_before_anything_is_sent` — trust on
 //!   first use: a second server with a different certificate is refused at
 //!   `cert_pin`, and it never receives a line;
@@ -181,6 +184,80 @@ fn the_whole_login_runs_and_the_game_socket_opens() {
             CLIENT_IDENTIFICATION.to_string()
         ]
     );
+    game_server.join().expect("the mock game server ends cleanly");
+    eaccess.join().expect("the mock eaccess server ends cleanly");
+}
+
+#[test]
+fn a_two_game_script_logs_in_to_the_second_game() {
+    let dir = TempDir::new("two-games");
+
+    // The game socket first, so the launch can point at a real port.
+    let game_server = MockGame::start(STREAM).expect("the mock game server starts");
+    let mut script = EaccessScript::synthetic();
+    script.games.push(("DR".to_string(), "DragonRealms".to_string()));
+    script.launch.host = "127.0.0.1".to_string();
+    script.launch.port = game_server.addr().port();
+    let eaccess = MockEaccess::start(script.clone()).expect("the mock eaccess server starts");
+
+    // Ask for the SECOND game: the client must read both pairs out of the one
+    // `M` record and stay in step through the close.
+    let (outcome, stages) = login(
+        eaccess.addr().port(),
+        &script.account,
+        "Aelith",
+        Some("DR"),
+        &script.password,
+        &dir.pin(),
+    );
+    let login = outcome.expect("the login succeeds with two games offered");
+
+    // All eight stages, in the recovered order, exactly once each.
+    assert_eq!(stages, STAGES.to_vec());
+
+    // The second game came back, by code and by name.
+    assert_eq!(login.game_code(), "DR");
+    assert_eq!(login.game_name(), "DragonRealms");
+    assert_eq!(login.account(), script.account);
+    assert_eq!(login.character().name, "Aelith");
+    assert_eq!(login.launch().port, game_server.addr().port());
+    assert_eq!(login.launch().key, script.launch.key);
+
+    // `M` was asked for once and answered once; every later stage named the
+    // second game, so nothing was read out of step.
+    assert_eq!(
+        eaccess.requests(),
+        vec![
+            "K".to_string(),
+            format!("A\t{}\t<key>", script.account),
+            "M".to_string(),
+            "F\tDR".to_string(),
+            "G\tDR".to_string(),
+            "C".to_string(),
+            format!("L\t{}\tSTORM", script.characters[0].0),
+        ]
+    );
+    assert_eq!(eaccess.errors(), Vec::<String>::new());
+
+    // The game socket opens and streams exactly as it does for one game.
+    let mut socket = game::connect(
+        &login.launch().host,
+        login.launch().port,
+        &login.launch().key,
+    )
+    .expect("the game socket opens");
+    let mut stream = String::new();
+    socket.read_to_string(&mut stream).expect("the stream is read");
+    assert_eq!(stream, STREAM);
+    drop(socket);
+    assert_eq!(
+        game_server.received(),
+        vec![
+            script.launch.key.clone(),
+            CLIENT_IDENTIFICATION.to_string()
+        ]
+    );
+
     game_server.join().expect("the mock game server ends cleanly");
     eaccess.join().expect("the mock eaccess server ends cleanly");
 }

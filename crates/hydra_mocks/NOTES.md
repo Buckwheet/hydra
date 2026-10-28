@@ -36,12 +36,24 @@ provider is left alone, so calling it from several tests is fine).
 * ESTABLISHED (in the offline registry): `rustls 0.23.46`, `ring 0.17.14`.
 * NOT AVAILABLE: `rcgen` (not fetched), so the DER is built by hand.
 
-`cert::generate()` makes a fresh Ed25519 key with
-`Ed25519KeyPair::generate_pkcs8`, hand-encodes a minimal v3 self-signed
-certificate (`CN=eaccess.invalid`, validity `2024-01-01`..`2034-01-01`, no
-extensions) and signs the `tbsCertificate` with that key. Two calls never return
-the same certificate, which is what makes a "the pinned certificate changed"
-test possible: start a second `MockEaccess`.
+`cert::generate()` hand-encodes a minimal v3 self-signed certificate
+(`CN=eaccess.invalid`, validity `2024-01-01`..`2034-01-01`, no extensions) and
+signs the `tbsCertificate` with `sha256WithRSAEncryption`. The key is a
+throwaway **synthetic RSA-2048** PKCS#8 key embedded in `cert.rs` as bytes (not
+a file, and never read from disk), reused for every certificate; each call
+mints a fresh serial number, so two calls never return the same certificate,
+which is what makes a "the pinned certificate changed" test possible: start a
+second `MockEaccess`.
+
+RSA rather than Ed25519, because of the *client*: the real login uses the
+platform TLS stack (`native-tls`), and macOS Secure Transport in TLS 1.2 does
+not offer `ed25519` in its `signature_algorithms`. A rustls server holding an
+Ed25519 key therefore aborts the handshake with `incompatible signing key`, and
+the client only sees `connection closed via error`. RSA-2048 also matches the
+real eaccess server, which is static-RSA TLS 1.2. The server config is pinned to
+TLS 1.2 (`builder_with_protocol_versions(&[&rustls::version::TLS12])`) so it
+offers the TLS 1.2 ECDHE suite the client expects instead of negotiating
+TLS 1.3.
 
 `CN=eaccess.invalid` is deliberate — `.invalid` is reserved by RFC 2606, so the
 name can never resolve even if it escaped a test.
@@ -50,9 +62,9 @@ name can never resolve even if it escaped a test.
 
 | stage | client sends | server answers |
 | --- | --- | --- |
-| `k_response` | `K` | `K\t<script key>` |
+| `k_response` | `K` | `<script key>` — bare: no `K\t` prefix and no newline (the only reply that is not a newline-terminated record) |
 | `a_response` | `A\t<account>\t<keyed password>` | `A\t<account>\tKEY\t<session key>\t<holder>` or `PASSWORD` |
-| `m_response` | `M` | one `M\t<code>\t<name>` per script game, in order |
+| `m_response` | `M` | ONE record carrying every game pair in script order: `M\t<code1>\t<name1>\t<code2>\t<name2>…` (a one-game script is `M\tGS3\tGemStone IV` exactly) |
 | `f_response` | `F\t<game>` | `F\t<tier>` |
 | `g_response` | `G\t<game>` | `G\t<g_response>` |
 | `c_response` | `C` | `C\t<n>\t<n>\t0\t1` then `\t<code>\t<name>` per character |
@@ -60,6 +72,12 @@ name can never resolve even if it escaped a test.
 
 Then the server closes the TLS connection (`send_close_notify`), as the real one
 does.
+
+Framing rule (the same on both sides): **every client command is one record, and
+every reply is one record, read once.** So `M` is answered with a *single* record
+holding all the game pairs — never one record per game, which would leave every
+game after the first unread and shift the rest of the session by a reply. The
+same is true of `C`, whose character pairs already travel in one line.
 
 The password check is the recovered `hash_password` recipe, reimplemented here
 rather than imported: `out[i] = ((password[i] - 0x20) ^ key[i]) + 0x20`, refused
@@ -102,8 +120,8 @@ Behaviour choices worth knowing:
 ### UNKNOWN / departure
 
 * The `M` response tail is unknown: SPEC_P6 records `M\t<code>\t<name>\t...` but
-  not the remaining fields, so the mock sends `M\t<code>\t<name>` and nothing
-  more.
+  not the remaining fields, so the mock sends `\t<code>\t<name>` per game and
+  nothing more — all of them in the one record, in script order.
 * `C\t<n>\t<max>`: the observed line does not say what `max` counts, so the mock
   sends `max == n` (the character count).
 * The character list is one line with **two** fields per character

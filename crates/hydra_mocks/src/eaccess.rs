@@ -1,18 +1,26 @@
 //! The mock eaccess login server: **real TLS**, scripted, loopback only.
 //!
-//! A real login walks a fixed sequence of newline-terminated, tab-separated
-//! exchanges with `eaccess.play.net:7910` (SPEC_P6.md §1-6, and
-//! `hydra_net::eaccess::wire` for the framing the client side uses):
+//! A real login walks a fixed sequence of tab-separated exchanges with
+//! `eaccess.play.net:7910` (SPEC_P6.md §1-6, and `hydra_net::eaccess::wire` for
+//! the framing the client side uses):
 //!
 //! | stage | client sends | server answers |
 //! | --- | --- | --- |
-//! | `k_response` | `K` | `K\t<script key>` |
+//! | `k_response` | `K` | the bare `<script key>`: no `K\t`, no newline |
 //! | `a_response` | `A\t<account>\t<keyed password>` | `A\t<account>\tKEY\t<session key>\t<holder>`, or `PASSWORD` |
-//! | `m_response` | `M` | `M\t<code>\t<name>` per game |
+//! | `m_response` | `M` | one record: `M\t<code>\t<name>` for every game, in script order |
 //! | `f_response` | `F\t<game>` | `F\t<tier>` |
 //! | `g_response` | `G\t<game>` | `G\t<g_response>` |
 //! | `c_response` | `C` | `C\t<n>\t<n>\t0\t1` then `\t<code>\t<name>` per character |
 //! | `l_response` | `L\t<code>\tSTORM` | `L\tOK\t...GAMEHOST=...\tGAMEPORT=...\tKEY=...`, or `L\tPROBLEM\t1` |
+//!
+//! Framing is per *record*, not per line: every reply is framed first and then
+//! written with a single `write_all`, because the client reads exactly one
+//! record per reply.  Only the `K` reply is bare — the 32 key bytes and nothing
+//! else, no prefix and no newline; the other replies keep their trailing
+//! newline.  Each client command is one record too, its line and newline
+//! together, and it is read that way here: a client that sends half a line is
+//! refused rather than served as if it had finished the line.
 //!
 //! The TLS certificate is generated per server (see [`crate::cert`]) so a test
 //! can point a trust-on-first-use pin at it, and a *second* server presents a
@@ -71,7 +79,8 @@ pub struct EaccessScript {
     pub holder: String,
     /// The session key in the `A` response.
     pub session_key: String,
-    /// The game list: `(code, name)` pairs, answered in this order.
+    /// The game list: `(code, name)` pairs, all of them in the one `M` record,
+    /// in this order.
     pub games: Vec<(String, String)>,
     /// The subscription tier (`F` response).
     pub tier: String,
@@ -178,8 +187,8 @@ impl MockEaccess {
 
     /// The DER certificate this server presents.
     ///
-    /// Two servers never share one: the bytes come from a freshly generated key
-    /// each time, which is how a changed-certificate test is written.
+    /// Two servers never share one: every call mints a certificate with a fresh
+    /// serial number, which is how a changed-certificate test is written.
     pub fn certificate_der(&self) -> Vec<u8> {
         self.cert_der.clone()
     }
@@ -240,7 +249,12 @@ impl Drop for MockEaccess {
 }
 
 fn server_config(generated: &GeneratedCert) -> io::Result<ServerConfig> {
-    ServerConfig::builder()
+    // TLS 1.2 only.  The client is the platform TLS stack (Secure Transport on
+    // macOS) at `min_protocol_version(Tlsv12)`, and the real eaccess server is a
+    // TLS 1.2 server; pinning the mock to TLS 1.2 keeps the handshake on the
+    // TLS 1.2 ECDHE suite the client expects instead of letting rustls pick
+    // TLS 1.3.
+    ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(generated.cert_der.clone())],
@@ -323,30 +337,83 @@ struct Wire {
 }
 
 impl Wire {
-    /// Read one client line, recording it (with any key material masked).
+    /// Read one client record, recording it (with any key material masked).
     fn recv(&mut self, stage: &'static str) -> io::Result<Vec<u8>> {
-        let mut line = Vec::new();
-        let read = self.stream.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            return Err(stage_error(
-                stage,
-                "the client closed the connection instead of sending a line",
-            ));
-        }
-        while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
-            line.pop();
-        }
+        let record = self.read_record(stage)?;
         lock(&self.record)
             .requests
-            .push(redact_request(&lossy(&line)));
-        Ok(line)
+            .push(redact_request(&lossy(&record)));
+        Ok(record)
     }
 
-    /// Write one response line and flush it: the client is waiting on it.
+    /// Read one record: the bytes up to the newline that ends it, exclusive.
+    ///
+    /// The client writes a command as one record — the line and its newline
+    /// together — so the buffer is drained until that newline arrives (or the
+    /// connection ends) instead of trusting a single read to hold a whole one.
+    /// Nothing is returned before the newline, so a client that sends half a
+    /// line cannot be served as if it had sent a whole one: the session is
+    /// refused instead, with whatever arrived (masked) in the error.
+    fn read_record(&mut self, stage: &'static str) -> io::Result<Vec<u8>> {
+        let mut record = Vec::new();
+        loop {
+            let (consumed, ended) = {
+                let available = self.stream.fill_buf()?;
+                if available.is_empty() {
+                    return Err(if record.is_empty() {
+                        stage_error(
+                            stage,
+                            "the client closed the connection instead of sending a record",
+                        )
+                    } else {
+                        stage_error(
+                            stage,
+                            format!(
+                                "the record {:?} was never ended by a newline",
+                                truncate(&redact_request(&lossy(&record)))
+                            ),
+                        )
+                    });
+                }
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(end) => {
+                        record.extend_from_slice(&available[..end]);
+                        (end + 1, true)
+                    }
+                    None => {
+                        // The rest of the record is still in flight: keep what
+                        // arrived and read on.
+                        record.extend_from_slice(available);
+                        (available.len(), false)
+                    }
+                }
+            };
+            self.stream.consume(consumed);
+            if ended {
+                while record.last() == Some(&b'\r') {
+                    record.pop();
+                }
+                return Ok(record);
+            }
+        }
+    }
+
+    /// Write one response line as one record: the line, its newline, one write.
     fn send(&mut self, line: &str) -> io::Result<()> {
+        let mut record = Vec::with_capacity(line.len() + 1);
+        record.extend_from_slice(line.as_bytes());
+        record.push(b'\n');
+        self.send_record(&record)
+    }
+
+    /// Write one record exactly as given, with a single `write_all`.
+    ///
+    /// The `K` reply goes out this way: the bare key bytes, no prefix and no
+    /// newline, framed by the server alone because the client reads one record
+    /// per reply.
+    fn send_record(&mut self, record: &[u8]) -> io::Result<()> {
         let stream = self.stream.get_mut();
-        stream.write_all(line.as_bytes())?;
-        stream.write_all(b"\n")?;
+        stream.write_all(record)?;
         stream.flush()
     }
 
@@ -364,9 +431,10 @@ impl Wire {
 /// Walk the eight stages of a login against the script.
 fn converse(wire: &mut Wire, script: &EaccessScript) -> io::Result<()> {
     // 2. k_response: the client asks for the script key to key its password.
+    // The answer is the bare key: no `K\t` prefix, no newline, one record.
     let line = wire.recv("k_response")?;
     expect_command(&line, b'K', "k_response")?;
-    wire.send(&script.key)?;
+    wire.send_record(script.key.as_bytes())?;
 
     // 3. a_response: the account and the keyed password.
     let line = wire.recv("a_response")?;
@@ -409,12 +477,13 @@ fn converse(wire: &mut Wire, script: &EaccessScript) -> io::Result<()> {
         script.account, script.session_key, script.holder
     ))?;
 
-    // 4. m_response: the game list.
+    // 4. m_response: the game list, as ONE record carrying every pair in
+    // script order (`M\t<code1>\t<name1>\t<code2>\t<name2>…`).  A reply is one
+    // record per command, so sending one record per game would leave every game
+    // after the first unread and desync the rest of the session.
     let line = wire.recv("m_response")?;
     expect_command(&line, b'M', "m_response")?;
-    for (code, name) in &script.games {
-        wire.send(&format!("M\t{code}\t{name}"))?;
-    }
+    wire.send(&game_list(script))?;
 
     // 5. f_response: the tier for the chosen game.
     let line = wire.recv("f_response")?;
@@ -462,6 +531,19 @@ fn converse(wire: &mut Wire, script: &EaccessScript) -> io::Result<()> {
         game, script.launch.host, script.launch.port, script.launch.key
     ))?;
     Ok(())
+}
+
+/// The `M` reply: one record, `M` then every `\t<code>\t<name>` pair in script
+/// order.
+///
+/// It is a single record because the client reads exactly one reply record per
+/// command; a record per game would leave all but the first unread.
+fn game_list(script: &EaccessScript) -> String {
+    let mut response = String::from("M");
+    for (code, name) in &script.games {
+        response.push_str(&format!("\t{code}\t{name}"));
+    }
+    response
 }
 
 /// Check that a line is the expected command letter (alone or with fields).
@@ -608,10 +690,13 @@ mod tests {
             }
         }
 
+        /// Send one command record: the line and its newline, in one write.
         fn send_bytes(&mut self, line: &[u8]) {
+            let mut record = Vec::with_capacity(line.len() + 1);
+            record.extend_from_slice(line);
+            record.push(b'\n');
             let stream = self.stream.get_mut();
-            stream.write_all(line).unwrap();
-            stream.write_all(b"\n").unwrap();
+            stream.write_all(&record).unwrap();
             stream.flush().unwrap();
         }
 
@@ -619,10 +704,42 @@ mod tests {
             self.send_bytes(line.as_bytes());
         }
 
+        /// Read ONE server record.
+        ///
+        /// A reply is one record: it ends at its newline, or — for the bare `K`
+        /// reply, which has no newline at all — is whatever the server sent in
+        /// that write.  `read_line` cannot be used for this: it would wait
+        /// forever for a newline the server never sends.
+        fn recv_record(&mut self) -> Vec<u8> {
+            let (mut record, consumed) = {
+                let available = self.stream.fill_buf().unwrap();
+                assert!(
+                    !available.is_empty(),
+                    "the server closed the connection instead of answering"
+                );
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(end) => (available[..end].to_vec(), end + 1),
+                    None => (available.to_vec(), available.len()),
+                }
+            };
+            self.stream.consume(consumed);
+            while record.last() == Some(&b'\r') {
+                record.pop();
+            }
+            record
+        }
+
+        /// Read ONE server record as text (every reply here is ASCII).
         fn recv(&mut self) -> String {
-            let mut line = String::new();
-            self.stream.read_line(&mut line).unwrap();
-            line.trim_end_matches(['\r', '\n']).to_string()
+            let record = self.recv_record();
+            String::from_utf8(record).expect("a reply record is valid UTF-8")
+        }
+
+        /// Close the connection the way a client should: a TLS close_notify.
+        fn close(&mut self) {
+            let stream = self.stream.get_mut();
+            stream.conn.send_close_notify();
+            stream.flush().unwrap();
         }
 
         /// Everything left after the server closes: always empty.
@@ -650,14 +767,18 @@ mod tests {
     /// Walk the stages up to the character list, which the caller then uses.
     fn reach_character_list(client: &mut Client, script: &EaccessScript) {
         client.send("K");
-        assert!(client.recv().starts_with("K\t"));
+        // The bare key, with no `K\t` prefix and no newline.
+        assert_eq!(client.recv_record(), script.key.as_bytes());
         let keyed = keyed_password(&script.password, &script.key).unwrap();
         client.send_bytes(&a_line(&script.account, &keyed));
         assert!(client.recv().starts_with("A\t"));
         client.send("M");
-        for _ in &script.games {
-            assert!(client.recv().starts_with("M\t"));
+        // ONE `M` record: every game pair, in script order.
+        let mut expected = String::from("M");
+        for (code, name) in &script.games {
+            expected.push_str(&format!("\t{code}\t{name}"));
         }
+        assert_eq!(client.recv(), expected);
         client.send("F\tGS3");
         assert!(client.recv().starts_with("F\t"));
         client.send("G\tGS3");
@@ -679,9 +800,16 @@ mod tests {
         let server = MockEaccess::start(script.clone()).unwrap();
         let mut client = Client::connect(server.addr());
 
-        // 2. k_response.
+        // 2. k_response: the bare 32-byte key — no `K\t` prefix, no newline.
         client.send("K");
-        assert_eq!(client.recv(), format!("K\t{}", script.key));
+        let k_response = client.recv_record();
+        assert_eq!(k_response, script.key.as_bytes());
+        assert_eq!(k_response.len(), 32);
+        assert!(!k_response.contains(&b'\t'), "the key has no `K\\t` prefix");
+        assert!(
+            !k_response.contains(&b'\n'),
+            "the key is not newline-terminated"
+        );
 
         // 3. a_response: the keyed password, then the key and the holder.
         let keyed = keyed_password(&script.password, &script.key).unwrap();
@@ -701,15 +829,10 @@ mod tests {
         assert_eq!(fields[4], script.holder);
         assert_eq!(script.session_key.len(), 32, "a session key is 32 hex chars");
 
-        // 4. m_response: the game list, one line per game.
+        // 4. m_response: ONE record carrying every game pair.  This script
+        // offers a single game, so the shape is the one-game `M\tGS3\tGemStone IV`.
         client.send("M");
-        for (code, name) in &script.games {
-            let response = client.recv();
-            let fields: Vec<&str> = response.split('\t').collect();
-            assert_eq!(fields[0], "M");
-            assert_eq!(fields[1], code);
-            assert_eq!(fields[2], name);
-        }
+        assert_eq!(client.recv(), "M\tGS3\tGemStone IV");
 
         // 5. f_response.
         client.send("F\tGS3");
@@ -778,15 +901,15 @@ mod tests {
         let mut client = Client::connect(server.addr());
 
         client.send("K");
-        assert!(client.recv().starts_with("K\t"));
+        assert_eq!(client.recv_record(), script.key.as_bytes());
         let keyed = keyed_password(&script.password, &script.key).unwrap();
         client.send_bytes(&a_line(&script.account, &keyed));
         assert!(client.recv().starts_with("A\t"));
 
-        // One `M` line per game, in script order.
+        // ONE `M` record, every game pair in script order — not one record per
+        // game, which would leave the second one unread on the client.
         client.send("M");
-        assert_eq!(client.recv(), "M\tGS3\tGemStone IV");
-        assert_eq!(client.recv(), "M\tDR\tDragonRealms");
+        assert_eq!(client.recv(), "M\tGS3\tGemStone IV\tDR\tDragonRealms");
 
         client.send("F\tDR");
         assert_eq!(client.recv(), "F\tNORMAL");
@@ -817,7 +940,7 @@ mod tests {
         let mut client = Client::connect(server.addr());
 
         client.send("K");
-        assert!(client.recv().starts_with("K\t"));
+        assert_eq!(client.recv_record(), script.key.as_bytes());
 
         let keyed = keyed_password("wrong-password", &script.key).unwrap();
         client.send_bytes(&a_line(&script.account, &keyed));
@@ -838,7 +961,7 @@ mod tests {
         let mut client = Client::connect(server.addr());
 
         client.send("K");
-        assert!(client.recv().starts_with("K\t"));
+        assert_eq!(client.recv_record(), script.key.as_bytes());
         let keyed = keyed_password(&script.password, &script.key).unwrap();
         client.send_bytes(&a_line("someone-else", &keyed));
         assert_eq!(client.recv(), "PASSWORD");
@@ -850,7 +973,8 @@ mod tests {
 
     #[test]
     fn a_malformed_line_is_recorded_and_the_session_dropped() {
-        let server = MockEaccess::start(EaccessScript::synthetic()).unwrap();
+        let script = EaccessScript::synthetic();
+        let server = MockEaccess::start(script.clone()).unwrap();
         let mut client = Client::connect(server.addr());
 
         client.send("nonsense");
@@ -863,8 +987,72 @@ mod tests {
         // The server survives a malformed session: it is still listening.
         let mut second = Client::connect(server.addr());
         second.send("K");
-        assert!(second.recv().starts_with("K\t"));
+        assert_eq!(second.recv_record(), script.key.as_bytes());
         drop(second);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_record_without_its_newline_is_refused_not_served() {
+        let script = EaccessScript::synthetic();
+        let server = MockEaccess::start(script.clone()).unwrap();
+        let mut client = Client::connect(server.addr());
+
+        // Half a record: the line alone, with no newline to end it, then a clean
+        // TLS shutdown.  What arrived is not a command and must not be served.
+        {
+            let stream = client.stream.get_mut();
+            stream.write_all(b"K").unwrap();
+            stream.flush().unwrap();
+        }
+        client.close();
+        client
+            .stream
+            .get_mut()
+            .sock
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+
+        assert_eq!(client.remainder(), "");
+        // An unterminated record is not a line, so nothing is recorded as one.
+        assert_eq!(server.requests(), Vec::<String>::new());
+        let errors = server.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("[k_response]"), "{errors:?}");
+        assert!(errors[0].contains("never ended by a newline"), "{errors:?}");
+
+        // And the server is still serving.
+        let mut second = Client::connect(server.addr());
+        second.send("K");
+        assert_eq!(second.recv_record(), script.key.as_bytes());
+        // Let go of it, or the mock's session would wait out its read timeout
+        // while `join` waits for the thread.
+        drop(second);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_key_shorter_than_the_password_refuses_the_login() {
+        let mut script = EaccessScript::synthetic();
+        // Shorter than the password, so no keyed password can be computed: a
+        // real server refuses the login rather than truncating the password.
+        script.key = "short-key".to_string();
+        let server = MockEaccess::start(script.clone()).unwrap();
+        let mut client = Client::connect(server.addr());
+
+        client.send("K");
+        // Whatever its length, the K reply is still the bare key.
+        assert_eq!(client.recv_record(), script.key.as_bytes());
+
+        let keyed = keyed_password(&script.password, &script.key);
+        assert!(keyed.is_none(), "the script key is short on purpose");
+        client.send_bytes(&a_line(&script.account, b"unusable"));
+        assert_eq!(client.remainder(), "");
+
+        let errors = server.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("[a_response]"), "{errors:?}");
+        assert!(errors[0].contains("shorter than"), "{errors:?}");
         server.join().unwrap();
     }
 
@@ -887,13 +1075,14 @@ mod tests {
 
     #[test]
     fn the_same_server_serves_a_second_login_with_the_same_certificate() {
-        let server = MockEaccess::start(EaccessScript::synthetic()).unwrap();
+        let script = EaccessScript::synthetic();
+        let server = MockEaccess::start(script.clone()).unwrap();
         let certificate = server.certificate_der();
 
         for _ in 0..2 {
             let mut client = Client::connect(server.addr());
             client.send("K");
-            assert!(client.recv().starts_with("K\t"));
+            assert_eq!(client.recv_record(), script.key.as_bytes());
             // Walk away mid-script: the server must shrug and take the next
             // connection, still with the same certificate.
             drop(client);
@@ -949,8 +1138,10 @@ mod tests {
 
     #[test]
     fn the_command_letter_must_be_alone_or_followed_by_a_tab() {
+        // The `K` request is the bare letter (its reply is the bare key, so the
+        // `M\tGS3` example is the one with fields); the rest is the shape check.
         assert!(expect_command(b"K", b'K', "k_response").is_ok());
-        assert!(expect_command(b"K\tabc", b'K', "k_response").is_ok());
+        assert!(expect_command(b"M\tGS3", b'M', "m_response").is_ok());
         assert!(expect_command(b"KEY", b'K', "k_response").is_err());
         assert!(expect_command(b"", b'K', "k_response").is_err());
         assert!(expect_command(b"A\tx\ty", b'K', "k_response").is_err());

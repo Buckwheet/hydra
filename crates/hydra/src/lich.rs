@@ -486,14 +486,12 @@ fn drain(keyed: &KeyedRelay, out: &mut dyn Write, printed: &mut usize) -> io::Re
     out.flush()
 }
 
-/// What `hydra play`/`hydra serve` say when `.lich` is off: there is nothing
-/// for this headless phase to do, and it says so instead of doing nothing.
+/// What `hydra play`/`hydra serve` say when `.lich` is off: the one thing
+/// missing is Lich, so the sentence names only that.
 pub fn off_message(label: &str) -> String {
     format!(
-        "{label}: Lich is off for this character, and this headless phase has no game \
-         connection; it needs a live game connection (hydra_table's connector, hydra_net's \
-         login) and Lich set to on (`lich.json` key \"on\", or `.lich on` in a session). \
-         See crates/hydra/NOTES.md."
+        "{label}: Lich is off for this character; this command needs Lich set to on \
+         (`lich.json` key \"on\", or `.lich on` in a session). See crates/hydra/NOTES.md."
     )
 }
 
@@ -672,7 +670,12 @@ mod tests {
     fn the_off_message_says_what_is_missing() {
         let message = off_message("hydra play");
         assert!(message.starts_with("hydra play: Lich is off for this character"), "{message}");
-        assert!(message.contains("no game connection"), "{message}");
+        // The one thing missing is Lich itself: `play` and `serve` both log in
+        // and connect a game since Phase 6/7, so the sentence must not claim
+        // otherwise.
+        assert!(message.contains("Lich set to on"), "{message}");
+        assert!(message.contains("`.lich on`"), "{message}");
+        assert!(!message.contains("no game connection"), "{message}");
         assert!(message.contains("NOTES.md"), "{message}");
         assert!(off_message("hydra serve").starts_with("hydra serve: "));
     }

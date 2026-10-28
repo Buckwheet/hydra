@@ -4,3 +4,10 @@ target
 
 # Test-generated ledger when HYDRA_DATA_DIR is unset
 crates/hydra/data/
+
+# Other test-generated artifacts: the ledger's SQLite file, the certificate pin
+# (`simu.pem`, written on first use) and session recordings (`*.bytes`).
+# Nothing here is tracked; a test run must not leave untracked noise behind.
+hydra.db
+*.pem
+*.bytes

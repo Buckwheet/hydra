@@ -273,12 +273,17 @@ mod tests {
         }
     }
 
+    /// `~/Library/Application Support/Hydra` built with joins here, so the
+    /// expectation is spelled with this platform's separators.
+    fn bundle_dir(home: &str) -> PathBuf {
+        BUNDLE_DIR
+            .iter()
+            .fold(PathBuf::from(home), |dir, piece| dir.join(piece))
+    }
+
     #[test]
     fn the_data_folder_is_application_support() {
-        assert_eq!(
-            app_data_dir(Path::new("/Users/x")),
-            PathBuf::from("/Users/x/Library/Application Support/Hydra")
-        );
+        assert_eq!(app_data_dir(Path::new("/Users/x")), bundle_dir("/Users/x"));
     }
 
     #[test]
@@ -286,7 +291,7 @@ mod tests {
         let exe = Path::new("/Applications/Hydra.app/Contents/MacOS/hydra");
         assert_eq!(
             prepare_from(exe, Some(PathBuf::from("/Users/x"))).unwrap(),
-            Some(PathBuf::from("/Users/x/Library/Application Support/Hydra"))
+            Some(bundle_dir("/Users/x"))
         );
         assert_eq!(
             prepare_from(exe, None).unwrap_err(),
@@ -337,33 +342,31 @@ mod tests {
 
     #[test]
     fn the_detach_plan_names_the_log_and_the_folder() {
+        let exe = Path::new("/opt/hydra/hydra");
+        let data = Path::new("/synthetic/data");
         let args = vec!["Aelith".to_string(), "--detach".to_string()];
-        let plan = plan_detach(
-            Path::new("/opt/hydra/hydra"),
-            &args,
-            Path::new("/synthetic/data"),
-            Some(Path::new("/synthetic/in")),
-        );
-        assert_eq!(plan.exe, PathBuf::from("/opt/hydra/hydra"));
+        let plan = plan_detach(exe, &args, data, Some(Path::new("/synthetic/in")));
+        assert_eq!(plan.exe.as_path(), exe);
         assert_eq!(plan.args, vec!["serve".to_string(), "Aelith".to_string()]);
-        assert_eq!(plan.data, PathBuf::from("/synthetic/data"));
-        assert_eq!(plan.log, PathBuf::from("/synthetic/data/hydra.log"));
-        assert_eq!(plan.cwd, Some(PathBuf::from("/synthetic/in")));
+        assert_eq!(plan.data.as_path(), data);
+        // The log is `<data>/hydra.log`, spelled with this platform's
+        // separators rather than a hard-coded slash path.
+        assert_eq!(plan.log, log_path(data));
+        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/synthetic/in")));
 
         // Without `--in` the child inherits the parent's folder.
-        let plan = plan_detach(
-            Path::new("/opt/hydra/hydra"),
-            &args,
-            Path::new("/synthetic/data"),
-            None,
-        );
+        let plan = plan_detach(exe, &args, data, None);
         assert_eq!(plan.cwd, None);
-        assert_eq!(log_path(Path::new("/synthetic/data")), plan.log);
+        assert_eq!(log_path(data), plan.log);
 
         // The recovered line names the log.
+        let log = log_path(data);
         assert_eq!(
-            resting(Path::new("/synthetic/data/hydra.log")),
-            "[hydra] resting in the background; its log is /synthetic/data/hydra.log"
+            resting(&log),
+            format!(
+                "[hydra] resting in the background; its log is {}",
+                log.display()
+            )
         );
     }
 

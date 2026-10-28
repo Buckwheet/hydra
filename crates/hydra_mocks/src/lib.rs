@@ -6,8 +6,8 @@
 //! * [`MockEaccess`] — the eaccess login service over **real TLS**, speaking the
 //!   tab-separated stage script a real login walks: `K`, `A`, `M`, `F`, `G`,
 //!   `C`, `L` (see `hydra_net::eaccess::wire` and SPEC_P6.md).  Its certificate
-//!   is a self-signed Ed25519 certificate generated at test time ([`cert`]), so
-//!   no key or certificate fixture is ever committed.
+//!   is a self-signed RSA certificate minted at test time ([`cert`]), so no
+//!   certificate fixture is ever committed.
 //! * [`MockGame`] — the game socket entry point: plain TCP, reads the two-line
 //!   handshake (`KEY`, then [`CLIENT_IDENTIFICATION`]) and writes exactly the
 //!   synthetic XML stream it was started with.

@@ -319,8 +319,8 @@ commands themselves live in `hydra_session::lich_command` (see
 | `start(&plan)` | `hydra_lich::relay::start_keyed_minted(&Launch::new(ruby, folder/lich.rbw))`: bind loopback, spawn `ruby -e … -e … <folder>/lich.rbw --pipe --stormfront --sentinel -g 127.0.0.1:<port>`, write the two-line stdin handshake, accept the keyed connection (`docs/LICH_WIRE.md` §1-2). Its failure paths kill and reap the child, so a refused start leaves no orphan. |
 | `announce(&plan, out)` | the two recovered start lines, on stdout: `Lich is at <dir>, for every character.` then `Lich is starting, from <dir>\lich.rbw.` — the message keeps the literal backslash of the Windows reference build while the path spawned is `<dir>/lich.rbw` on this platform (`lich_command::script_path`). |
 | `relay(&mut keyed, out, session)` | print Lich's stdout lines through `hydra_lich::wire::LichOut` (so the 0x1F chunk byte is stripped) until `Relay::pump` reports the child gone, or until the session stops (`SessionHandle::stopping`, the recovered cancellation token), which kills and reaps Lich first. Returns Lich's exit status. |
-| `relay_game(&mut keyed, &mut game, out, session)` | Phase 6's two-way relay: Lich's stdout through `LichOut`, game lines to Lich's accepted socket, Lich's `<c>`/bare frames back to the game, until the child or the game ends. Used by `play`; `serve` still calls the Lich-only `relay`. |
-| `off_message(label)` | what `play`/`serve` say when `.lich` is off. The sentence is the Phase 3 text and still says "no game connection": that is exactly true of `serve`, and is kept verbatim for `play` rather than paraphrasing a recovered string. |
+| `relay_game(&mut keyed, &mut game, out, session)` | Phase 6's two-way relay: Lich's stdout through `LichOut`, game lines to Lich's accepted socket, Lich's `<c>`/bare frames back to the game, until the child or the game ends. Used by `play` and, since Phase 7, by `serve`. |
+| `off_message(label)` | what `play`/`serve` say when `.lich` is off: `<label>: Lich is off for this character; this command needs Lich set to on (`lich.json` key "on", or `.lich on` in a session). See crates/hydra/NOTES.md.` Since Phase 6/7 both commands log in and connect a game, so Lich being off is the only thing the sentence names. |
 | `character_of(tokens)` | the character a `play`/`serve` command line names: the first word that is neither an option nor an option's value (`VALUE_OPTIONS` is `--account`/`--game`/`--in`/`--web`; `--detach` takes none). |
 
 `main`'s `run` sends `Command::Play` through `login::play` (Phase 6: settings
@@ -331,10 +331,9 @@ stderr, exit 1; a refusal → that sentence on stderr, exit 1; otherwise start,
 announce, relay, exit 0. `Command::Login` is `login::login`; the bare hub,
 `import` and `lookout seed` are unchanged and still report what they need.
 
-**Not wired, deliberately:** `serve` never writes to the accepted socket and
-never reads Lich's `<c>`/bare command lines back, because it has no game
-connection to relay them to (`play` does both through `relay_game`).
-`--detach`/`--web`/`--in` for `serve` are still ignored.
+**Wired since Phase 7:** `serve` runs the same two-way `relay_game` session as
+`play` (writing to the accepted socket and reading Lich's `<c>`/bare lines back)
+and supports `--detach`, `--web` and `--in` (§8.4).
 
 ## 7. `hydra replay` — the report
 
@@ -458,9 +457,10 @@ Every still-unwired command prints
 `hydra <name>: not wired up in this headless phase; it needs <crates>. See crates/hydra/NOTES.md.`
 on stderr and exits 1 — the same shape as every other failure `hydra::main`
 reports (`0x10021dffc`). `play`/`serve` with Lich off print
-`hydra <name>: Lich is off for this character, and this headless phase has no
-game connection; it needs …` instead: same channel, same status, and it names
-both missing halves.
+`hydra <name>: Lich is off for this character; this command needs Lich set to
+on (…). See crates/hydra/NOTES.md.` instead: same channel, same status, and it
+names the one thing missing (Lich), since both commands do log in and connect a
+game (§8.1, §8.4).
 
 ### 8.1 The login, and `play` through it (Phase 6)
 
@@ -496,10 +496,9 @@ both missing halves.
 * **`hydra play`** keeps the Phase 3 gating order *without any network*: Lich
   off → `lich::off_message`; no folder / no `lich.rbw` / no Ruby → the recovered
   sentence. Only then: login, `lich::start`, the two start lines, the game
-  socket, and `lich::relay_game`.  (The `off_message` sentence still says the
-  phase has no game connection: it is the Phase 3 text, kept verbatim because
-  the recovered sentences are quoted, not paraphrased — since Phase 7 that
-  sentence is out of date for both `play` and `serve`.)
+  socket, and `lich::relay_game`.  The `off_message` sentence names Lich being
+  off as the one thing missing; both `play` (Phase 6) and `serve` (Phase 7) log
+  in and connect a game, so it does not mention a game connection.
 
 ### 8.2 What `play` (and now `serve`) relays
 

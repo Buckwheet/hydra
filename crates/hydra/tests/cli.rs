@@ -268,6 +268,11 @@ fn play_and_serve_say_that_lich_is_off() {
             err.starts_with(&format!("hydra {}: Lich is off for this character", args[0])),
             "{args:?}: {err}"
         );
-        assert!(err.contains("no game connection"), "{args:?}: {err}");
+        // Both commands log in and connect a game since Phase 6/7, so the only
+        // thing the sentence may say is missing is Lich itself.
+        assert!(err.contains("Lich set to on"), "{args:?}: {err}");
+        assert!(err.contains("`.lich on`"), "{args:?}: {err}");
+        assert!(err.contains("crates/hydra/NOTES.md"), "{args:?}: {err}");
+        assert!(!err.contains("no game connection"), "{args:?}: {err}");
     }
 }

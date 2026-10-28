@@ -321,7 +321,10 @@ mod tests {
     #[test]
     fn expect_echo_matches_the_command_letter() {
         assert!(expect_echo("A\tOK\n", b'A', "a_response").is_ok());
-        assert!(expect_echo("K\tabc", b'K', "k_response").is_ok());
+        // A lettered reply; the `K` reply is the exception — it is the bare key
+        // with no leading letter at all (`handshake::sge_key`), so a command
+        // letter check never applies to it.
+        assert!(expect_echo("F\tGS3", b'F', "f_response").is_ok());
         let err = expect_echo("M\t1", b'A', "a_response").unwrap_err();
         assert_eq!(err.stage, "a_response");
         assert!(

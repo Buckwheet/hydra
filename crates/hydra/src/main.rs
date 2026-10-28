@@ -65,6 +65,7 @@ mod lich;
 mod login;
 mod render;
 mod replay;
+mod serve;
 mod session;
 mod source;
 mod started;
@@ -158,58 +159,15 @@ fn run(command: &Command) -> Option<String> {
         Command::Play { targets } => login::play(targets).err(),
         // `login` is the same login without Lich: the raw XML stream on stdout.
         Command::Login { targets } => login::login(targets).err(),
-        Command::Serve { args } => {
-            let label = command.label();
-            match lich::load_settings() {
-                Ok(settings) => lich_side(label, &lich::character_of(args), &settings),
-                Err(err) => Some(format!("{label}: {err}")),
-            }
-        }
+        // `hydra serve` runs the whole session without a window: the login,
+        // this character's Lich, the game socket and the two-way relay, plus
+        // `--in <dir>` (chdir + input spool) and `--web <port>` (the headless
+        // page) — [`serve`].  `--detach` re-spawns itself and exits 0.
+        Command::Serve { args } => serve::run(args).err(),
         // The bare hub reaches the same `gui::run` in the recovered dispatch
         // (`0x10021dd40`), but this headless phase keeps it reporting rather
         // than opening a window; only the explicit `gui` word launches.
         Command::Hub | Command::Import { .. } | Command::LookoutSeed => Some(not_wired(command)),
-    }
-}
-
-/// The Lich side of `hydra play` / `hydra serve`: start Lich with the observed
-/// semantics when `.lich on` is set, say the two recovered start lines, relay
-/// Lich's stdout until it exits or the session stops, and return.
-///
-/// With `.lich` off there is nothing this headless phase can do — no game
-/// connection exists — so it says so rather than doing nothing.  A refusal
-/// reports one of the recovered sentences (`Where Lich is has not been said…`,
-/// `… has no lich.rbw in it`, `Lich needs Ruby…`) on stderr with status 1.
-///
-/// The settings are an argument (not read here) so the tests can drive every
-/// branch without touching the filesystem.
-fn lich_side(
-    label: &str,
-    character: &str,
-    settings: &hydra_session::lich_command::LichSettings,
-) -> Option<String> {
-    if !settings.on {
-        return Some(lich::off_message(label));
-    }
-    let plan = match lich::plan(settings) {
-        Ok(plan) => plan,
-        Err(refusal) => return Some(refusal.message()),
-    };
-    // The session owns the cancellation token the relay watches; there is no
-    // game connection in this phase, so nothing else touches it.
-    let session = session::Headless::new(character);
-    let mut keyed = match lich::start(&plan) {
-        Ok(keyed) => keyed,
-        Err(err) => return Some(format!("{label}: Lich could not be started: {err}")),
-    };
-    let mut out = std::io::stdout();
-    if let Err(err) = lich::announce(&plan, &mut out) {
-        let _ = keyed.relay.stop();
-        return Some(format!("{label}: {err}"));
-    }
-    match lich::relay(&mut keyed, &mut out, session.handle()) {
-        Ok(_status) => None,
-        Err(err) => Some(format!("{label}: {err}")),
     }
 }
 
@@ -246,18 +204,16 @@ fn gui_launch(targets: &[String]) -> hydra_gui::app::Launch {
 
 /// Why a recognised subcommand does not run in this phase.
 ///
-/// `play` and `login` are no longer here: since Phase 6 they log in for real
-/// ([`login`]) — `login` streams the raw XML, `play` relays it through Lich.
-/// `serve` is Lich-only: it starts Lich when `.lich on` is set ([`lich_side`])
-/// and reports [`lich::off_message`] when it is not; what it still lacks is the
-/// resting/serve window.
+/// `play`, `login` and `serve` are no longer here: since Phase 6 the first two
+/// log in for real ([`login`]), and since Phase 7 `serve` does too
+/// ([`serve`]) — with `--in <dir>` and `--web <port>`.  What `serve` still
+/// lacks is the window and the recovered resting loop over a captured session.
 fn not_wired(command: &Command) -> String {
     let needs = match command {
         Command::Hub => {
             "the window (egui/eframe: hydra_gui, hydra_ui, hydra_board, gs_render)"
         }
         Command::Play { .. } | Command::Login { .. } => "nothing: it is wired",
-        Command::Serve { .. } => "the resting/serve window (hydra_web, hydra_table)",
         Command::Import { .. } => "the ledger (hydra_import, hydra_ledger)",
         Command::LookoutSeed => "the data folder and the player logs (hydra_table, hydra_net)",
         _ => "nothing: it is wired",
@@ -297,17 +253,21 @@ mod tests {
 
     #[test]
     fn every_unwired_command_says_what_it_needs() {
-        // `login` and `play` are wired since Phase 6 (they log in for real):
-        // `tests/login.rs` covers them, and `crate::login`'s own tests cover the
-        // argument and roster half without a socket.
-        for command in [Command::Hub, Command::Import { paths: vec![] }, Command::LookoutSeed] {
+        // `login`, `play` and `serve` are wired (Phases 6 and 7: they log in for
+        // real): `tests/{login,play_stdin,serve}.rs` cover them, and
+        // `crate::login`/`crate::serve`'s own tests cover the argument half
+        // without a socket.
+        for command in [
+            Command::Hub,
+            Command::Import { paths: vec![] },
+            Command::LookoutSeed,
+        ] {
             let message = run(&command).expect("a message");
             assert!(message.contains("not wired up in this headless phase"), "{message}");
             assert!(message.contains("NOTES.md"), "{message}");
         }
         assert!(not_wired(&Command::Hub).contains("eframe"));
         assert!(not_wired(&Command::LookoutSeed).contains("hydra_table"));
-        assert!(not_wired(&Command::Serve { args: vec![] }).contains("hydra_web"));
     }
 
     #[test]
@@ -319,7 +279,7 @@ mod tests {
         // `.lich` is off, and neither touches the network.
         let message = crate::login::play_with("hydra play", &[], Ok(off.clone())).unwrap_err();
         assert!(message.starts_with("hydra play: Lich is off"), "{message}");
-        let message = lich_side("hydra serve", "Aelith", &off).expect("a message");
+        let message = crate::serve::run_with(&named, Ok(off)).unwrap_err();
         assert!(message.starts_with("hydra serve: Lich is off"), "{message}");
 
         // On, but nothing says where Lich is: the recovered sentence, no spawn.
@@ -332,7 +292,7 @@ mod tests {
             WHERE_NOT_SAID_SENTENCE
         );
         assert_eq!(
-            lich_side("hydra serve", "Aelith", &on).unwrap(),
+            crate::serve::run_with(&named, Ok(on)).unwrap_err(),
             WHERE_NOT_SAID_SENTENCE
         );
 
@@ -349,7 +309,7 @@ mod tests {
             crate::login::play_with("hydra play", &named, Ok(on.clone())).unwrap_err(),
             expected
         );
-        assert_eq!(lich_side("hydra serve", "Aelith", &on).unwrap(), expected);
+        assert_eq!(crate::serve::run_with(&named, Ok(on)).unwrap_err(), expected);
     }
 
     #[test]

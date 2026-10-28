@@ -139,6 +139,110 @@ pub fn prepare_from(exe: &Path, home: Option<PathBuf>) -> Result<Option<PathBuf>
     Ok(Some(app_data_dir(&home)))
 }
 
+/// The recovered log file name inside the data folder (`__const`
+/// `0x10206fc9f`): `hydra.log`.
+pub const LOG_FILE: &str = "hydra.log";
+
+/// The flag the detached child must not see again (`--detach`).
+pub const DETACH_FLAG: &str = "--detach";
+
+/// The recovered message `hydra::startup::detach` prints for the parent
+/// (`__const` `0x103e2546b`, `[hydra] resting in the background; its log is `).
+pub fn resting(log: &Path) -> String {
+    format!("[hydra] resting in the background; its log is {}", log.display())
+}
+
+/// The log's path inside `data` (`hydra_table::account::data_dir` in practice).
+pub fn log_path(data: &Path) -> PathBuf {
+    data.join(LOG_FILE)
+}
+
+/// The argv a detached child runs: `serve`, then `args` with every `--detach`
+/// removed.
+///
+/// **RECOVERED** shape: `hydra::startup::detach` spawned
+/// `std::process::Command::new(exe()).arg("serve").args(args)`, where `args` is
+/// the parent's own argument list minus the flag that would make the child
+/// detach again.
+pub fn detach_args(args: &[String]) -> Vec<String> {
+    let mut out = vec![SUBCOMMAND.to_string()];
+    out.extend(
+        args.iter()
+            .filter(|arg| arg.as_str() != DETACH_FLAG)
+            .cloned(),
+    );
+    out
+}
+
+/// The subcommand a detached child runs.
+pub const SUBCOMMAND: &str = "serve";
+
+/// Everything the spawn needs, as a value, so the argv/cwd rules are testable
+/// without starting a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detach {
+    /// the executable to spawn (`hydra::startup::exe`)
+    pub exe: PathBuf,
+    /// `serve` + the parent's arguments without `--detach`
+    pub args: Vec<String>,
+    /// the data folder (`hydra_table::account::data_dir`)
+    pub data: PathBuf,
+    /// `<data>/hydra.log`
+    pub log: PathBuf,
+    /// the child's working directory (`--in <dir>`, if given)
+    pub cwd: Option<PathBuf>,
+}
+
+/// [`Detach`] for these values — the pure half of [`detach`].
+pub fn plan_detach(exe: &Path, args: &[String], data: &Path, cwd: Option<&Path>) -> Detach {
+    Detach {
+        exe: exe.to_path_buf(),
+        args: detach_args(args),
+        data: data.to_path_buf(),
+        log: log_path(data),
+        cwd: cwd.map(Path::to_path_buf),
+    }
+}
+
+/// Rest in the background: spawn this executable as `hydra serve` with stdin
+/// closed and stdout/stderr appended to `<data>/hydra.log`.
+///
+/// **RECOVERED** (`0x10021f40c`): `hydra_table::account::data_dir`, create it,
+/// open `<data>/hydra.log` create+append, spawn `serve <args>` with
+/// `stdin(Stdio::null())` and both output streams on that file.  The child is
+/// *not* waited for; the parent goes on to print [`resting`].
+pub fn detach(args: &[String], cwd: Option<&Path>) -> Result<PathBuf, String> {
+    let plan = plan_detach(exe(), args, &hydra_table::account::data_dir(), cwd);
+    std::fs::create_dir_all(&plan.data).map_err(|err| {
+        format!(
+            "{} cannot be made: {err}",
+            plan.data.display()
+        )
+    })?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&plan.log)
+        .map_err(|err| format!("{}: {err}", plan.log.display()))?;
+    let copy = log
+        .try_clone()
+        .map_err(|err| format!("{}: {err}", plan.log.display()))?;
+
+    let mut command = std::process::Command::new(&plan.exe);
+    command
+        .args(&plan.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(copy)
+        .stderr(log);
+    if let Some(cwd) = &plan.cwd {
+        command.current_dir(cwd);
+    }
+    command
+        .spawn()
+        .map_err(|err| format!("{}: {err}", plan.exe.display()))?;
+    Ok(plan.log)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +299,72 @@ mod tests {
         let exe = Path::new("/Users/x/Code/hydra-recon/target/debug/hydra");
         assert_eq!(prepare_from(exe, Some(PathBuf::from("/Users/x"))).unwrap(), None);
         assert_eq!(prepare_from(exe, None).unwrap(), None);
+    }
+
+    #[test]
+    fn the_detached_argv_is_serve_without_the_detach_flag() {
+        let args: Vec<String> = ["Aelith", "--detach", "--web", "7788", "--in", "/tmp/in"]
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        assert_eq!(
+            detach_args(&args),
+            vec![
+                "serve".to_string(),
+                "Aelith".to_string(),
+                "--web".to_string(),
+                "7788".to_string(),
+                "--in".to_string(),
+                "/tmp/in".to_string(),
+            ]
+        );
+        // Every occurrence goes, not just the first, and no other word is
+        // touched (including a value that merely starts with `--`).
+        let args: Vec<String> = ["--detach", "--detach", "--web", "1"]
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        assert_eq!(
+            detach_args(&args),
+            vec![
+                "serve".to_string(),
+                "--web".to_string(),
+                "1".to_string()
+            ]
+        );
+        assert_eq!(detach_args(&[]), vec!["serve".to_string()]);
+    }
+
+    #[test]
+    fn the_detach_plan_names_the_log_and_the_folder() {
+        let args = vec!["Aelith".to_string(), "--detach".to_string()];
+        let plan = plan_detach(
+            Path::new("/opt/hydra/hydra"),
+            &args,
+            Path::new("/synthetic/data"),
+            Some(Path::new("/synthetic/in")),
+        );
+        assert_eq!(plan.exe, PathBuf::from("/opt/hydra/hydra"));
+        assert_eq!(plan.args, vec!["serve".to_string(), "Aelith".to_string()]);
+        assert_eq!(plan.data, PathBuf::from("/synthetic/data"));
+        assert_eq!(plan.log, PathBuf::from("/synthetic/data/hydra.log"));
+        assert_eq!(plan.cwd, Some(PathBuf::from("/synthetic/in")));
+
+        // Without `--in` the child inherits the parent's folder.
+        let plan = plan_detach(
+            Path::new("/opt/hydra/hydra"),
+            &args,
+            Path::new("/synthetic/data"),
+            None,
+        );
+        assert_eq!(plan.cwd, None);
+        assert_eq!(log_path(Path::new("/synthetic/data")), plan.log);
+
+        // The recovered line names the log.
+        assert_eq!(
+            resting(Path::new("/synthetic/data/hydra.log")),
+            "[hydra] resting in the background; its log is /synthetic/data/hydra.log"
+        );
     }
 
     #[test]

@@ -356,6 +356,83 @@ pub fn spawn_stdin(session: Headless) -> io::Result<(Receiver<Handled>, thread::
     Ok((requests, handle))
 }
 
+/// How often [`spawn_spool`] looks in its folder for new files.
+pub const SPOOL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The spool files in `dir`: every regular file whose name does not start with
+/// `.`, in name order.
+///
+/// **ADDITION** (`hydra serve --in <dir>`, see `crates/hydra/NOTES.md` §8): the
+/// reference build only *entered* the folder.  The hidden files a `.DS_Store`
+/// or an editor leaves behind are skipped, so only what was meant as input is
+/// read.
+pub fn spooled(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| match path.file_name() {
+            Some(name) => !name.to_string_lossy().starts_with('.'),
+            None => false,
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Read typed input from a spool folder instead of this process's stdin.
+///
+/// **ADDITION**: `hydra serve --in <dir>` has no keyboard (it is usually
+/// detached), so what would be typed is dropped into files in `dir` instead.
+/// Each file is read line by line through [`dispatch`] — the same rules as
+/// stdin, so `.lich`/`;status`/game-vs-Lich are identical — and removed once it
+/// has been read.  The thread ends when the session stops or the receiver is
+/// dropped, and is deliberately not joined: it may be asleep between polls.
+pub fn spawn_spool(
+    dir: PathBuf,
+    session: Headless,
+) -> io::Result<(Receiver<Handled>, thread::JoinHandle<()>)> {
+    let (sender, requests) = mpsc::channel();
+    let handle = thread::Builder::new()
+        .name("hydra-spool".to_string())
+        .spawn(move || {
+            let mut out = io::stdout();
+            loop {
+                if session.handle().stopping() {
+                    return;
+                }
+                for file in spooled(&dir) {
+                    let Ok(handle) = std::fs::File::open(&file) else {
+                        continue;
+                    };
+                    let mut keep_going = true;
+                    pump(io::BufReader::new(handle), |line| {
+                        if !keep_going {
+                            return;
+                        }
+                        if let Ok(handled) = dispatch(line, &session, &mut out) {
+                            if !handled.is_idle() && sender.send(handled).is_err() {
+                                // The relay loop is gone: this run is over.
+                                keep_going = false;
+                            }
+                        }
+                    });
+                    // The file is consumed whether or not it was wanted: that is
+                    // what "spool" means, and it keeps a failed line from being
+                    // replayed forever.
+                    let _ = std::fs::remove_file(&file);
+                    if !keep_going {
+                        return;
+                    }
+                }
+                thread::sleep(SPOOL_POLL);
+            }
+        })?;
+    Ok((requests, handle))
+}
+
 /// Watch for Ctrl-C while the run lasts.
 ///
 /// **RECOVERED** shape (`0x100025b34`'s `tokio::select!` arm): Ctrl-C sends
@@ -453,6 +530,25 @@ mod tests {
 
     fn text(buffer: &[u8]) -> String {
         String::from_utf8(buffer.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn the_spool_skips_hidden_files_and_reads_the_rest() {
+        let dir = std::env::temp_dir().join(format!("hydra-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b"), "second\n").unwrap();
+        std::fs::write(dir.join("a"), "first\n").unwrap();
+        // What an editor or the Finder leaves behind is not input.
+        std::fs::write(dir.join(".DS_Store"), "not input\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        let names: Vec<String> = spooled(&dir)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

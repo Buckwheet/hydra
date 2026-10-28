@@ -41,6 +41,11 @@ tokio = { workspace = true }
 # `eframe` is named here only so the tests can assert `Renderer::Wgpu` on the
 # built `NativeOptions` — the types come from the same pinned git rev.
 hydra_gui = { path = "../hydra_gui" }
+# Phase 7: `hydra serve --web <port>` serves the headless page through
+# `hydra_web::Server` (the recovered `hydra_web::Server`, `pairing::pairing` and
+# `hydra_web::http::respond`).  Only the page and the accept loop are used — no
+# mDNS (`bonjour`) and no websocket.
+hydra_web = { path = "../hydra_web" }
 eframe = { workspace = true }
 
 [dev-dependencies]

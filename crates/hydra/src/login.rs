@@ -240,7 +240,10 @@ fn say_stage(stage: Stage) {
 }
 
 /// Log in for `target` and print every stage on stderr.
-fn sign_in(target: &Target, password: &str) -> Result<Login, String> {
+///
+/// `pub(crate)` so `hydra serve` runs exactly this login (same stages, same
+/// refusals) rather than a second copy of it.
+pub(crate) fn sign_in(target: &Target, password: &str) -> Result<Login, String> {
     let config = LoginConfig {
         account: &target.account,
         character: &target.character,
@@ -253,7 +256,9 @@ fn sign_in(target: &Target, password: &str) -> Result<Login, String> {
 }
 
 /// Open the game socket the login named.
-fn open_game(launch: &handshake::LaunchOwned) -> Result<TcpStream, String> {
+///
+/// `pub(crate)` for the same reason as [`sign_in`].
+pub(crate) fn open_game(launch: &handshake::LaunchOwned) -> Result<TcpStream, String> {
     eprintln!("[login] [stage: game_connect]");
     game::connect(&launch.host, launch.port, &launch.key).map_err(|error| {
         format!(

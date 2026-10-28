@@ -449,7 +449,7 @@ Facts, for a later pass:
 | `hydra login <char> [--account A] [--game G]` | **runs** | the real eaccess login (`hydra_net::eaccess::handshake`), then the game socket: the raw XML goes to stdout; §8.1 |
 | `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends, and reads what the player types on stdin; §8.1, §8.3 |
 | `hydra play …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` — said before anything is dialled |
-| `hydra serve …` with `.lich on` | **runs** (the Lich side only) | starts Lich, prints the two start lines, relays Lich's stdout until it exits; **no login, no game socket** (§8.2) |
+| `hydra serve …` with `.lich on` | **runs** | the whole session without a window: login, Lich, game socket, two-way relay — plus `--in <dir>` (chdir + input spool) and `--web <port>` (the headless page) and `--detach`; §8.4 |
 | `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` (§6.4) |
 | `hydra import …` | recognised, exit 1 | needs `hydra_import` + `hydra_ledger` |
 | `hydra lookout seed` | recognised, exit 1 | needs `hydra_table::account::data_dir` + `hydra_net::sink::config` (§5.3) |
@@ -498,10 +498,10 @@ both missing halves.
   sentence. Only then: login, `lich::start`, the two start lines, the game
   socket, and `lich::relay_game`.  (The `off_message` sentence still says the
   phase has no game connection: it is the Phase 3 text, kept verbatim because
-  `serve` is exactly the command it is still true of, and because the recovered
-  sentences are quoted, not paraphrased.)
+  the recovered sentences are quoted, not paraphrased — since Phase 7 that
+  sentence is out of date for both `play` and `serve`.)
 
-### 8.2 What `play` relays, and what `serve` still does not
+### 8.2 What `play` (and now `serve`) relays
 
 `lich::relay_game` is the Phase 6 relay (§6.4 is the Lich-only one):
 
@@ -518,8 +518,7 @@ both missing halves.
   that fails because Lich has already exited is ignored — that is what the fake
   Ruby in `tests/fixtures/lich_path/ruby` looks like.
 
-`serve` is deliberately still Lich-only: it has no login, no game socket and no
-relay, and no test gives it one.
+`serve` used to be Lich-only; since Phase 7 it runs the same session (§8.4).
 
 ### 8.3 Typing on stdin (Phase 7): `src/typing.rs`
 
@@ -589,6 +588,66 @@ real game. Every test is a loopback mock (`hydra_mocks`), and the protocol shape
 comes from `SPEC_P6.md` and
 `https://github.com/elanthia-online/lich-5/blob/cec0f60e/docs/eaccess-protocol-analysis.md`,
 not from a capture this reconstruction made.
+
+### 8.4 `hydra serve` (Phase 7): `src/serve.rs`
+
+`hydra::serve` (`0x10021e6d0` … `0x10021eec4`) parses its own arguments first
+(the tokens come in as pointer + length in `x2`/`x3`):
+
+| token | meaning | here |
+|---|---|---|
+| `--detach` | rest in the background (`hydra::startup::detach`, `0x10021f40c`) | **wired** |
+| `--resume <arg>` | a captured session to resume | parsed, reported as not wired |
+| `--web <port>` | serve the page on that `u16` port | **wired** (headless page) |
+| `--open` | open the page in a browser | parsed, reported as not wired |
+| `--again` | start over rather than continue | parsed, reported as not wired |
+| `--in <dir>` | `std::sys::paths::unix::chdir` (`0x10021e9a0`-family) | **wired**, plus a spool (below) |
+| anything else | pushed onto the target list (the character) | **wired** |
+| `--account <a>`, `--game <g>` | — | **ADDITIONS** (the reference took both from the roster alone; `login`/`play` already take them) |
+
+* **The session.** `serve` runs exactly what `play` runs, in the same order and
+  with the same messages: `lich::load_settings` → `lich::off_message` when off →
+  `lich::plan` (the recovered refusals) → `login::resolve` / `password` /
+  `sign_in` (the same stage lines on stderr) → `lich::start` → `lich::announce`
+  (the two recovered start lines) → the game socket → the connected notice →
+  `lich::relay_game` → `[status] the session has ended`. `login::sign_in` and
+  `login::open_game` are `pub(crate)` for exactly that reuse. The run exits 0
+  when the game or Lich ends.
+* **`--in <dir>` — the recovered half.** It is the reference build's `chdir`
+  into `dir`, first thing after the parse; a failure prints the recovered
+  `{path}: {err}` shape and exits 1. Relative paths after it are the folder's,
+  which is why the tests point `HYDRA_LICH_SETTINGS` at an absolute path.
+* **`--in <dir>` — the addition (`ADDITION`/`INFERRED`).** The reference only
+  *entered* the folder; this phase also reads it as an **input spool**, because
+  a detached session has no keyboard: `typing::spawn_spool` polls the folder,
+  reads every regular file whose name does not start with `.` line by line
+  through the same `typing::dispatch` that stdin uses (so `.lich`, `;status` and
+  the Lich-vs-game rule are identical), and removes each file once read.
+  Without `--in`, typing comes from stdin as in `play`. Nothing in the
+  reference build corresponds to this watcher; it is this phase's seam for
+  headless input.
+* **`--web <port>`.** `hydra_web::Server::new(<data dir>)` loads/mints the
+  pairing token, `Server::bind(port)` binds `0.0.0.0:<port>` (the recovered
+  address, reachable on `127.0.0.1`) and `Server::serve_blocking` answers each
+  connection from its own thread: a plain `GET /` gets `200`,
+  `text/html; charset=utf-8` and a **synthetic page** (`Server::page_html`)
+  naming `Hydra`, the character and the pairing token; anything else is a `404`.
+  The page is *not* the recovered phone client (that is `hydra_web`'s
+  `client::Page`, modelled but not drawn here), and nothing is registered over
+  mDNS — `bonjour` is deliberately untouched, and the run says so nowhere
+  better than in `hydra_web/NOTES.md`.
+* **`--detach`.** `startup::detach` (recovered `0x10021f40c`): the data folder
+  from `hydra_table::account::data_dir()`, created if need be; `<data>/hydra.log`
+  opened create+append; `Command::new(exe()).arg("serve")` + the parent's
+  arguments **without** `--detach` (`startup::detach_args`, the recovered
+  `Serve::args` shape), `stdin(Stdio::null())`, both output streams on the log,
+  cwd `--in`; spawned, not waited for. The parent then prints the recovered
+  `[hydra] resting in the background; its log is <path>` on stderr and exits 0.
+* **Still unwired.** The window and the recovered resting loop
+  (`hydra::gui::run` over a captured session), `--resume`/`--again`/`--open`
+  (there is no session store and no browser here), and the real mDNS
+  announcement. Those three flags are *reported* (one `[hydra] serve: …` line
+  each) rather than ignored.
 
 ## 9. UNKNOWN / not recovered
 
@@ -740,12 +799,27 @@ Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
   bounded by `WAIT` (30 s), and each child is killed and reaped when the test
   ends.
 
-Gates run on `p7/1` (all `--offline`):
+* `tests/serve.rs` (Phase 7) — `hydra serve` end to end, both halves:
+  * `serve Aelith --account main --in <dir> --web <port>` against a lingering
+    `MockGame`, a `MockEaccess` and `tests/fixtures/lich_typing/ruby`: the two
+    recovered start lines and Lich's own line are printed, `GET /` on
+    `127.0.0.1:<port>` answers `200` + `text/html; charset=utf-8` with a body
+    containing `Hydra`; `look` dropped into a file in `<dir>` reaches the game
+    (and the file is removed), `quit` in the next file reaches it too, the game
+    closing then ends the run with status 0, and the game received exactly
+    `look`, `quit` — while the login's `[login] [stage: cert_pin]` went to
+    stderr;
+  * `serve Aelith --account main --detach`: the parent exits 0, its stderr says
+    `resting in the background; its log is <data>/hydra.log`, and that log
+    (which is the child's stdout *and* stderr) holds the child's own
+    `[login] [stage: cert_pin]`, the start line and `[status] the session has
+    ended` — the child really ran and ended with the session.
+
+Gates run on `p7/2` (all `--offline`):
 
 ```sh
-cargo test  -p hydra --offline          # 94 + 13 + 3 + 6 + 4 passing
-cargo test  -p hydra_session --offline  # 217 passing (crate untouched)
-cargo test  -p hydra_mocks --offline    # 22 passing (the lingering game)
+cargo test  -p hydra --offline          # 104 + 13 + 3 + 6 + 4 + 2 passing
+cargo test  -p hydra_web --offline      # 92 passing (the page + the accept loop)
 cargo check -p hydra --offline          # clean
 target/debug/hydra --help               # the recovered usage text, exit 0
 target/debug/hydra --replay crates/hydra/tests/fixtures/small_stream.xml

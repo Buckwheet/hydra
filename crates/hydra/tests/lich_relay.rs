@@ -13,8 +13,9 @@
 //! play` also logs in for real, so its runs point `HYDRA_EACCESS_HOST`/`PORT` at
 //! `hydra_mocks::MockEaccess` and the launch at `hydra_mocks::MockGame` — both
 //! on `127.0.0.1`, with a certificate generated at test time and a synthetic
-//! password in `HYDRA_PASSWORD_MAIN`.  `hydra serve` is still the Lich side
-//! only: no login, no game socket, so its tests need no mock at all.
+//! password in `HYDRA_PASSWORD_MAIN`.  Since Phase 7 `hydra serve` runs the
+//! same session, so its test points at the same mocks (`tests/serve.rs` covers
+//! the `--in` spool and the `--web` page on top of that).
 //!
 //! Every wait is bounded: [`WAIT`] caps a whole run, and a run that overruns
 //! fails the test instead of parking it.
@@ -270,8 +271,16 @@ fn play_starts_lich_relays_its_stdout_and_exits_cleanly() {
 
 #[test]
 fn serve_starts_lich_too() {
+    // `serve` is the whole session since Phase 7 (login + Lich + game socket),
+    // so it needs the same loopback mocks `play` does.
     let (data, folder) = TempDir::with_lich("serve");
-    let finished = run(&["serve", "Aelith"], &data, &fake_path());
+    let (game, eaccess, envs) = start_mocks();
+    let finished = run_with(
+        &["serve", "Aelith", "--account", "main"],
+        &data,
+        &fake_path(),
+        &envs,
+    );
 
     assert_eq!(finished.code, Some(0), "stderr: {}", finished.stderr);
     let (at, starting) = start_lines(&folder);
@@ -283,6 +292,15 @@ fn serve_starts_lich_too() {
         finished.stdout
     );
     assert!(!finished.stdout.contains('\u{1f}'), "{}", finished.stdout);
+    // The login really ran, on stderr, as `hydra login` prints it.
+    assert!(
+        finished.stderr.contains("[login] [stage: cert_pin]"),
+        "{}",
+        finished.stderr
+    );
+
+    eaccess.join().expect("the mock eaccess server ends cleanly");
+    game.join().expect("the mock game server ends cleanly");
 }
 
 #[test]

@@ -1,0 +1,69 @@
+#!/bin/bash
+# A synthetic "ruby": the Lich stand-in for `tests/play_stdin.rs`.
+#
+# Nothing here is Ruby, Lich or game text — every name and line is invented.
+# Where `tests/fixtures/lich_path/ruby` plays a Lich that reads one line and
+# exits, this one plays a Lich that *takes the player's typing*
+# (`docs/LICH_WIRE.md` §3): it keeps reading its stdin and forwards every line
+# it is given to the game socket, which is what a real Lich does with a typed
+# line.  That is what makes the "a typed line reaches the game" assertion
+# possible without Hydra writing to the game itself.
+#
+# Hydra starts Lich as (`docs/LICH_WIRE.md` §1):
+#
+#   ruby -e '<prelude>' -e '$0 = ARGV.shift; load $0' <folder>/lich.rbw \
+#        --pipe --stormfront --sentinel -g 127.0.0.1:<port>
+#
+# so the two `-e` snippets and the lich.rbw path are ignored, and the script
+# plays Lich's half of the observed handshake:
+#
+#   1. read the two stdin handshake lines (token, client identification);
+#   2. connect to 127.0.0.1:<port> and send them back as the first two lines
+#      of the socket stream (bash's /dev/tcp built-in: no network beyond
+#      loopback, no helper program);
+#   3. say one line of its own on stdout, the way Lich announces itself;
+#   4. then forward every line typed on stdin to the game socket, until stdin
+#      closes or a read times out.  A read timeout is the end of the run: the
+#      test never leaves this child parked.
+#
+# Exit codes: 1 when argv has no usable -g address, 2 when the connection is
+# refused.
+
+set -u
+
+read -r token || true
+read -r client || true
+
+port=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-g" ] && [ "$#" -ge 2 ]; then
+        port="${2##*:}"
+    fi
+    shift
+done
+
+if [ -z "$port" ]; then
+    echo "fake ruby: no -g address in argv" >&2
+    exit 1
+fi
+
+exec 3<>"/dev/tcp/127.0.0.1/$port" || {
+    echo "fake ruby: cannot connect to 127.0.0.1:$port" >&2
+    exit 2
+}
+
+printf '%s\n%s\n' "$token" "$client" >&3
+
+# Lich's own output carries no chunk byte (docs/LICH_WIRE.md §4).
+printf '%s\n' '--- synthetic Lich is taking typing.'
+
+# Lich takes typing: every bare line on stdin goes on to the game as it came.
+while read -r -t 20 line; do
+    if [ -z "$line" ]; then
+        continue
+    fi
+    printf '%s\n' "$line" >&3
+    printf -- '--- synthetic Lich forwarded %s\n' "$line"
+done
+
+exit 0

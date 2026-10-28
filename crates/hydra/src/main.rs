@@ -46,9 +46,10 @@
 //! `.lich on` they start this character's Lich with the observed semantics
 //! ([`lich`]); with `.lich` off they say so), and — since Phase 6 — the real
 //! game login: `hydra login <char>` streams the game's raw XML, and `hydra play`
-//! logs in, starts Lich and relays both ways ([`login`]).  The remaining
-//! subcommands are *recognised* — the recovered word table and the usage text
-//! are exact — and then report what they still need, on stderr, with status 1.
+//! logs in, starts Lich, relays both ways and reads what the player types on
+//! stdin ([`login`], [`typing`]).  The remaining subcommands are *recognised* —
+//! the recovered word table and the usage text are exact — and then report what
+//! they still need, on stderr, with status 1.
 //! Nothing is stubbed out silently: see `NOTES.md` for the per-command state
 //! and for the GUI boundary.
 //!
@@ -68,6 +69,7 @@ mod session;
 mod source;
 mod started;
 mod startup;
+mod typing;
 
 use std::process::ExitCode;
 

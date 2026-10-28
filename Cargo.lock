@@ -1366,6 +1366,8 @@ version = "0.1.0-beta.7"
 dependencies = [
  "eframe",
  "hydra_gui",
+ "hydra_import",
+ "hydra_ledger",
  "hydra_lich",
  "hydra_mocks",
  "hydra_net",

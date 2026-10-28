@@ -1,9 +1,12 @@
 # Hydra reconstruction: plan
 
-State (2026-10-27, after Phase 6): the crates are reconnected to the real dependencies (tokio/serde/egui/wgpu,
-plus rustls for the login), the Lich keyed accept is the observed one, and `hydra login`/`play` run against local
-mock eaccess/game servers (`cargo test --workspace --offline`: 2755 tests green). Still not tested against a real
-account or game server; `serve` is Lich-only. Local research only.
+State (2026-10-27, after Phase 7): the crates are reconnected to the real dependencies (tokio/serde/egui/wgpu,
+plus rustls for the login), the Lich keyed accept is the observed one, and `hydra login`/`play`/`serve` run against
+local mock eaccess/game servers (`cargo test --workspace --offline`: 2800 tests green). `play` reads stdin
+(bare lines to the game or Lich, `.lich`/`;status` local, Ctrl-C quits); `serve` adds login + game socket +
+two-way relay, `--in <dir>` (chdir + input spool), `--detach` and `--web <port>`; `import` and `lookout seed`
+are wired to `hydra_import`/`hydra_ledger` and `hydra_session::lookout_seed`. Still not tested against a real
+account or game server. Local research only.
 Reference data: ~/Code/hydra-inspect/{hydra, symbols_demangled.txt, crate_versions.txt}.
 
 ## Phase 1: reconnect the real dependencies (DeepSeek loop, off-peak)
@@ -79,3 +82,27 @@ or a live game.
     to end (stage lines in order, XML byte for byte, pin recorded, changed
     certificate refused) in `crates/hydra/tests/login.rs` plus the updated
     `tests/lich_relay.rs`. All loopback, all bounded.
+
+
+## Phase 7: the remaining subcommands (done)
+
+All loopback only, with the Phase 6 mock eaccess/game servers; nothing here has
+been run against a real account, real Lich install or live game.
+  * `play` stdin (`crates/hydra/src/typing.rs`): a bare line goes to Lich's stdin
+    when Lich takes typing and to the game socket otherwise; a `.`-prefixed line
+    is Hydra's (`SessionHandle::lich_command`, never forwarded); `;status` prints
+    one local status line; Ctrl-C sends `quit` and cancels. Tests:
+    `crates/hydra/tests/play_stdin.rs` (piped stdin, lingering mock game,
+    synthetic Lich that forwards typing).
+  * `serve` (`crates/hydra/src/serve.rs`): the same login/Lich/game session
+    without a window, two-way relay, `--in <dir>` (recovered chdir plus an input
+    spool), `--detach` (`startup::detach`, `<data>/hydra.log`) and `--web <port>`
+    (`hydra_web::Server::serve_blocking`, a synthetic headless page). Tests:
+    `crates/hydra/tests/serve.rs` (spool input reaches the mock game; `GET /` on
+    127.0.0.1 returns the page; detach really re-runs and logs).
+  * `import` (`crates/hydra/src/import.rs`) records `hydra_import::sessions`'
+    files through `hydra_ledger::Ledger::note_import` and prints the recovered
+    summary; `lookout seed` (`crates/hydra/src/lookout.rs`) locks the data folder
+    (`hydra.lock`), reads the player logs and prints
+    `hydra_session::lookout_seed` summaries. Tests:
+    `crates/hydra/tests/import_lookout.rs`.

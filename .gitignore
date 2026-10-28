@@ -1,3 +1,6 @@
 target
 .work
 .reasonix
+
+# Test-generated ledger when HYDRA_DATA_DIR is unset
+crates/hydra/data/

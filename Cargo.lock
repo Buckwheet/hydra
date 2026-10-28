@@ -1509,9 +1509,9 @@ dependencies = [
  "base64",
  "hydra_mocks",
  "jiff",
+ "native-tls",
  "regex",
  "reqwest",
- "rustls",
  "tokio",
  "tokio-tungstenite",
 ]

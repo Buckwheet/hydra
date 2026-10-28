@@ -43,12 +43,8 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::Arc;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use native_tls::{Protocol, TlsConnector, TlsStream};
 
 use crate::eaccess::wire::{self, Refusal};
 
@@ -292,6 +288,11 @@ pub trait Transport {
     fn write_line(&mut self, line: &str) -> io::Result<()> {
         self.write_bytes(line.as_bytes())
     }
+    /// One reply that may not end in a newline: the real server answers `K`
+    /// with the bare 32-byte key and nothing after it.
+    fn read_unterminated(&mut self) -> io::Result<String> {
+        self.read_line()
+    }
     /// The end-entity certificate the TLS layer was handed, in DER.
     fn certificate_der(&self) -> Option<Vec<u8>>;
     /// Force the TLS handshake to finish before anything is read or written.
@@ -300,7 +301,7 @@ pub trait Transport {
 
 /// A real eaccess connection: synchronous `rustls` over a `TcpStream`.
 pub struct TlsTransport {
-    stream: BufReader<StreamOwned<ClientConnection, TcpStream>>,
+    stream: BufReader<TlsStream<TcpStream>>,
 }
 
 impl TlsTransport {
@@ -317,39 +318,27 @@ impl TlsTransport {
                 format!("could not reach the eaccess server at {host}:{port}: {error}"),
             )
         })?;
-        let peer = stream.peer_addr().map_err(|error| {
+        // eaccess speaks only TLS 1.2 with static-RSA key exchange, which rustls
+        // never offers, so the platform TLS stack is used.  No SNI, no chain
+        // check: trust is the certificate pin, checked before anything is sent.
+        let connector = TlsConnector::builder()
+            .min_protocol_version(Some(Protocol::Tlsv12))
+            .use_sni(false)
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .map_err(|error| {
+                Refusal::new(
+                    "connect",
+                    format!("could not build the TLS client for {host}:{port}: {error}"),
+                )
+            })?;
+        let stream = connector.connect(host, stream).map_err(|error| {
             Refusal::new(
                 "connect",
-                format!("could not read the eaccess connection's address: {error}"),
+                format!("the TLS handshake with {host}:{port} failed: {error}"),
             )
         })?;
-        let config = client_config().map_err(|error| {
-            Refusal::new(
-                "connect",
-                format!("could not build the TLS client for {host}:{port}: {error}"),
-            )
-        })?;
-        let name = ServerName::IpAddress(peer.ip().into());
-        let conn = ClientConnection::new(Arc::new(config), name).map_err(|error| {
-            Refusal::new(
-                "connect",
-                format!("could not start TLS with {host}:{port}: {error}"),
-            )
-        })?;
-        let mut stream = StreamOwned::new(conn, stream);
-        // Force the handshake before a single credential is read: the pin check
-        // needs the certificate, and nothing may be sent on an unchecked link.
-        while stream.conn.is_handshaking() {
-            stream
-                .conn
-                .complete_io(&mut stream.sock)
-                .map_err(|error| {
-                    Refusal::new(
-                        "connect",
-                        format!("the TLS handshake with {host}:{port} failed: {error}"),
-                    )
-                })?;
-        }
         Ok(TlsTransport {
             stream: BufReader::new(stream),
         })
@@ -357,43 +346,46 @@ impl TlsTransport {
 }
 
 impl Transport for TlsTransport {
+    // eaccess replies are single unterminated records (Lich sysreads them), so
+    // every reply is one read, cut at a newline if the record has one.
     fn read_line(&mut self) -> io::Result<String> {
-        let mut line = Vec::new();
-        let read = self.stream.read_until(b'\n', &mut line)?;
-        if read == 0 {
+        self.read_unterminated()
+    }
+
+    fn read_unterminated(&mut self) -> io::Result<String> {
+        let buf = self.stream.fill_buf()?;
+        if buf.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the eaccess server closed the connection",
             ));
         }
-        while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        Ok(String::from_utf8_lossy(&line).into_owned())
+        let end = buf.iter().position(|&b| b == 0x0A).map_or(buf.len(), |i| i + 1);
+        let text = String::from_utf8_lossy(&buf[..end]).trim_end().to_string();
+        self.stream.consume(end);
+        Ok(text)
     }
 
     fn write_bytes(&mut self, line: &[u8]) -> io::Result<()> {
         let stream = self.stream.get_mut();
-        stream.write_all(line)?;
-        stream.write_all(b"\n")?;
+        // One record: the server parses per read, so the newline must travel with the line.
+        let mut framed = line.to_vec();
+        framed.push(0x0A);
+        stream.write_all(&framed)?;
         stream.flush()
     }
 
     fn certificate_der(&self) -> Option<Vec<u8>> {
         self.stream
             .get_ref()
-            .conn
-            .peer_certificates()
-            .and_then(|certificates| certificates.first())
-            .map(|certificate| certificate.as_ref().to_vec())
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|certificate| certificate.to_der().ok())
     }
 
     fn complete_handshake(&mut self) -> io::Result<()> {
-        let stream = self.stream.get_mut();
-        while stream.conn.is_handshaking() {
-            stream.conn.complete_io(&mut stream.sock)?;
-        }
-        Ok(())
+        Ok(()) // connect() has already finished the handshake
     }
 }
 
@@ -424,7 +416,13 @@ pub fn login_with(
 
     // 2. k_response: the key the password is hashed with.
     on_stage(Stage::KResponse);
-    let key = sge_key(&exchange(transport, "K", "k_response")?)?;
+    transport.write_line("K").map_err(|error| {
+        Refusal::new("k_response", format!("the server could not be written to: {error}"))
+    })?;
+    let k_line = transport.read_unterminated().map_err(|error| {
+        Refusal::new("k_response", format!("the server did not answer: {error}"))
+    })?;
+    let key = sge_key(&k_line)?;
 
     // The password is hashed here, before the account is sent, and the hash is
     // never echoed or logged.  Its bytes need not be UTF-8, so the `A` line is
@@ -540,17 +538,15 @@ fn exchange_bytes(
 /// The key from the `K` response, used whole (normally 32 bytes).
 fn sge_key(line: &str) -> Result<Vec<u8>, Refusal> {
     let trimmed = line.trim_end_matches(['\n', '\r']);
-    match trimmed.strip_prefix("K\t") {
-        Some(key) if !key.is_empty() => Ok(key.as_bytes().to_vec()),
-        Some(_) => Err(Refusal::new(
+    // The real server answers K with the bare key line; a "K\t" prefix is tolerated.
+    let key = trimmed.strip_prefix("K\t").unwrap_or(trimmed);
+    if key.is_empty() {
+        return Err(Refusal::new(
             "k_response",
             "the server's K response carried an empty key, so the password cannot be keyed",
-        )),
-        None => Err(Refusal::new(
-            "k_response",
-            "the server did not answer K with a key (no K response); nothing can be keyed",
-        )),
+        ));
     }
+    Ok(key.as_bytes().to_vec())
 }
 
 /// The holder name and session key from the `A` response.
@@ -733,88 +729,6 @@ fn parse_l_response(line: &str) -> Result<LaunchOwned, Refusal> {
         Refusal::new("l_response", format!("the launch payload is unusable: {}", refusal.detail))
     })?;
     Ok(LaunchOwned::from_wire(&launch))
-}
-
-/// Install rustls's `ring` provider (the only one in the offline registry) and
-/// return it.
-fn provider() -> Arc<CryptoProvider> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    Arc::new(rustls::crypto::ring::default_provider())
-}
-
-/// The TLS client configuration: no SNI, and a verifier that leaves trust to
-/// the certificate pin.
-fn client_config() -> Result<ClientConfig, rustls::Error> {
-    let provider = provider();
-    let verifier = Arc::new(TrustOnFirstUse {
-        provider: Arc::clone(&provider),
-    });
-    Ok(ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
-}
-
-/// A certificate verifier that does not check the chain.
-///
-/// eaccess presents a self-signed certificate with no name a client could
-/// verify, and the reference build's trust decision is the pin file
-/// ([`crate::eaccess::pin`]): the *first* certificate is recorded and every
-/// later login must present the same bytes.  So the chain is deliberately not
-/// verified here — but the handshake signature is, with the provider's own
-/// algorithm set, so a peer cannot present a certificate whose key it does not
-/// hold.
-#[derive(Debug)]
-struct TrustOnFirstUse {
-    provider: Arc<CryptoProvider>,
-}
-
-impl ServerCertVerifier for TrustOnFirstUse {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 #[cfg(test)]

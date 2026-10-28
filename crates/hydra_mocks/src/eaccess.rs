@@ -366,7 +366,7 @@ fn converse(wire: &mut Wire, script: &EaccessScript) -> io::Result<()> {
     // 2. k_response: the client asks for the script key to key its password.
     let line = wire.recv("k_response")?;
     expect_command(&line, b'K', "k_response")?;
-    wire.send(&format!("K\t{}", script.key))?;
+    wire.send(&script.key)?;
 
     // 3. a_response: the account and the keyed password.
     let line = wire.recv("a_response")?;

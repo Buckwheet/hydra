@@ -1,12 +1,14 @@
 # Hydra reconstruction: plan
 
-State (2026-10-27, after Phase 7): the crates are reconnected to the real dependencies (tokio/serde/egui/wgpu,
-plus rustls for the login), the Lich keyed accept is the observed one, and `hydra login`/`play`/`serve` run against
-local mock eaccess/game servers (`cargo test --workspace --offline`: 2800 tests green). `play` reads stdin
-(bare lines to the game or Lich, `.lich`/`;status` local, Ctrl-C quits); `serve` adds login + game socket +
-two-way relay, `--in <dir>` (chdir + input spool), `--detach` and `--web <port>`; `import` and `lookout seed`
-are wired to `hydra_import`/`hydra_ledger` and `hydra_session::lookout_seed`. Still not tested against a real
-account or game server. Local research only.
+State (2026-10-28, after Phase 9): the crates are reconnected to the real dependencies (tokio/serde/egui/wgpu,
+plus rustls for the login), the Lich keyed accept is the observed one, and `hydra login`/`play`/`serve`/`gui`
+run against local mock eaccess/game servers (`cargo test --workspace --offline`: green). `play` reads stdin
+(bare lines to the game or Lich, `.lich`/`;status` local, Ctrl-C quits) and can swap Lich mid-session with
+`.lich on`/`.lich off`; `serve` adds login + game socket + two-way relay, `--in <dir>` (chdir + input spool),
+`--detach` and `--web <port>`, and now rests across game disconnects (same session and Lich, recovered
+backoff); `gui <character>` logs in and paints the live game through the parser and `hydra_ui`; `import` and
+`lookout seed` are wired to `hydra_import`/`hydra_ledger` and `hydra_session::lookout_seed`. Still not tested
+against a real account, game server or display in Phase 9. Local research only.
 Reference data: ~/Code/hydra-inspect/{hydra, symbols_demangled.txt, crate_versions.txt}.
 
 ## Phase 1: reconnect the real dependencies (DeepSeek loop, off-peak)

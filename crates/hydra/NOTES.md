@@ -81,19 +81,19 @@ its own — the reference build inlines it into the one 8136-byte closure.
 | `hydra::started::write` | `0x1001dd4d4` | 436 | ◐ | writes + eprints; file path comes from the caller |
 | `hydra::started::log_in` | `0x1001dd688` | 3076 | — | login timeline; not needed headless |
 | `hydra::startup::exe` | `0x10021eec4` | 232 | ◐ | `OnceLock<String>` at `0x1044fd4a0` |
-| `hydra::startup::Serve::args` | `0x10021efac` | 1120 | — | `serve` flags; `serve` is not wired |
-| `hydra::startup::detach` | `0x10021f40c` | 1648 | — | relaunch-and-exit for `serve --detach` |
+| `hydra::startup::Serve::args` | `0x10021efac` | 1120 | ✅ | the detached child's argv: `serve`, `--again`, the parent's options; §8.4 |
+| `hydra::startup::detach` | `0x10021f40c` | 1648 | ✅ | relaunch-and-exit for `serve --detach`; §8.4 |
 | `hydra::startup::EXE` (static) | `0x1044fd4a0` | — | ✅ | the cached executable path |
 | `hydra::started::START` (static) | `0x1044fd460` | — | ✅ | `OnceLock<Mutex<Start>>` |
 | `hydra::render::Renderer::frame` | `0x1002593ec` | 1164 | — | §7: not ported, facts recorded |
 | `hydra::status::line` | `0x100112c78` | 1128 | — | `play`'s status line |
 | `hydra::status::gauge` | `0x1001130e0` | 228 | — | |
 | `hydra::lookout_seed` | `0x10021d088` | 1672 | — | needs `hydra_table`/`hydra_net` (§6) |
-| `hydra::serve` | `0x10021e6d0` | 2036 | — | `Serve::args` → `detach` → `Target::many` → `gui::run` |
-| `hydra::gui::run` | `0x1001103f4` | 9716 | — | **the eframe boundary** (§5) |
+| `hydra::serve` | `0x10021e6d0` | 2036 | ✅ | `Serve::args` → `detach` → targets → the resting session; §8.4 |
+| `hydra::gui::run` | `0x1001103f4` | 9716 | — | **the eframe boundary** (§5); the live window is `src/gui.rs` §5.4 |
 | `hydra::gui::start_next` | `0x100110208` | 492 | — | |
 | `hydra::play::supervised` | `0x100258fd0` | 1052 | — | builds the supervised session |
-| `hydra::rest::doing` | `0x10021e474` | 604 | — | |
+| `hydra::rest::doing` | `0x10021e474` | 604 | ✅ | the resting status composition; `src/rest.rs`, §8.4 |
 | `hydra::update::said` | `0x1001131c4` | 300 | — | |
 | `hydra::connect::game_and_name` | `0x1001132f0` | 388 | — | |
 | `hydra::connect::Target::many` | `0x100113474` | 496 | — | `gui`/`serve` target list |

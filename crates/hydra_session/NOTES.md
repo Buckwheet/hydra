@@ -265,6 +265,34 @@ jitter, keeping the one-argument `backoff(u32)` and the `Duration`-shaped
 `jitter(up_to)` so the public API is unchanged; `JITTER_MS` survives only as an
 unused, documented constant.
 
+### 2.3a-bis `SupervisedSession`'s logged lines (Phase 9, hydra serve)
+
+Three of the reference build's log lines come from the supervisor, and their
+text is in the binary's string table:
+
+| recovered | here |
+| --- | --- |
+| `
+lifecycle {state}` (`SupervisedSession::transition`) | `lifecycle_line(Lifecycle)` |
+| `reconnecting in {ms}ms (attempt {n})` (`wait_before_retry`) | `reconnecting_line(wait, attempt)` |
+| `
+session stopped: {reason}` (`SupervisedSession::finish`) | `stopped_line(reason)` |
+
+**ESTABLISHED**: the three templates and the five state words — `Connecting`,
+`Logging in`, `Connected`, `Reconnecting`, `Closed` — which `Lifecycle` names.
+`Lifecycle::ALL` is those five in that order.  `wait_before_retry(attempt)` is
+`backoff(attempt, jitter())`, the recovered composition (§2.3a).
+
+**INFERRED**: which transition belongs to which moment.  The binary logs one
+line per state change but the call sites are not distinguishable by text, so
+`hydra serve` puts `Connecting` before the first dial, `Logging in` around the
+login, `Connected` once the game socket is open, `Reconnecting` when a
+connection drops (after the dropped notice and before the wait) and `Closed` at
+`finish`.  Whether `{n}` in the reconnecting line counts from 0 or 1 is
+**UNKNOWN**; the line prints the 1-based attempt, while `backoff` keeps the
+recovered 0-based index it clamps at 4 — so the *first* retry prints
+`attempt 1` and waits 0.8–1.2 s.
+
 ### 2.3b `steps` — pieces, waits and rendering (ESTABLISHED in the audit pass)
 
 ```
@@ -567,7 +595,13 @@ with did not include Phase 3's wire tests; the new tests are the ones marked
   band per step, the clamp at entry 4, the constants themselves, the jitter
   fraction bounds, `answer_between` first-value and deadline, and (*Phase 1*)
   `answer_between_async` taking the first value, hitting the deadline, and
-  returning at once on a closed channel.
+  returning at once on a closed channel.  (*Phase 9*) the five recovered
+  lifecycle words, the three recovered log templates byte for byte
+  (`
+lifecycle Connected`, `
+session stopped: quit`,
+  `reconnecting in 934ms (attempt 1)`), and `wait_before_retry` staying inside
+  the 80 %..=120 % band of each table entry.
 * `alias`: `{}_{}` key, name/rest split, single-command expansion, the
   multi-command `\?` error verbatim, `put`/`remove`, JSON round trip.
 * `steps`: comma splitting + `\,` escaping, `wait` in both spellings

@@ -41,6 +41,86 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime};
 
+/// The five lifecycle states, in their recovered order.
+///
+/// **ESTABLISHED** words: `SupervisedSession::transition` (`0x1000089…`)
+/// broadcast the state and logged `\nlifecycle {state}`; the five words are in
+/// the binary's string table — `Connecting`, `Logging in`, `Connected`,
+/// `Reconnecting`, `Closed`.  Which transition happens *where* is
+/// **INFERRED** from the three logged lines below (a session logs `Connecting`
+/// and `Logging in` before it is `Connected`, `Reconnecting` before
+/// [`wait_before_retry`], and `Closed` where it logs `\nsession stopped:
+/// {reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// about to dial
+    Connecting,
+    /// dialled, walking the login
+    LoggingIn,
+    /// the game connection is up
+    Connected,
+    /// the connection dropped and a retry is pending
+    Reconnecting,
+    /// the session is over
+    Closed,
+}
+
+impl Lifecycle {
+    /// Every state, in the recovered order.
+    pub const ALL: [Lifecycle; 5] = [
+        Lifecycle::Connecting,
+        Lifecycle::LoggingIn,
+        Lifecycle::Connected,
+        Lifecycle::Reconnecting,
+        Lifecycle::Closed,
+    ];
+
+    /// The recovered state word (`Connecting`, `Logging in`, `Connected`,
+    /// `Reconnecting`, `Closed`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Lifecycle::Connecting => "Connecting",
+            Lifecycle::LoggingIn => "Logging in",
+            Lifecycle::Connected => "Connected",
+            Lifecycle::Reconnecting => "Reconnecting",
+            Lifecycle::Closed => "Closed",
+        }
+    }
+}
+
+/// `\nlifecycle {state}` — the recovered `transition` log line
+/// (`SupervisedSession::transition`).
+pub fn lifecycle_line(state: Lifecycle) -> String {
+    format!("\nlifecycle {}", state.name())
+}
+
+/// `reconnecting in {ms}ms (attempt {n})` — the recovered
+/// `SupervisedSession::wait_before_retry` line.
+///
+/// **ESTABLISHED** template.  The attempt number is 1-based here, because the
+/// recovered line names the attempt it is about to make (the first retry says
+/// `attempt 1`); whether the original counted from 0 is **UNKNOWN**, and it
+/// does not matter to [`backoff`], which takes the 0-based *index* it clamps at
+/// 4.
+pub fn reconnecting_line(wait: Duration, attempt: u32) -> String {
+    format!("reconnecting in {}ms (attempt {attempt})", wait.as_millis())
+}
+
+/// `\nsession stopped: {reason}` — the recovered `SupervisedSession::finish`
+/// line.
+pub fn stopped_line(reason: &str) -> String {
+    format!("\nsession stopped: {reason}")
+}
+
+/// The wait before retry `attempt` (0-based): `backoff(attempt, jitter())`.
+///
+/// **ESTABLISHED** composition: `wait_before_retry` calls `jitter` and then
+/// `backoff` back to back, with `d0` passed straight through — and [`backoff`]
+/// already does both (see the module note).
+pub fn wait_before_retry(attempt: u32) -> Duration {
+    backoff(attempt)
+}
+
 /// The first retry delay (**ESTABLISHED**: the first table entry).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// The longest retry delay (**ESTABLISHED**: the last table entry).
@@ -166,6 +246,37 @@ mod tests {
         assert_eq!(BACKOFF_BASE, Duration::from_secs(1));
         assert_eq!(BACKOFF_CAP, Duration::from_secs(30));
         assert_eq!((JITTER_FLOOR, JITTER_SPAN), (0.8, 0.4));
+    }
+
+    #[test]
+    fn the_lifecycle_words_are_the_recovered_five() {
+        let words: Vec<&str> = Lifecycle::ALL.iter().map(|state| state.name()).collect();
+        assert_eq!(
+            words,
+            vec!["Connecting", "Logging in", "Connected", "Reconnecting", "Closed"]
+        );
+        // The recovered log line has a leading newline and the state word.
+        assert_eq!(lifecycle_line(Lifecycle::Connected), "\nlifecycle Connected");
+        // `finish`: `\nsession stopped: {reason}`.
+        assert_eq!(stopped_line("quit"), "\nsession stopped: quit");
+        // `wait_before_retry`: `reconnecting in {ms}ms (attempt {n})`, with the
+        // wait in whole milliseconds and the attempt counted from 1.
+        assert_eq!(
+            reconnecting_line(Duration::from_millis(934), 1),
+            "reconnecting in 934ms (attempt 1)"
+        );
+        assert_eq!(
+            reconnecting_line(Duration::from_millis(1200), 3),
+            "reconnecting in 1200ms (attempt 3)"
+        );
+        // The wait is the recovered backoff: the jitter is multiplicative, so
+        // every step lands in 80 %..=120 % of its table entry.
+        for attempt in 0..6u32 {
+            let wait = wait_before_retry(attempt);
+            let step = BACKOFF_STEPS[(attempt.min(4)) as usize] * 1000;
+            assert!(wait.as_millis() >= (step * 4 / 5) as u128, "{attempt}: {wait:?}");
+            assert!(wait.as_millis() <= (step * 6 / 5) as u128, "{attempt}: {wait:?}");
+        }
     }
 
     #[test]

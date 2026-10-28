@@ -55,6 +55,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use hydra_session::command::SessionHandle;
@@ -331,13 +332,44 @@ pub fn pump<R: BufRead>(mut reader: R, mut sink: impl FnMut(&str)) {
     }
 }
 
+/// The session a long-lived input thread dispatches to.
+///
+/// `hydra play` never changes its session, but a resting `hydra serve` can
+/// (`--again` starts a fresh [`Headless`] when the game connection drops and
+/// comes back), and the input thread outlives a connection.  The thread holds
+/// this cell instead of one `Headless`, so the lines typed after the swap go to
+/// the session that is running now — and no second input thread is needed.
+#[derive(Clone, Debug)]
+pub struct Current(Arc<Mutex<Headless>>);
+
+impl Current {
+    /// A cell holding `session`.
+    pub fn new(session: Headless) -> Current {
+        Current(Arc::new(Mutex::new(session)))
+    }
+
+    /// The session that is running now.
+    pub fn get(&self) -> Headless {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Install `session` and hand back the one it replaced.
+    pub fn replace(&self, session: Headless) -> Headless {
+        let mut current = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *current, session)
+    }
+}
+
 /// Read this process's stdin on its own thread.
 ///
 /// Every line goes through [`dispatch`]; the requests that need the relay loop
 /// (a `.lich off`) come back on the receiver.  The thread ends at EOF or at the
 /// first read error, and is deliberately not joined: it may be parked in a read
 /// when the run ends, and joining a parked reader would hang the exit.
-pub fn spawn_stdin(session: Headless) -> io::Result<(Receiver<Handled>, thread::JoinHandle<()>)> {
+pub fn spawn_stdin(session: Current) -> io::Result<(Receiver<Handled>, thread::JoinHandle<()>)> {
     let (sender, requests) = mpsc::channel();
     let handle = thread::Builder::new()
         .name("hydra-stdin".to_string())
@@ -345,7 +377,7 @@ pub fn spawn_stdin(session: Headless) -> io::Result<(Receiver<Handled>, thread::
             let stdin = io::stdin();
             let mut out = io::stdout();
             pump(stdin.lock(), |line| {
-                if let Ok(handled) = dispatch(line, &session, &mut out) {
+                if let Ok(handled) = dispatch(line, &session.get(), &mut out) {
                     if !handled.is_idle() {
                         // A dead receiver means the run is over.
                         let _ = sender.send(handled);
@@ -392,7 +424,7 @@ pub fn spooled(dir: &std::path::Path) -> Vec<PathBuf> {
 /// dropped, and is deliberately not joined: it may be asleep between polls.
 pub fn spawn_spool(
     dir: PathBuf,
-    session: Headless,
+    session: Current,
 ) -> io::Result<(Receiver<Handled>, thread::JoinHandle<()>)> {
     let (sender, requests) = mpsc::channel();
     let handle = thread::Builder::new()
@@ -400,7 +432,7 @@ pub fn spawn_spool(
         .spawn(move || {
             let mut out = io::stdout();
             loop {
-                if session.handle().stopping() {
+                if session.get().handle().stopping() {
                     return;
                 }
                 for file in spooled(&dir) {
@@ -412,7 +444,7 @@ pub fn spawn_spool(
                         if !keep_going {
                             return;
                         }
-                        if let Ok(handled) = dispatch(line, &session, &mut out) {
+                        if let Ok(handled) = dispatch(line, &session.get(), &mut out) {
                             if !handled.is_idle() && sender.send(handled).is_err() {
                                 // The relay loop is gone: this run is over.
                                 keep_going = false;
@@ -440,7 +472,7 @@ pub fn spawn_spool(
 /// line goes — to Lich when it takes typing, to the game otherwise — and the
 /// cancel is [`SessionHandle::stop`], which is what
 /// [`crate::lich::relay_game`] watches.
-pub fn spawn_ctrl_c(session: Headless) -> io::Result<thread::JoinHandle<()>> {
+pub fn spawn_ctrl_c(session: Current) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("hydra-ctrl-c".to_string())
         .spawn(move || {
@@ -455,6 +487,7 @@ pub fn spawn_ctrl_c(session: Headless) -> io::Result<thread::JoinHandle<()>> {
             if runtime.block_on(tokio::signal::ctrl_c()).is_err() {
                 return;
             }
+            let session = session.get();
             let mut out = io::stdout();
             let _ = dispatch("quit", &session, &mut out);
             session.handle().stop("Ctrl-C");

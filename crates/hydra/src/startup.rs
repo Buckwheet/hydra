@@ -146,6 +146,16 @@ pub const LOG_FILE: &str = "hydra.log";
 /// The flag the detached child must not see again (`--detach`).
 pub const DETACH_FLAG: &str = "--detach";
 
+/// The flag the detached child is always given (`--again`).
+///
+/// **RECOVERED** (`hydra::startup::Serve::args`, `0x10021efac`): the child's
+/// argv is `serve`, then `--again`, then the parent's own options (`--web
+/// <port>`, `--open`, one `--resume <arg>` per resume, and the targets).  So a
+/// detached session is told it is starting over rather than continuing
+/// whatever the parent was doing — which is what "rest in the background"
+/// means: the parent is leaving, and the child is the rest of the run.
+pub const AGAIN_FLAG: &str = "--again";
+
 /// The recovered message `hydra::startup::detach` prints for the parent
 /// (`__const` `0x103e2546b`, `[hydra] resting in the background; its log is `).
 pub fn resting(log: &Path) -> String {
@@ -160,12 +170,15 @@ pub fn log_path(data: &Path) -> PathBuf {
 /// The argv a detached child runs: `serve`, then `args` with every `--detach`
 /// removed.
 ///
-/// **RECOVERED** shape: `hydra::startup::detach` spawned
-/// `std::process::Command::new(exe()).arg("serve").args(args)`, where `args` is
-/// the parent's own argument list minus the flag that would make the child
-/// detach again.
+/// **RECOVERED** shape: `hydra::startup::Serve::args` (`0x10021efac`) built
+/// `serve` + [`AGAIN_FLAG`] + the parent's own options (each `--web`/`--open`
+/// and one `--resume` per resume, then the targets), and
+/// `hydra::startup::detach` spawned that with `std::process::Command::new(exe())`.
+/// This takes the parent's raw argument list instead of its parsed options —
+/// the same words — minus the flag that would make the child detach again, plus
+/// the `--again` the recovered builder always added.
 pub fn detach_args(args: &[String]) -> Vec<String> {
-    let mut out = vec![SUBCOMMAND.to_string()];
+    let mut out = vec![SUBCOMMAND.to_string(), AGAIN_FLAG.to_string()];
     out.extend(
         args.iter()
             .filter(|arg| arg.as_str() != DETACH_FLAG)
@@ -316,6 +329,8 @@ mod tests {
             detach_args(&args),
             vec![
                 "serve".to_string(),
+                // The recovered `Serve::args` always appends this one.
+                "--again".to_string(),
                 "Aelith".to_string(),
                 "--web".to_string(),
                 "7788".to_string(),
@@ -333,11 +348,15 @@ mod tests {
             detach_args(&args),
             vec![
                 "serve".to_string(),
+                "--again".to_string(),
                 "--web".to_string(),
                 "1".to_string()
             ]
         );
-        assert_eq!(detach_args(&[]), vec!["serve".to_string()]);
+        assert_eq!(
+            detach_args(&[]),
+            vec!["serve".to_string(), "--again".to_string()]
+        );
     }
 
     #[test]
@@ -347,7 +366,14 @@ mod tests {
         let args = vec!["Aelith".to_string(), "--detach".to_string()];
         let plan = plan_detach(exe, &args, data, Some(Path::new("/synthetic/in")));
         assert_eq!(plan.exe.as_path(), exe);
-        assert_eq!(plan.args, vec!["serve".to_string(), "Aelith".to_string()]);
+        assert_eq!(
+            plan.args,
+            vec![
+                "serve".to_string(),
+                AGAIN_FLAG.to_string(),
+                "Aelith".to_string()
+            ]
+        );
         assert_eq!(plan.data.as_path(), data);
         // The log is `<data>/hydra.log`, spelled with this platform's
         // separators rather than a hard-coded slash path.

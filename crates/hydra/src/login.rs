@@ -361,12 +361,13 @@ pub fn play_with(
     let claim = session.door().claim();
     let (taker, to_game) = taker_pair();
     session.handle().set_taker(taker);
-    let (requests, _stdin_thread) = typing::spawn_stdin(session.clone())
+    let current = typing::Current::new(session.clone());
+    let (requests, _stdin_thread) = typing::spawn_stdin(current.clone())
         .map_err(|error| format!("{label}: stdin could not be read: {error}"))?;
     // Ctrl-C sends `quit` and then cancels the session, which ends the relay.
     // The watcher is never joined: it may be parked in a signal read when the
     // run ends, and joining it would hold the exit.
-    let _ctrl_c = typing::spawn_ctrl_c(session.clone()).ok();
+    let _ctrl_c = typing::spawn_ctrl_c(current).ok();
     let queues = typing::Queues {
         to_lich: claim.typed,
         to_game,

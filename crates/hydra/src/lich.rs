@@ -34,18 +34,22 @@
 //! `lich.rbw` in it (`<dir> has no lich.rbw in it`), or no Ruby
 //! (`Lich needs Ruby, …`).
 //!
-//! # Two relays
+//! # Three relays
 //!
 //! * [`relay`] is the Lich-only relay: Lich's stdout is relayed to this
 //!   process's stdout with the 0x1F chunk byte stripped
 //!   ([`hydra_lich::wire::LichOut`]) until Lich exits or the session stops, and
 //!   nothing is written to the accepted socket or read back from it.  Neither
-//!   `play` nor `serve` uses it any more (both run [`relay_game`]); it is kept
-//!   because it is the smallest faithful start-and-print loop.
-//! * [`relay_game`] is the whole session `hydra play` and `hydra serve` run once
-//!   a real login has named the game socket: the game's lines go to Lich, Lich's
-//!   frames go to the game, and Lich's stdout still reaches this process's
-//!   stdout.  See its own documentation for what ends it.
+//!   `play` nor `serve` uses it any more (both run [`relay_game`], or
+//!   [`Resting::play`]); it is kept because it is the smallest faithful
+//!   start-and-print loop.
+//! * [`relay_game`] is the whole session `hydra play` runs once a real login has
+//!   named the game socket: the game's lines go to Lich, Lich's frames go to the
+//!   game, and Lich's stdout still reaches this process's stdout.  One game
+//!   connection, and it ends with that connection.  See its own documentation.
+//! * [`Resting`] is the same loop for `hydra serve`: one Lich for the whole run,
+//!   one [`GameLink`] per game connection, so a dropped connection costs the
+//!   connection and nothing else (Phase 9).
 //!
 //! # Starting Lich again in a running session
 //!
@@ -220,6 +224,14 @@ pub fn relay(
 /// has gone before it stops the child.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
 
+/// How long one pass of the relay loop idles when it moved nothing.
+///
+/// **INFERRED / ADDITION**: the recovered session is tokio-driven and wakes on
+/// its channels, so it has no idle case at all.  This synchronous loop polls,
+/// and a **resting** `serve` (Phase 9) may poll for hours: one millisecond keeps
+/// a quiet session off the CPU without any player or test noticing the latency.
+const IDLE_PASS: Duration = Duration::from_millis(1);
+
 /// How long [`relay_game`] keeps carrying Lich's frames to the game after the
 /// session has stopped.
 ///
@@ -366,6 +378,20 @@ impl LichRun {
         }
         self.carry_frames(game);
     }
+
+    /// [`LichRun::stop`] with no game connection left to carry frames to.
+    ///
+    /// A resting run stops Lich after the connection it was relaying has gone
+    /// ([`Resting::stop`]), so there is nowhere for Lich's last frames to go but
+    /// this process's stdout.
+    fn stop_alone(&mut self, out: &mut dyn Write) {
+        let _ = self.keyed.relay.stop();
+        let _ = self.drain(out);
+        let _ = self.keyed.socket.shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 impl Drop for LichRun {
@@ -387,10 +413,10 @@ impl Drop for LichRun {
 /// This is the last hop of `hydra play`: the login named the game socket
 /// ([`hydra_net::eaccess::game::connect`]) and Lich has already connected back
 /// on the keyed socket ([`start`]).  Two reader threads feed channels — one over
-/// a clone of the game socket (line by line), one over a clone of Lich's socket
-/// ([`LichFrame`], so a `<c>` command and a bare line stay distinguishable) —
-/// and the loop below moves what is pending each way while Lich's stdout is
-/// still printed through [`drain`]:
+/// the game socket (line by line, [`GameLink`]), one over a clone of Lich's
+/// socket ([`LichFrame`], so a `<c>` command and a bare line stay
+/// distinguishable) — and [`relay_link`] moves what is pending each way while
+/// Lich's stdout is still printed through [`drain`]:
 ///
 /// * game → Lich: [`KeyedRelay::send_game`], one line at a time;
 /// * Lich → game: [`LichFrame::text`] (the `<c>` prefix stripped, a bare line
@@ -432,6 +458,9 @@ impl Drop for LichRun {
 /// (which is what unblocks the game reader) and joins it.  A write that fails
 /// because the other side has already closed is *not* an error: that is what a
 /// Lich that exits immediately looks like.
+///
+/// **`serve` does not use this** any more: a resting run keeps Lich across game
+/// connections, which is [`Resting`].
 pub fn relay_game(
     keyed: KeyedRelay,
     game: &mut TcpStream,
@@ -439,55 +468,164 @@ pub fn relay_game(
     session: &SessionHandle,
     queues: crate::typing::Queues,
 ) -> io::Result<()> {
-    // The game socket is read for as long as the session lasts.
-    let _ = game.set_read_timeout(None);
-
-    let (game_sender, game_lines) = mpsc::channel::<String>();
-    let game_socket = game.try_clone()?;
-    let game_reader = thread::Builder::new()
-        .name("hydra-game-reader".to_string())
-        .spawn(move || read_into(game_socket, game_sender, |line| line))?;
-
-    let mut queues = queues;
+    // The caller keeps its own handle on the socket; the link reads and writes
+    // its own duplicate of it, so shutting the link down shuts the connection
+    // down for both.
+    let mut link = GameLink::open(game.try_clone()?)?;
     let mut lich = match LichRun::attach(keyed) {
         Ok(run) => Some(run),
         Err(error) => {
-            // Nothing would read the game socket: close it, so the reader
-            // above is not left parked on it.  `keyed` was dropped inside
-            // `attach`, and `Relay::drop` kills and reaps its child.
-            let _ = game.shutdown(Shutdown::Both);
-            let _ = game_reader.join();
+            // Nothing would read the game socket: close it, so the reader is
+            // not left parked on it.  `keyed` was dropped inside `attach`, and
+            // `Relay::drop` kills and reaps its child.
+            link.close();
             return Err(error);
         }
     };
 
-    let mut game_open = true;
-    let outcome = loop {
+    let mut queues = queues;
+    let mut quit = false;
+    let outcome = relay_link(
+        &mut lich,
+        &mut link,
+        out,
+        session,
+        &mut queues,
+        &mut quit,
+        false,
+        None,
+    );
+
+    if matches!(outcome, Ok(Ended::Game)) {
+        // The recovered literal `\n[hydra] the game closed the connection\n`
+        // (`hydra::play::run::{{closure}}`'s pool).  `play` ends here; a resting
+        // `serve` says [`crate::rest::DROPPED`] instead and reconnects.
+        let _ = write!(out, "{}", crate::typing::GAME_CLOSED);
+        let _ = out.flush();
+    }
+
+    // Teardown.  Lich may still have stdout in flight, so give it a bounded
+    // grace period before the child is stopped (pump drains what has arrived).
+    if outcome.is_ok() {
+        if let Some(run) = lich.as_mut() {
+            run.grace(out);
+        }
+    }
+    if let Some(run) = lich.as_mut() {
+        run.stop(&mut link.socket, out);
+    }
+    drop(lich);
+    link.close();
+    outcome.map(|_| ())
+}
+
+/// One game connection as the relay loop sees it: the socket the game's lines
+/// arrive on and leave through, and the thread that reads it.
+///
+/// **INFERRED** shape (Phase 9): `relay_game` used to own the reader inline.  A
+/// resting `serve` replaces the game connection without touching Lich
+/// ([`Resting::play`]), so one connection is one value that can be closed and
+/// made again.
+struct GameLink {
+    /// the writing end of the connection (the reader has its own duplicate)
+    socket: TcpStream,
+    /// lines the game sent, until it closes
+    lines: mpsc::Receiver<String>,
+    /// the thread that fills `lines`; joined once the socket is shut down
+    reader: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl GameLink {
+    /// Start reading `socket` line by line.
+    fn open(socket: TcpStream) -> io::Result<GameLink> {
+        // A connection is read for as long as it lasts: the login's own
+        // 60-second timeout must not end a resting session.
+        let _ = socket.set_read_timeout(None);
+        let (sender, lines) = mpsc::channel::<String>();
+        let read = socket.try_clone()?;
+        let reader = thread::Builder::new()
+            .name("hydra-game-reader".to_string())
+            .spawn(move || read_into(read, sender, |line| line))?;
+        Ok(GameLink {
+            socket,
+            lines,
+            reader: Some(reader),
+        })
+    }
+
+    /// Shut the connection down (which is what unblocks the reader) and join it.
+    fn close(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// Why one game connection's relay loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// the game closed the connection (EOF, or a socket that failed)
+    Game,
+    /// Lich exited by itself
+    Lich,
+    /// the session stopped: Ctrl-C, or a typed line that asked to leave
+    Stopped,
+}
+
+/// The relay loop itself: carry lines both ways and typed input where it goes,
+/// for as long as one game connection lasts.
+///
+/// Shared by [`relay_game`] (which tears Lich down when it returns) and
+/// [`Resting::play`] (which does not).  `quit` is set when a typed line was an
+/// exit intent (`hydra_session::actor::is_exit_intent`) — `play` ignores it
+/// because the game closing ends `play` anyway; `serve` reads it to tell a
+/// deliberate `quit` from a dropped connection.
+fn relay_link(
+    lich: &mut Option<LichRun>,
+    link: &mut GameLink,
+    out: &mut dyn Write,
+    session: &SessionHandle,
+    queues: &mut crate::typing::Queues,
+    quit: &mut bool,
+    stop_on_quit: bool,
+    status: Option<&mut crate::rest::Status>,
+) -> io::Result<Ended> {
+    let mut status = status;
+    loop {
+        // What this pass moved, so a pass that moved nothing can idle instead of
+        // spinning (`IDLE_PASS`).
+        let mut moved = 0usize;
+        // The resting status, if this run keeps one: a tick per pass, and a
+        // line at most every five seconds (`crate::rest::Watch`).
+        if let Some(watch) = status.as_mut() {
+            if let Some(line) = watch.poll() {
+                let _ = writeln!(out, "{line}");
+                let _ = out.flush();
+            }
+        }
         if session.stopping() {
             // What was typed in the last instant still goes — the `quit` that
             // Ctrl-C sends above all — and then Lich gets its bounded moment to
             // carry that line on to the game.
-            carry_typed(&mut lich, &mut queues, game, out, session);
+            *quit |= carry_typed(lich, queues, &mut link.socket, out, session).quit;
             if let Some(run) = lich.as_mut() {
-                run.flush(game, out, STOP_FLUSH);
+                run.flush(&mut link.socket, out, STOP_FLUSH);
             }
-            break Ok(());
+            return Ok(Ended::Stopped);
         }
         // Lich's own output, and whether the child is still there.
         let mut lich_alive = true;
         if let Some(run) = lich.as_mut() {
-            lich_alive = match run.pump() {
-                Ok(alive) => alive,
-                Err(error) => break Err(error),
-            };
-            if let Err(error) = run.drain(out) {
-                break Err(error);
-            }
+            lich_alive = run.pump()?;
+            run.drain(out)?;
         }
         // game -> Lich
+        let mut game_open = true;
         loop {
-            match game_lines.try_recv() {
+            match link.lines.try_recv() {
                 Ok(line) => {
+                    moved += 1;
                     if let Some(run) = lich.as_mut() {
                         run.send_game(&line);
                     }
@@ -499,36 +637,133 @@ pub fn relay_game(
                 }
             }
         }
-        carry_typed(&mut lich, &mut queues, game, out, session);
+        let carried = carry_typed(lich, queues, &mut link.socket, out, session);
+        moved += carried.lines;
+        *quit |= carried.quit;
+        if *quit && stop_on_quit {
+            // The player asked to leave (`serve`'s reading; `play` leaves this
+            // to the game's own close): the line that says so is theirs, so it
+            // gets the same bounded moment Ctrl-C's `quit` gets to reach Lich
+            // and the game, and then the session stops.
+            if let Some(run) = lich.as_mut() {
+                run.flush(&mut link.socket, out, STOP_FLUSH);
+            }
+            return Ok(Ended::Stopped);
+        }
         // Lich -> game
         if let Some(run) = lich.as_mut() {
-            run.carry_frames(game);
+            run.carry_frames(&mut link.socket);
         }
-        if !lich_alive || !game_open {
-            if !game_open {
-                // The recovered literal `\n[hydra] the game closed the
-                // connection\n` (`hydra::play::run::{{closure}}`'s pool).
-                let _ = write!(out, "{}", crate::typing::GAME_CLOSED);
-                let _ = out.flush();
-            }
-            break Ok(());
+        // The connection first: a game that has gone cannot be carried to, and
+        // the reference build said `the game closed the connection` whenever
+        // both sides were gone.
+        if !game_open {
+            return Ok(Ended::Game);
         }
-    };
+        if !lich_alive {
+            return Ok(Ended::Lich);
+        }
+        // A resting session can sit here for hours: a pass that moved nothing
+        // gives the thread back instead of spinning a core (`IDLE_PASS`).
+        if moved == 0 {
+            thread::sleep(IDLE_PASS);
+        }
+    }
+}
 
-    // Teardown.  Lich may still have stdout in flight, so give it a bounded
-    // grace period before the child is stopped (pump drains what has arrived).
-    if outcome.is_ok() {
-        if let Some(run) = lich.as_mut() {
+/// A session that outlives its game connections: what `hydra serve` runs.
+///
+/// `play` relays exactly one connection ([`relay_game`]) and ends with it.  A
+/// **detached** `serve` must not: it is the reference build's resting session,
+/// which waits for the game to come back (`crates/hydra/NOTES.md` §8.4).  So the
+/// Lich half ([`LichRun`]) is built once, outside any connection, and each game
+/// connection is one [`GameLink`]: a drop closes that link and nothing else —
+/// not the child, not its keyed socket, not the session, not the typed lines
+/// still queued for it.
+///
+/// **INFERRED**: that the reference build keeps the same Lich across a game
+/// reconnect.  What is recovered is that the *supervisor* reconnects the game
+/// connector rather than the session (`hydra_session::supervisor`), so keeping
+/// the child is this reconstruction's reading; restarting it would re-run its
+/// own handshake and spawn a second child under a session that never ended.  The
+/// fallback (stop Lich and start it again with each connection) is *not* used,
+/// and nothing here claims the reference build does either.
+pub struct Resting {
+    lich: Option<LichRun>,
+    quit: bool,
+}
+
+impl Resting {
+    /// Take the Lich `hydra serve` has already started and keep it for every
+    /// connection this run makes.
+    pub fn start(keyed: KeyedRelay) -> io::Result<Resting> {
+        Ok(Resting {
+            lich: Some(LichRun::attach(keyed)?),
+            quit: false,
+        })
+    }
+
+    /// Relay one game connection until it ends, leaving Lich alone.
+    ///
+    /// The socket is owned for the duration and closed on the way out, so the
+    /// caller can dial again without leaking a reader thread.
+    pub fn play(
+        &mut self,
+        game: TcpStream,
+        out: &mut dyn Write,
+        session: &SessionHandle,
+        queues: &mut crate::typing::Queues,
+        status: Option<&mut crate::rest::Status>,
+    ) -> io::Result<Ended> {
+        let mut link = GameLink::open(game)?;
+        let mut quit = false;
+        let outcome = relay_link(
+            &mut self.lich,
+            &mut link,
+            out,
+            session,
+            queues,
+            &mut quit,
+            true,
+            status,
+        );
+        self.quit |= quit;
+        link.close();
+        outcome
+    }
+
+    /// Whether a line the player typed asked to leave the game
+    /// (`hydra_session::actor::is_exit_intent`: `quit`, `exit`, `qui`, `exi`).
+    pub fn quit_requested(&self) -> bool {
+        self.quit
+    }
+
+    /// Is Lich still running?  Prints what it said in the meantime.
+    ///
+    /// A resting run asks this while a retry is pending: a Lich that has exited
+    /// by itself ends the session, exactly as it does inside the relay loop, and
+    /// a run that is only waiting for the game would otherwise never notice.
+    pub fn alive(&mut self, out: &mut dyn Write) -> io::Result<bool> {
+        let Some(run) = self.lich.as_mut() else {
+            return Ok(false);
+        };
+        let alive = run.pump()?;
+        run.drain(out)?;
+        Ok(alive)
+    }
+
+    /// Stop Lich for good: the run is over.
+    ///
+    /// There is no game connection left to carry Lich's last frames to (the run
+    /// ended because one dropped, or because the session stopped and the relay
+    /// already flushed), so this stops the child, prints what was still on its
+    /// stdout and joins its reader.
+    pub fn stop(&mut self, out: &mut dyn Write) {
+        if let Some(mut run) = self.lich.take() {
             run.grace(out);
+            run.stop_alone(out);
         }
     }
-    if let Some(run) = lich.as_mut() {
-        run.stop(game, out);
-    }
-    drop(lich);
-    let _ = game.shutdown(Shutdown::Both);
-    let _ = game_reader.join();
-    outcome
 }
 
 /// What a typed `.lich` line asks the relay loop to do, in the order typed.
@@ -645,8 +880,15 @@ fn carry_typed(
     game: &mut TcpStream,
     out: &mut dyn Write,
     session: &SessionHandle,
-) {
+) -> Carried {
     let (to_lich, to_game, asked) = queues.take();
+    // Whether one of those lines asked to leave the game
+    // (`hydra_session::actor::is_exit_intent`).  `play` does not care — the game
+    // closing ends it anyway — and `serve` does: a connection that drops right
+    // after a `quit` was closed on purpose, and is not reconnected.
+    let mut quit = false;
+    let mut lines = 0usize;
+    lines += to_lich.len() + to_game.len() + asked.len();
     // The `.lich` requests first: they were typed through the same stdin as the
     // lines below, and the door they close (or open) is what those lines are
     // written through.  A line typed just before a `.lich off` and still waiting
@@ -682,6 +924,7 @@ fn carry_typed(
         }
     }
     for line in to_lich {
+        quit |= hydra_session::actor::is_exit_intent(&line);
         match lich.as_mut() {
             Some(run) => run.send_typed(&line),
             None => {
@@ -692,8 +935,25 @@ fn carry_typed(
         }
     }
     for line in to_game {
+        quit |= hydra_session::actor::is_exit_intent(&line);
         let _ = write_text(game, &line);
     }
+    Carried { quit, lines }
+}
+
+/// What one pass of [`carry_typed`] moved.
+///
+/// The relay loop sleeps this briefly when a whole pass moved nothing, so a
+/// **resting** session rests instead of spinning a core for hours (Phase 9:
+/// `serve` now stays up across game connections, so the loop has to be idle
+/// cheaply).  The sleep is one millisecond — far below anything a player or a
+/// test can notice — and it is skipped whenever there was work to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Carried {
+    /// a line the player typed asked to leave the game
+    quit: bool,
+    /// how many lines this pass moved (typed lines and `.lich` requests)
+    lines: usize,
 }
 
 /// Read CRLF-stripped lines from `socket` into `sender` until EOF, mapping each

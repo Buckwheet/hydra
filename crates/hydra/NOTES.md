@@ -36,8 +36,11 @@ workspace-pinned `tokio`, and — since Phase 4 — on `hydra_gui` and `eframe`
 `hydra_ui`/`hydra_gui` models (§5.4), `hydra play`/`hydra serve` start this
 character's Lich when `.lich on` is set (§6.4), and `hydra login` / `hydra play`
 log in for real — the `hydra_net` eaccess handshake, then the game socket
-(§8.1-8.2). What is still *recognised and reported* rather than faked is the
-resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
+(§8.1-8.2). `hydra serve` is the same session **resting** (§8.4): since Phase 9
+it survives a game disconnect (recovered notice, recovered backoff, the same
+Lich, the same session) instead of exiting. What is still *recognised and
+reported* rather than faked is the resting **window** (`serve` without one) and
+the ledger (`hydra_import`, `hydra_ledger`) — see
 [Wired vs not](#wired-vs-not).
 
 ---
@@ -363,7 +366,10 @@ commands themselves live in `hydra_session::lich_command` (see
 | `start(&plan)` | `hydra_lich::relay::start_keyed_minted(&Launch::new(ruby, folder/lich.rbw))`: bind loopback, spawn `ruby -e … -e … <folder>/lich.rbw --pipe --stormfront --sentinel -g 127.0.0.1:<port>`, write the two-line stdin handshake, accept the keyed connection (`docs/LICH_WIRE.md` §1-2). Its failure paths kill and reap the child, so a refused start leaves no orphan. |
 | `announce(&plan, out)` | the two recovered start lines, on stdout: `Lich is at <dir>, for every character.` then `Lich is starting, from <dir>\lich.rbw.` — the message keeps the literal backslash of the Windows reference build while the path spawned is `<dir>/lich.rbw` on this platform (`lich_command::script_path`). |
 | `relay(&mut keyed, out, session)` | print Lich's stdout lines through `hydra_lich::wire::LichOut` (so the 0x1F chunk byte is stripped) until `Relay::pump` reports the child gone, or until the session stops (`SessionHandle::stopping`, the recovered cancellation token), which kills and reaps Lich first. Returns Lich's exit status. Neither `play` nor `serve` uses it (both run `relay_game`); it is kept as the smallest faithful start-and-print loop. |
-| `relay_game(keyed, &mut game, out, session, queues)` | the whole session's two-way relay: Lich's stdout through `LichOut`, game lines to Lich's accepted socket, Lich's `<c>`/bare frames back to the game, typed lines where `crate::typing` routed them, until the child or the game ends. Used by `play` and, since Phase 7, by `serve`. Since Phase 9 its Lich side is swappable (`LichRun`), so `.lich off`/`.lich on` typed mid-session work without touching the game socket (§8.3). |
+| `relay_game(keyed, &mut game, out, session, queues)` | the whole session's two-way relay **for one game connection**: Lich's stdout through `LichOut`, game lines to Lich's accepted socket, Lich's `<c>`/bare frames back to the game, typed lines where `crate::typing` routed them, until the child or the game ends. `play` uses it; `serve` uses `Resting` (below). Since Phase 9 its Lich side is swappable (`LichRun`), so `.lich off`/`.lich on` typed mid-session work without touching the game socket (§8.3). |
+| `Resting` (Phase 9) | a session that outlives its game connections: `start(keyed)` keeps the `LichRun` for the whole run, `play(socket, out, session, queues, status)` relays one connection (`GameLink`) and closes only that, `alive(out)` answers whether Lich still runs (the retry loop asks), `quit_requested()` says whether a typed line asked to leave (`hydra_session::actor::is_exit_intent`), `stop(out)` stops Lich for good. **INFERRED**: that the reference build keeps one Lich across a game reconnect — the recovered supervisor reconnects the *connector*, not the session (§8.4, §9). |
+| `GameLink` (private) | one game connection: the socket, the channel its reader fills and the reader thread. `open` starts it, `close` shuts the socket down and joins. A dropped connection is a dropped `GameLink`, nothing more. |
+| `relay_link(...) -> Ended` (private) | the loop both relays share; `Ended::Game`/`Lich`/`Stopped` says why it returned. `stop_on_quit` is `false` for `play` (the game's own close ends `play`) and `true` for `Resting` (a typed `quit` ends `serve` deliberately); a pass that moved nothing idles for `IDLE_PASS` (1 ms) so a resting session does not spin. |
 | `LichRun` (private) | one Lich while it runs: the `KeyedRelay`, its frames channel, the thread that reads its socket and how much of its stdout has been printed. `attach` starts the reader, `stop(game, out)` carries Lich's last frames to the game, kills the child, shuts the socket down and joins the reader — bounded and idempotent (its `Drop` repeats it, `Relay::drop` reaps). |
 | `switches(&[Handled]) -> Vec<Switch>` | the pure bookkeeping behind a typed `.lich`: `.lich off` → `Switch::Stop`, `.lich on` → `Switch::Start`, in the order typed. The folder and every other setting are read from `SessionHandle::lich_settings()`, never carried here. |
 | `start_lich(session, queues, out)` (private) | a start in a running session: `plan` from the session's settings, `start`, the two recovered start lines (`announce`), then a fresh `LichDoor::claim` whose `typed` end replaces the relay's queue. A refusal or a failed spawn prints its sentence (or `[hydra] …`) and returns `None`, leaving the session running with typing going to the game. |
@@ -501,7 +507,7 @@ Facts, for a later pass:
 | `hydra login <char> [--account A] [--game G]` | **runs** | the real eaccess login (`hydra_net::eaccess::handshake`), then the game socket: the raw XML goes to stdout; §8.1 |
 | `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends, and reads what the player types on stdin; §8.1, §8.3 |
 | `hydra play …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` — said before anything is dialled |
-| `hydra serve …` with `.lich on` | **runs** | the whole session without a window: login, Lich, game socket, two-way relay — plus `--in <dir>` (chdir + input spool) and `--web <port>` (the headless page) and `--detach`; §8.4 |
+| `hydra serve …` with `.lich on` | **runs** | the whole session without a window: login, Lich, game socket, two-way relay — plus `--in <dir>` (chdir + input spool), `--web <port>` (the headless page), `--detach`, `--resume <path>` and `--again`. Since Phase 9 it **rests**: a dropped game connection is waited out and dialled again with the same Lich and session; §8.4 |
 | `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` (§6.4) |
 | `hydra import <path>...` | **runs** | `hydra_import::sessions` groups the recordings and `hydra_ledger::Ledger::note_import` records each file; the recovered summary line is printed; §8.5 |
 | `hydra lookout seed` | **runs** | locks the data folder, finds the player logs, and prints `hydra_session::lookout_seed::seed`/`summary` for every character; §8.5 |
@@ -571,6 +577,12 @@ game (§8.1, §8.4).
   Ruby in `tests/fixtures/lich_path/ruby` looks like.
 
 `serve` used to be Lich-only; since Phase 7 it runs the same session (§8.4).
+
+**Since Phase 9 `serve` runs a *resting* variant** (`lich::Resting`, §8.4): the
+loop above is `relay_link`, shared by both, and the difference is what happens
+when it returns.  `relay_game` tears the whole session down; `Resting::play`
+closes only the `GameLink` for that connection and keeps Lich, its keyed socket,
+its reader thread and the typed queues exactly where they were.
 
 **Since Phase 9 the Lich side is swappable.** Everything one Lich owns — the
 child, its stdin, its stdout lines, its accepted socket and the thread reading
@@ -677,7 +689,7 @@ comes from `SPEC_P6.md` and
 `https://github.com/elanthia-online/lich-5/blob/cec0f60e/docs/eaccess-protocol-analysis.md`,
 not from a capture this reconstruction made.
 
-### 8.4 `hydra serve` (Phase 7): `src/serve.rs`
+### 8.4 `hydra serve` (Phase 7, resting since Phase 9): `src/serve.rs`
 
 `hydra::serve` (`0x10021e6d0` … `0x10021eec4`) parses its own arguments first
 (the tokens come in as pointer + length in `x2`/`x3`):
@@ -685,22 +697,65 @@ not from a capture this reconstruction made.
 | token | meaning | here |
 |---|---|---|
 | `--detach` | rest in the background (`hydra::startup::detach`, `0x10021f40c`) | **wired** |
-| `--resume <arg>` | a captured session to resume | parsed, reported as not wired |
+| `--resume <arg>` | a captured session to resume | **wired as a resume file** (Phase 9): `hydra_table::table::Resume::read` |
 | `--web <port>` | serve the page on that `u16` port | **wired** (headless page) |
 | `--open` | open the page in a browser | parsed, reported as not wired |
-| `--again` | start over rather than continue | parsed, reported as not wired |
+| `--again` | start over rather than continue | **wired** (Phase 9, INFERRED): a fresh session per reconnect |
 | `--in <dir>` | `std::sys::paths::unix::chdir` (`0x10021e9a0`-family) | **wired**, plus a spool (below) |
 | anything else | pushed onto the target list (the character) | **wired** |
 | `--account <a>`, `--game <g>` | — | **ADDITIONS** (the reference took both from the roster alone; `login`/`play` already take them) |
 
-* **The session.** `serve` runs exactly what `play` runs, in the same order and
-  with the same messages: `lich::load_settings` → `lich::off_message` when off →
-  `lich::plan` (the recovered refusals) → `login::resolve` / `password` /
-  `sign_in` (the same stage lines on stderr) → `lich::start` → `lich::announce`
-  (the two recovered start lines) → the game socket → the connected notice →
-  `lich::relay_game` → `[status] the session has ended`. `login::sign_in` and
-  `login::open_game` are `pub(crate)` for exactly that reuse. The run exits 0
-  when the game or Lich ends.
+* **The session.** `serve` starts exactly as `play` does and with the same
+  messages: `lich::load_settings` → `lich::off_message` when off → `lich::plan`
+  (the recovered refusals) → `login::resolve` / `password` / `sign_in` (the same
+  stage lines on stderr) → `lich::start` → `lich::announce` (the two recovered
+  start lines) → the game socket → the connected notice. `login::sign_in` and
+  `login::open_game` are `pub(crate)` for exactly that reuse. What follows is
+  the resting loop below, not `play`'s one-connection relay.
+* **Resting: a detached `serve` survives a game disconnect (Phase 9).** The
+  session (`session::Headless`), its Lich (`lich::Resting`), the typed input
+  thread (`typing::Current`), the web page and the settings are made **once**;
+  each game connection is one `Resting::play`. When the game reaches EOF:
+     1. the recovered notice `\n\n[hydra] the connection dropped;
+        reconnecting\n\n` (`rest::DROPPED`) is printed;
+     2. `\nlifecycle Reconnecting` (`hydra_session::supervisor::lifecycle_line`),
+        then `reconnecting in {ms}ms (attempt {n})`
+        (`supervisor::reconnecting_line`) with
+        `supervisor::wait_before_retry(attempt)` — the recovered
+        `[1, 2, 5, 10, 30]`-second table with 80–120 % jitter, so the first wait
+        really is ~1 s;
+     3. the wait is slept in 25 ms slices (`RETRY_SLICE`) so Ctrl-C is felt
+        immediately, then `\nlifecycle Logging in` and the **same** resolved
+        target and password are logged in again (`login::sign_in` /
+        `login::open_game` — the password is read once, at the start, and never
+        prompted for or printed again);
+     4. a login or dial that fails is *not* the end: the next step of the table
+        is waited out and tried, so a game that is down for a minute is waited
+        for. A successful connection resets the attempt counter to 0.
+  `--again` swaps the session for a fresh `Headless` at that moment (`[hydra]
+  serve: --again: started a new session for <character>`), keeping Lich, the
+  input thread and the page; without it the same session is reused (same
+  character, same settings, same typed log, same Lich door).
+* **What ends it.** Only a deliberate end: a typed `quit`/`exit`/`qui`/`exi`
+  (`hydra_session::actor::is_exit_intent`, which is what
+  `Resting::quit_requested` reads), Ctrl-C, or Lich exiting by itself. A
+  `quit` carried through Lich is given `STOP_FLUSH` (400 ms) to reach the game
+  and then the session stops; a *dropped* connection that follows a `quit` is
+  not reconnected. The end is the recovered `finish`: `\nsession stopped:
+  {reason}` (`quit`, `Ctrl-C`, `Lich ended` — the reason a stopped session said
+  through `Event::Over`), then `[status] the session has ended`, and exit 0.
+* **The resting status (`src/rest.rs`).** `rest::doing(playing, laid_out,
+  windows)` is the recovered composition (`no character playing` /
+  `1 character playing` / `{n} characters playing`, `, the map laid out {n}
+  times`, `no window open` / `the windows open`); `rest::Watch` repeats
+  `[hydra] memory: {doing}, …` every 5 s when the composition changes and every
+  60 s otherwise, polled from the relay loop's own passes (it never blocks the
+  relay). The memory **figure is not reconstructed** — it needs a
+  `memory_stats` dependency that is not in this workspace — so the line says
+  `RAM unknown` (`rest::MEMORY_UNKNOWN`) rather than inventing a number.
+  `serve` passes `1` while a connection is up and `0` while a retry is pending;
+  the map and window counts are always `0` here (**INFERRED**: what the
+  reference build counted).
 * **`--in <dir>` — the recovered half.** It is the reference build's `chdir`
   into `dir`, first thing after the parse; a failure prints the recovered
   `{path}: {err}` shape and exits 1. Relative paths after it are the folder's,
@@ -731,11 +786,31 @@ not from a capture this reconstruction made.
   `Serve::args` shape), `stdin(Stdio::null())`, both output streams on the log,
   cwd `--in`; spawned, not waited for. The parent then prints the recovered
   `[hydra] resting in the background; its log is <path>` on stderr and exits 0.
-* **Still unwired.** The window and the recovered resting loop
-  (`hydra::gui::run` over a captured session), `--resume`/`--again`/`--open`
-  (there is no session store and no browser here), and the real mDNS
-  announcement. Those three flags are *reported* (one `[hydra] serve: …` line
-  each) rather than ignored.
+  Since Phase 9 the child's argv also carries the `--again` the recovered
+  `Serve::args` always appends (`startup::AGAIN_FLAG`), so a detached child
+  starts a new session each time it reconnects — and the detached test checks
+  exactly that, through the log.
+* **`--resume <path>` (Phase 9, INFERRED).** `serve` splits the path into a
+  folder and a file name and calls the recovered
+  `hydra_table::table::Resume::read(dir, file)`; its `arg()` becomes the
+  character **when the command line named none** (a named target always wins).
+  A resume file that names nobody (or is not there) is reported —
+  `[hydra] serve: <path> names no character to resume; …` — and changes
+  nothing.  What the reference build meant by "a captured session to resume" is
+  **UNKNOWN**: there is no captured-session store here, so the one recovered
+  piece (a file whose trimmed content names something) is all that is used.
+* **`--again` (Phase 9, INFERRED).** Read as "start over rather than continue"
+  per reconnect: a fresh `Headless` (no typed log, no settings of its own, a
+  fresh Lich door) with the same taker, while Lich, the input thread and the
+  page stay (they belong to the run, not the session). Whether the reference
+  build meant a session, a character or a recording is **UNKNOWN**. Note that
+  `startup::Serve::args` appends `--again` to a detached child's argv, which is
+  consistent with "this run is a restart, do not continue the old one".
+* **Still unwired.** The window and the recovered GUI resting loop
+  (`hydra::gui::run` over a captured session) — this headless `serve` is the
+  session without the window — `--open` (there is no browser here), and the
+  real mDNS announcement. `--open` is *reported* (one `[hydra] serve: …` line)
+  rather than ignored.
 
 ### 8.5 `hydra import` and `hydra lookout seed` (Phase 7)
 
@@ -845,7 +920,38 @@ recovered summary templates are printed.
     is the bare `.lich` and `.lich status` is answered with the usage line —
     locally, never forwarded. Whether the reference build accepts a `status`
     word is UNKNOWN; it is not in the recovered table.
-12. **Phase 9, the live window (§5.4).** What is *established* is the chain
+12. **Phase 9, the resting `serve` (§8.4).** What is *established* is the
+    recovered argv/`Serve::args` shape, the three supervisor log templates and
+    their five state words, the `[1, 2, 5, 10, 30]`-second backoff with
+    multiplicative jitter, `is_exit_intent`'s four words, the
+    `rest::doing` composition's literals, the 5 s/60 s `rest::watch` cadence, the
+    `\n\n[hydra] the connection dropped; reconnecting\n\n` notice and the
+    `[status] the session has ended` tail.  What is **INFERRED**:
+    * **one Lich across a reconnect.**  The supervisor reconnects the game
+      connector, not the session, so `lich::Resting` keeps the child, its keyed
+      socket and its reader for the whole run; the fallback (stop Lich and start
+      it again with every connection) is *not* used.  Nothing in the recovered
+      strings says which the reference build does.
+    * **`--again`** = a fresh `Headless` per reconnect (§8.4), while Lich, the
+      input thread and the web page stay.  The flag's own words ("start over
+      rather than continue") do not say what is started over.
+    * **`--resume <path>`** = a resume file whose trimmed content names the
+      character if the command line named none.  There is no captured-session
+      store here; `Resume::read(dir, file)` and `Resume::arg()` are the two
+      recovered pieces used.
+    * **which moment gets which lifecycle state**, and that the lifecycle lines
+      are written on stdout (the login's stage lines stay on stderr).
+    * **`rest::doing`'s counts**: `serve` reports one character playing while a
+      connection is up, none while a retry is pending, and no map and no window
+      in a headless build.
+    * **the idle pass.**  `relay_link` sleeps `IDLE_PASS` (1 ms) when a pass
+      moved nothing.  The recovered session is tokio-driven and has no idle
+      case; without this, a session that now rests for hours would spin a core.
+    The memory figure `rest::watch` prints is **not reconstructed** (a
+    `memory_stats` dependency is not in this workspace), so the line says
+    `RAM unknown`.  And as everywhere else here: nothing was run against a real
+    account, game or Lich — every test is a loopback mock.
+13. **Phase 9, the live window (§5.4).** What is *established* is the chain
     (login → game socket → `hydra_protocol::Parser` → `hydra_ui`/`hydra_model`
     models → `hydra_gui`) and every model it draws.  What is **INFERRED** is the
     play area's four-band layout inside the recovered chrome, the `> ` echo
@@ -860,9 +966,9 @@ recovered summary templates are printed.
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **153 passing** (119 unit + 34 integration:
+`cargo test -p hydra --offline` → **164 passing** (126 unit + 38 integration:
 13 in `tests/cli.rs`, 4 in `tests/import_lookout.rs`, 3 in `tests/login.rs`,
-6 in `tests/lich_relay.rs`, 6 in `tests/play_stdin.rs`, 2 in `tests/serve.rs`).
+6 in `tests/lich_relay.rs`, 6 in `tests/play_stdin.rs`, 6 in `tests/serve.rs`).
 
 Unit tests (in the modules):
 
@@ -920,6 +1026,18 @@ Unit tests (in the modules):
   `.lich off` closes the door so the next line goes to the game; a start that
   cannot be planned prints the recovered sentence, starts nothing and leaves
   typing working; a start asked for as the session ends spawns nothing);
+* `rest` (Phase 9) — the recovered `rest::doing` composition (one/many/no
+  character playing, `the map laid out {n} times`, `no window open`/`the windows
+  open`), the `[hydra] memory: …` line with a figure **and** with `RAM unknown`,
+  the `DROPPED` notice byte for byte, and `Watch`/`Status`: the first status,
+  silence inside the 5 s interval, the changed composition at the next tick, and
+  the ~60 s heartbeat;
+* `serve` (Phase 9) — the resume file (`Resume::read` through a path, a missing
+  file naming nobody, a path with no file name being reported, a resume that
+  names the character only when the command line named none, a named target
+  winning), `--open` as the one still-unwired word (`--resume`/`--again` no
+  longer are), and `wait_before_retry` really waiting but answering at once for
+  a stopped session;
 * `typing` (Phase 7) — the pure router (empty lines, `;status` as the first word
   and `;statuses` not being it, the `.`-prefix with the default and a chosen
   symbol, the Lich/game split), `dispatch` for each route (the door's queue
@@ -957,7 +1075,10 @@ Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
   lines, Lich's own line, the forwarded chunk **without** its 0x1F byte, exit 0
   and an empty stderr; plus Lich off (nothing spawned), no Ruby (the recovered
   Ruby sentence), a folder without `lich.rbw`, and a settings file with no
-  folder. Every run is capped at 30 s and killed on overrun;
+  folder. Every run is capped at 30 s and killed on overrun.  Since Phase 9 the
+  `serve` run there keeps its game up (`MockGame::start_lingering`) and ends
+  because the short-lived fixture Lich exits, not because the game closed: a
+  game EOF would now be reconnected instead;
 * `tests/play_stdin.rs` (Phases 7 and 9) — `hydra play` with its **stdin
   piped**, a `MockGame::start_lingering` (the game socket stays open so the
   session can type at it) and `tests/fixtures/lich_typing/ruby`, a second
@@ -997,21 +1118,51 @@ Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
   Every wait and every run is bounded by `WAIT` (30 s), and each child is killed
   and reaped when the test ends.
 
-* `tests/serve.rs` (Phase 7) — `hydra serve` end to end, both halves:
+* `tests/serve.rs` (Phases 7 and 9) — `hydra serve` end to end, six runs:
   * `serve Aelith --account main --in <dir> --web <port>` against a lingering
     `MockGame`, a `MockEaccess` and `tests/fixtures/lich_typing/ruby`: the two
     recovered start lines and Lich's own line are printed, `GET /` on
     `127.0.0.1:<port>` answers `200` + `text/html; charset=utf-8` with a body
     containing `Hydra`; `look` dropped into a file in `<dir>` reaches the game
-    (and the file is removed), `quit` in the next file reaches it too, the game
-    closing then ends the run with status 0, and the game received exactly
-    `look`, `quit` — while the login's `[login] [stage: cert_pin]` went to
-    stderr;
-  * `serve Aelith --account main --detach`: the parent exits 0, its stderr says
+    (and the file is removed), then `.lich off` and `quit` end the run
+    **deliberately** (status 0, `\nsession stopped: quit`,
+    `[status] the session has ended`) because Phase 9 stopped treating a game
+    EOF as the end of a resting `serve`; the game received exactly `look`,
+    `quit`, made exactly one connection, and the login's
+    `[login] [stage: cert_pin]` went to stderr;
+  * (**Phase 9**) `serve … --in <dir>` against a `MockGame::start_series` whose
+    **first** connection closes after its stream and whose second lingers, with
+    `tests/fixtures/lich_restart/ruby` (the fixture Lich that counts its boots):
+    the recovered `\n\n[hydra] the connection dropped; reconnecting\n\n`
+    notice, `\nlifecycle Reconnecting` and a `reconnecting in …ms (attempt 1)`
+    line appear, a **second** game handshake happens (four recorded lines: the
+    same launch key and front-end line twice), the boot counter is still **1**
+    and the start pair was printed **once** (so the same Lich served both
+    connections), a spooled `look` then reaches the *second* connection through
+    that Lich, and a spooled `quit` ends the run with status 0,
+    `\nsession stopped: quit` and no third connection;
+  * (**Phase 9**) the same drop with `--again`: the log/streams say
+    `[hydra] serve: --again: started a new session for Aelith` after the second
+    handshake, and Lich is still the one boot;
+  * (**Phase 9**) `serve --resume <file> --account main` with **no** character
+    on the command line: the resume file names it, so the login's `L` line is
+    `L\tW_TEST_001\tSTORM` (the character code from the mock's list), nothing
+    is reported as unnamed, and the run ends by itself when the short-lived
+    fixture Lich exits;
+  * (**Phase 9**) Ctrl-C (`/bin/kill -INT`) on a resting serve whose game
+    lingers: the run ends by itself with status 0, says
+    `\nsession stopped: Ctrl-C` and `[status] the session has ended`, sent the
+    `quit` on to the game, and made no second connection;
+  * `serve Aelith --account main --detach --in <dir>` against the same
+    two-connection game: the parent exits 0, its stderr says
     `resting in the background; its log is <data>/hydra.log`, and that log
     (which is the child's stdout *and* stderr) holds the child's own
-    `[login] [stage: cert_pin]`, the start line and `[status] the session has
-    ended` — the child really ran and ended with the session.
+    `[login] [stage: cert_pin]`, the start line, the dropped notice, the
+    retrying line, a **second** game handshake, `--again: started a new
+    session for Aelith` (the recovered `Serve::args` gives a detached child
+    `--again`), and — after `.lich off` and `quit` in the spool —
+    `\nsession stopped: quit` and `[status] the session has ended`.  The run
+    made exactly two connections, so nothing was left reconnecting.
 
 * `tests/import_lookout.rs` (Phase 7) — `hydra import` over a synthetic
   `GS3_Aelith-2026-10-27_10-00-00-000.bytes` recording: the recovered summary
@@ -1051,6 +1202,21 @@ cargo test  -p hydra --offline          # 119 + 13 + 4 + 3 + 6 + 6 + 2 passing
 cargo test  --workspace --offline       # green
 cargo check --workspace --offline       # clean
 ```
+
+And on `p9/3` (Phase 9, the resting `serve`), again `--offline`, loopback only,
+with a multi-connection `MockGame` and no real host anywhere:
+
+```sh
+cargo test  -p hydra --offline          # 126 + 13 + 4 + 3 + 6 + 6 + 6 passing
+cargo test  -p hydra_mocks --offline    # 29 passing (7 of them the game server)
+cargo test  -p hydra_session --offline  # 218 passing (the supervisor's lifecycle lines)
+cargo test  --workspace --offline       # green
+cargo check --workspace --offline       # clean
+```
+
+The reconnect tests (`tests/serve.rs`) were re-run six times in a row with the
+same result; every wait in them is bounded by `WAIT` (30 s) and the whole file
+finishes in about three seconds.
 
 `cargo clippy -p hydra --all-targets` **cannot run on this branch**: it stops on
 `crates/hydra_net/src/sink/config.rs:54` (`clippy::erasing_op` is deny-by-default

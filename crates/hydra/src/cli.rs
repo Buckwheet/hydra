@@ -66,8 +66,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// One of the command lines the reference build understands.
 ///
 /// Every variant is recognised; what each one *runs* is set out in `NOTES.md`
-/// §8 (`login` and `play` log in for real since Phase 6, `serve` is still the
-/// Lich side only, the hub window and the ledger are still reported).
+/// §8 (`login`/`play`/`serve` log in and relay for real since Phases 6-9, the
+/// live window and the ledger too; what is still only *reported* is the hub
+/// window without a character and `serve --open`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// No arguments at all: the hub window (`hydra::gui::run`).

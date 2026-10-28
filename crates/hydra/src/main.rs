@@ -68,6 +68,7 @@ mod lookout;
 mod login;
 mod render;
 mod replay;
+mod rest;
 mod serve;
 mod session;
 mod source;

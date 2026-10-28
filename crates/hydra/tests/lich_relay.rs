@@ -15,7 +15,10 @@
 //! on `127.0.0.1`, with a certificate generated at test time and a synthetic
 //! password in `HYDRA_PASSWORD_MAIN`.  Since Phase 7 `hydra serve` runs the
 //! same session, so its test points at the same mocks (`tests/serve.rs` covers
-//! the `--in` spool and the `--web` page on top of that).
+//! the `--in` spool, the `--web` page and — since Phase 9 — the resting
+//! reconnects on top of that).  Since Phase 9 a *game* EOF no longer ends
+//! `serve`, so `serve_starts_lich_too` keeps its game up and lets the
+//! short-lived fixture Lich end the run instead.
 //!
 //! Every wait is bounded: [`WAIT`] caps a whole run, and a run that overruns
 //! fails the test instead of parking it.
@@ -193,7 +196,11 @@ fn mocks_for_play(eaccess_port: u16, password: &str) -> Vec<(&'static str, Strin
 /// Start a `MockGame` and a `MockEaccess` whose launch points at it, and return
 /// the environment `play` needs.  Both serve on `127.0.0.1`.
 fn start_mocks() -> (MockGame, MockEaccess, Vec<(&'static str, String)>) {
-    let game = MockGame::start(STREAM).expect("the mock game server starts");
+    start_mocks_with(MockGame::start(STREAM).expect("the mock game server starts"))
+}
+
+/// [`start_mocks`] around a game server the caller chose.
+fn start_mocks_with(game: MockGame) -> (MockGame, MockEaccess, Vec<(&'static str, String)>) {
     let mut script = EaccessScript::synthetic();
     script.launch.host = "127.0.0.1".to_string();
     script.launch.port = game.addr().port();
@@ -272,9 +279,16 @@ fn play_starts_lich_relays_its_stdout_and_exits_cleanly() {
 #[test]
 fn serve_starts_lich_too() {
     // `serve` is the whole session since Phase 7 (login + Lich + game socket),
-    // so it needs the same loopback mocks `play` does.
+    // so it needs the same loopback mocks `play` does.  Since Phase 9 its run
+    // does *not* end with the game (`serve` reconnects instead), so this test
+    // keeps the game up (`MockGame::start_lingering`) and ends the run the way
+    // a resting serve really ends: the short-lived fixture Lich exits by
+    // itself, which stops the session (`Ended::Lich`) exactly as it does for
+    // `play`.  Nothing here is left waiting for a reconnect.
     let (data, folder) = TempDir::with_lich("serve");
-    let (game, eaccess, envs) = start_mocks();
+    let (game, eaccess, envs) = start_mocks_with(
+        MockGame::start_lingering(STREAM).expect("the mock game server starts"),
+    );
     let finished = run_with(
         &["serve", "Aelith", "--account", "main"],
         &data,

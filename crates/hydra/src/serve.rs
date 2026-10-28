@@ -21,12 +21,34 @@
 //! `0x10021efac`, which appends `--again`, `--web <port>`, `--open` and one
 //! `--resume <arg>` per resume) and calls `hydra::startup::detach`
 //! (`0x10021f40c`); without it, `hydra::connect::Target::many` and then
-//! `hydra::gui::run`.
+//! `hydra::gui::run`.  The original `serve` **is** the resting window; this
+//! headless `serve` is the same session without a window.
+//!
+//! # Resting: the game may go away and come back
+//!
+//! The recovered session is a supervisor: `SupervisedSession::transition`,
+//! `wait_before_retry` and `finish` log `\nlifecycle {state}`,
+//! `reconnecting in {ms}ms (attempt {n})` and `\nsession stopped: {reason}`, and
+//! `supervisor::backoff` is the recovered `[1, 2, 5, 10, 30]`-second table with
+//! multiplicative jitter.  A **detached** `serve` that exited on a game EOF
+//! would not be resting at all, so this phase makes the connection — not the
+//! session — the thing that comes and goes:
+//!
+//! * the session ([`session::Headless`]), its Lich ([`lich::Resting`]), the
+//!   typed input thread, the web page and the settings are made **once**;
+//! * each game connection is one relay ([`lich::Resting::play`]); when the game
+//!   reaches EOF the run says the recovered [`crate::rest::DROPPED`] notice,
+//!   waits the recovered `supervisor::wait_before_retry(attempt)`, logs in again
+//!   for the same resolved target and password (never prompting) and dials
+//!   again;
+//! * a login or connect that fails only means the next attempt, with the next
+//!   step of the recovered table;
+//! * only a deliberate end stops it: a typed `quit`/`exit`
+//!   (`hydra_session::actor::is_exit_intent`), Ctrl-C, or Lich exiting by
+//!   itself.  The run then says `\nsession stopped: {reason}` and
+//!   `[status] the session has ended`, and exits 0.
 //!
 //! # What this phase runs
-//!
-//! The whole session `hydra play` runs — the eaccess login, this character's
-//! Lich, the game socket and [`crate::lich::relay_game`] — without a window:
 //!
 //! * `--in <dir>` is the recovered `chdir`, **plus** an addition: `dir` is also
 //!   watched as an *input spool*.  Every regular file whose name does not start
@@ -42,30 +64,55 @@
 //!   stdin closed and stdout/stderr in `<data>/hydra.log`
 //!   ([`crate::startup::detach`]), prints the recovered resting message and
 //!   returns `Ok`, so the parent exits 0;
-//! * `--resume`, `--again` and `--open` are parsed (the recovered words) and
-//!   reported as not wired: there is no captured-session store and no browser
-//!   to open here.
+//! * `--resume <path>` is read with `hydra_table::table::Resume::read`, and its
+//!   `arg()` becomes the character when the command line named none;
+//! * `--again` starts a **fresh** `Headless` when the game connection comes
+//!   back (see [`start_over`]); without it the session is reused;
+//! * `--open` stays reported as not wired: there is no browser to open here.
 //!
-//! The run ends when the game or Lich does, and exits 0 — the same way `play`
-//! does after the recovered `[status] the session has ended`.
+//! **INFERRED**, and marked so at each point: that `--again` means a fresh
+//! session per reconnect, that the Lich child survives a game reconnect, and
+//! the channel the lifecycle lines are written on.  What the reference build's
+//! `rest::doing` counted as "playing" and the memory figure it printed are
+//! **UNKNOWN**; see [`crate::rest`].
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use hydra_session::command::taker_pair;
+use hydra_session::command::{taker_pair, Event, Listener, SessionHandle, Taker};
 use hydra_session::lich_command::LichSettings;
+use hydra_session::supervisor::{self, Lifecycle};
+use hydra_table::table::Resume;
 
 use crate::lich;
 use crate::login;
+use crate::rest;
 use crate::session;
 use crate::startup;
 use crate::typing;
 
 /// The command's own name, as every message spells it.
 pub const LABEL: &str = "hydra serve";
+
+/// The reason a run ends with when the player typed `quit`/`exit`
+/// (`hydra_session::actor::is_exit_intent`).
+pub const QUIT: &str = "quit";
+
+/// The reason a run ends with when Lich exited by itself.
+pub const LICH_ENDED: &str = "Lich ended";
+
+/// How long a retry's wait is slept in one piece.
+///
+/// The recovered backoff is up to 30 seconds per attempt, and Ctrl-C has to be
+/// felt while it runs: the wait is taken in slices this short, each one checking
+/// the session's cancellation token.  It is not a busy loop — one retry is a few
+/// dozen of these.
+const RETRY_SLICE: Duration = Duration::from_millis(25);
 
 /// A parsed `hydra serve` command line.
 ///
@@ -162,7 +209,8 @@ impl Options {
         self.targets.first().cloned().unwrap_or_default()
     }
 
-    /// The login arguments this command line amounts to.
+    /// The login arguments this command line amounts to, before `--resume` has
+    /// been read ([`resume_arguments`] reads it).
     pub fn arguments(&self) -> login::Arguments {
         login::Arguments {
             character: self.character(),
@@ -174,17 +222,76 @@ impl Options {
     /// The recovered words this phase parses but cannot honour yet.
     pub fn unwired(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if !self.resumes.is_empty() {
-            out.push("--resume (resuming a captured session needs hydra_table's session store)");
-        }
-        if self.again {
-            out.push("--again (there is no captured session to start over from)");
-        }
         if self.open {
             out.push("--open (there is no browser to open, and no window in this phase)");
         }
         out
     }
+}
+
+/// The character a resume file names, through `hydra_table::table::Resume::read`.
+///
+/// The recovered reader takes the data directory and the file *name*
+/// (`Resume::read(dir, file)`), while `--resume` is one path, so the path is
+/// split here.  `Ok(None)` means the file was there but named nobody (or was not
+/// there at all): the recovered reader answers an empty `arg()` for both.
+pub fn resume_character(path: &str) -> Result<Option<String>, String> {
+    let path = Path::new(path);
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{}: not a resume file path", path.display()))?;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok(Resume::read(dir, file).arg())
+}
+
+/// The login arguments for this run, with `--resume` filling in a character.
+///
+/// **INFERRED** (the recovered `Resume::arg` is a `String` and `serve` pushes
+/// its `--resume` values onto the resume list, but which of them names a
+/// character is this phase's reading): the first resume file that names one is
+/// the character, and only when the command line named none.  A resume that
+/// cannot be read is reported and changes nothing, so a named target still runs.
+pub fn resume_arguments(options: &Options) -> login::Arguments {
+    let mut arguments = options.arguments();
+    if !arguments.character.is_empty() {
+        return arguments;
+    }
+    for path in &options.resumes {
+        match resume_character(path) {
+            Ok(Some(character)) => {
+                arguments.character = character;
+                break;
+            }
+            Ok(None) => eprintln!(
+                "[hydra] serve: {path} names no character to resume; keeping the target this \
+                 command line named"
+            ),
+            Err(message) => eprintln!("[hydra] serve: {message}"),
+        }
+    }
+    arguments
+}
+
+/// Say one lifecycle state on stdout.
+///
+/// **INFERRED** channel: the recovered `\nlifecycle {state}` is a log line, and
+/// this headless session writes what it says about itself on stdout (the
+/// connected, dropped and session-ended notices are there too); the login's
+/// stage lines stay on stderr.
+fn life(out: &mut dyn Write, state: Lifecycle) {
+    let _ = writeln!(out, "{}", supervisor::lifecycle_line(state));
+    let _ = out.flush();
+}
+
+/// Say one line, ignoring a write error: a closed stdout must not end a run that
+/// is otherwise still usable.
+fn say(out: &mut dyn Write, line: &str) {
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// A web page thread, stopped and joined when this value is dropped.
@@ -195,7 +302,7 @@ struct Web {
 
 impl Web {
     /// Bind `port` and serve the synthetic page from its own thread.
-    fn start(root: &std::path::Path, port: u16, character: &str) -> Result<Web, String> {
+    fn start(root: &Path, port: u16, character: &str) -> Result<Web, String> {
         let mut server = hydra_web::Server::new(root)?;
         let (listener, port) = server.bind(port)?;
         let page = server.page(character);
@@ -204,7 +311,7 @@ impl Web {
         let thread = {
             let stop = Arc::clone(&stop);
             let server = server.clone();
-            std::thread::Builder::new()
+            thread::Builder::new()
                 .name("hydra-web".to_string())
                 .spawn(move || server.serve_blocking(listener, page, &stop))
                 .map_err(|error| format!("the web page could not be served: {error}"))?
@@ -223,6 +330,65 @@ impl Drop for Web {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// The parts of a resting run that outlive one game connection.
+struct Wiring {
+    /// the session itself: reused across reconnects, replaced by `--again`
+    session: session::Headless,
+    /// the game end of the session's taker, kept so a replacement session
+    /// ([`start_over`]) can be given the same one
+    taker: Taker,
+    /// what the input thread fills and the relay loop drains
+    queues: typing::Queues,
+    /// this session's events, from before the run started: `Event::Over` is how
+    /// a stopped session says *why* it stopped
+    events: Listener,
+    /// the spool/stdin thread; deliberately not joined (it may be parked in a
+    /// read when the run ends)
+    _input: JoinHandle<()>,
+}
+
+impl Wiring {
+    /// One session's typing: the Lich door claimed (so Lich takes typing again),
+    /// the taker installed, and the input thread started.
+    fn new(
+        session: session::Headless,
+        options: &Options,
+        current: &typing::Current,
+    ) -> Result<Wiring, String> {
+        let claim = session.door().claim();
+        let (taker, to_game) = taker_pair();
+        session.handle().set_taker(taker.clone());
+        // Subscribed before the run: `SessionHandle::subscribe` only reports
+        // events from now on, and the one this is here for (`Event::Over`) is
+        // the last thing a run produces.
+        let events = session.subscribe();
+        let (requests, input) = match &options.in_dir {
+            Some(dir) => typing::spawn_spool(dir.clone(), current.clone()),
+            None => typing::spawn_stdin(current.clone()),
+        }
+        .map_err(|error| format!("{LABEL}: the typed input could not be read: {error}"))?;
+        Ok(Wiring {
+            session,
+            taker,
+            queues: typing::Queues {
+                to_lich: claim.typed,
+                to_game,
+                requests,
+            },
+            events,
+            _input: input,
+        })
+    }
+
+    /// Why the session stopped, if it said so (`Event::Over`): Ctrl-C above all.
+    fn over_reason(&mut self) -> Option<String> {
+        self.events.drain().into_iter().rev().find_map(|event| match event {
+            Event::Over(reason) => Some(reason),
+            _ => None,
+        })
     }
 }
 
@@ -264,6 +430,9 @@ pub fn run_with(tokens: &[String], settings: io::Result<LichSettings>) -> Result
 }
 
 /// The session itself: settings, login, Lich, game socket, relay, web page.
+///
+/// The whole thing is made once and lives as long as the run; only the game
+/// connection is made again when it drops.
 fn session_run(options: &Options, settings: io::Result<LichSettings>) -> Result<(), String> {
     let settings = settings.map_err(|error| format!("{LABEL}: {error}"))?;
     if !settings.on {
@@ -272,49 +441,64 @@ fn session_run(options: &Options, settings: io::Result<LichSettings>) -> Result<
     }
     let plan = lich::plan(&settings).map_err(|refusal| refusal.message())?;
 
-    let arguments = options.arguments();
+    // `--resume` may name the character; the target and the password are
+    // resolved once, and a reconnect reuses both (a password is never asked for
+    // twice, and never printed).
+    let arguments = resume_arguments(options);
     let target = login::resolve(&arguments).map_err(|message| format!("{LABEL}: {message}"))?;
     let password =
         login::password(&target.account).map_err(|message| format!("{LABEL}: {message}"))?;
+
+    let mut out = io::stdout();
+    life(&mut out, Lifecycle::Connecting);
+    life(&mut out, Lifecycle::LoggingIn);
     let login = login::sign_in(&target, &password).map_err(|message| format!("{LABEL}: {message}"))?;
     let launch = login.launch().clone();
 
-    let session = session::Headless::new(&arguments.character);
+    let session = session::Headless::new(&target.character);
     session.handle().set_lich_settings(settings.clone());
-    let mut keyed = lich::start(&plan)
-        .map_err(|error| format!("{LABEL}: Lich could not be started: {error}"))?;
-    let mut out = io::stdout();
+    let keyed = match lich::start(&plan) {
+        Ok(keyed) => keyed,
+        Err(error) => return Err(format!("{LABEL}: Lich could not be started: {error}")),
+    };
+    // Everything one Lich owns rides in `Resting`, so the child and its keyed
+    // socket survive a game reconnect; a failed attach drops `keyed`, and
+    // `Relay::drop` kills and reaps the child.
+    let mut resting = match lich::Resting::start(keyed) {
+        Ok(resting) => resting,
+        Err(error) => {
+            return Err(format!("{LABEL}: Lich's socket could not be read: {error}"));
+        }
+    };
     if let Err(error) = lich::announce(&plan, &mut out) {
-        let _ = keyed.relay.stop();
+        resting.stop(&mut out);
         return Err(format!("{LABEL}: {error}"));
     }
 
     let mut socket = match login::open_game(&launch) {
         Ok(socket) => socket,
         Err(message) => {
-            let _ = keyed.relay.stop();
+            resting.stop(&mut out);
             return Err(format!("{LABEL}: {message}"));
         }
     };
-
+    life(&mut out, Lifecycle::Connected);
     // The recovered connected notice (`play` says the same one).
     let _ = write!(out, "{}", typing::CONNECTED);
     let _ = out.flush();
 
     // The page, if `--web` asked for one.  It is bound *before* the relay so a
-    // port it cannot have is an error rather than a silent absence.
+    // port it cannot have is an error rather than a silent absence, and it lives
+    // as long as the run — not as long as one connection.
     let web = match options.web_port {
         Some(port) => match Web::start(
             &hydra_table::account::data_dir(),
             port,
-            &arguments.character,
+            &target.character,
         ) {
             Ok(web) => Some(web),
             Err(message) => {
-                // A port the page cannot have is a refusal, not a silent
-                // absence: Lich is stopped on the way out (`Relay::drop` would
-                // reap it too, but the recovered teardown stops first).
-                let _ = keyed.relay.stop();
+                resting.stop(&mut out);
                 return Err(format!("{LABEL}: {message}"));
             }
         },
@@ -322,41 +506,260 @@ fn session_run(options: &Options, settings: io::Result<LichSettings>) -> Result<
     };
 
     // Typing: the spool folder when `--in` named one (an addition), stdin
-    // otherwise.  Both fill the same two queues `relay_game` carries.
-    let claim = session.door().claim();
-    let (taker, to_game) = taker_pair();
-    session.handle().set_taker(taker);
-    let (requests, input_thread) = match &options.in_dir {
-        Some(dir) => typing::spawn_spool(dir.clone(), session.clone()),
-        None => typing::spawn_stdin(session.clone()),
-    }
-    .map_err(|error| format!("{LABEL}: the typed input could not be read: {error}"))?;
-    let _ctrl_c = typing::spawn_ctrl_c(session.clone()).ok();
-    let queues = typing::Queues {
-        to_lich: claim.typed,
-        to_game,
-        requests,
+    // otherwise.  Both fill the same two queues the relay loop carries, and both
+    // are made once: they follow the session (`typing::Current`) if `--again`
+    // replaces it.
+    let current = typing::Current::new(session.clone());
+    let mut wiring = match Wiring::new(session, options, &current) {
+        Ok(wiring) => wiring,
+        Err(message) => {
+            resting.stop(&mut out);
+            return Err(message);
+        }
+    };
+    // Ctrl-C sends `quit` and then cancels the session, which is what ends a
+    // resting run.  The watcher is never joined: it may be parked in a signal
+    // read when the run ends.
+    let _ctrl_c = typing::spawn_ctrl_c(current.clone()).ok();
+
+    // The resting status (`crate::rest`): one character plays while the game is
+    // connected, none while a retry is pending; this build has no map and no
+    // window.
+    let mut status = rest::Status::new(rest::doing(1, 0, 0));
+    let mut attempt: u32 = 0;
+
+    let outcome: Result<(), String> = loop {
+        match resting.play(
+            socket,
+            &mut out,
+            wiring.session.handle(),
+            &mut wiring.queues,
+            Some(&mut status),
+        ) {
+            // Lich exiting by itself ends the session, as it does for `play`:
+            // the `\nsession stopped: {reason}` line below says why, and nothing
+            // reconnects a game no Lich is left to read.
+            Ok(lich::Ended::Lich) => break Ok(()),
+            Ok(lich::Ended::Stopped) => break Ok(()),
+            Ok(lich::Ended::Game) => {
+                // A `quit` the player typed is why the game closed: this is the
+                // end they asked for, not a connection to reconnect.
+                if resting.quit_requested() {
+                    break Ok(());
+                }
+                // The recovered `\n\n[hydra] the connection dropped;
+                // reconnecting\n\n`, then the recovered lifecycle state and the
+                // recovered backoff wait.
+                let _ = write!(out, "{}", rest::DROPPED);
+                let _ = out.flush();
+                life(&mut out, Lifecycle::Reconnecting);
+                status.set(rest::doing(0, 0, 0));
+                match reconnect(
+                    options,
+                    &target,
+                    &password,
+                    &mut resting,
+                    &mut wiring,
+                    &current,
+                    &settings,
+                    &mut out,
+                    &mut attempt,
+                ) {
+                    Some(next) => {
+                        socket = next;
+                        status.set(rest::doing(1, 0, 0));
+                        continue;
+                    }
+                    None => break Ok(()),
+                }
+            }
+            Err(error) => break Err(format!("{LABEL}: {error}")),
+        }
     };
 
-    let outcome = lich::relay_game(keyed, &mut socket, &mut out, session.handle(), queues);
-
-    session.door().over();
-    session.handle().stop(typing::SESSION_ENDED);
+    // The recovered `finish`: stop Lich, close the Lich slot, transition to
+    // `Closed`, say `\nsession stopped: {reason}`, then the status tail `play`
+    // prints too.
+    let reason = match (wiring.over_reason(), resting.quit_requested()) {
+        (Some(reason), _) => reason,
+        (None, true) => QUIT.to_string(),
+        (None, false) => LICH_ENDED.to_string(),
+    };
+    resting.stop(&mut out);
+    wiring.session.over(&reason);
+    life(&mut out, Lifecycle::Closed);
+    let _ = writeln!(out, "{}", supervisor::stopped_line(&reason));
     let _ = writeln!(out, "[status] {}", typing::SESSION_ENDED);
     let _ = out.flush();
     // The spool thread ends on the stopped session; the web page is closed with
     // `web`, so nothing outlives the run.
-    let _ = input_thread;
     drop(web);
-    outcome.map_err(|error| format!("{LABEL}: {error}"))
+    outcome
+}
+
+/// Sleep out one recovered backoff, answering `false` if the session stopped.
+///
+/// The wait is taken in [`RETRY_SLICE`] slices so Ctrl-C (which cancels the
+/// session) is felt in a fraction of a second rather than after the whole
+/// recovered backoff (up to 36 s).  The wait itself comes from
+/// `hydra_session::supervisor::wait_before_retry`.
+fn sleep_while_waiting(session: &SessionHandle, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if session.stopping() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep((deadline - now).min(RETRY_SLICE));
+    }
+}
+
+/// Reconnect after the game dropped: the recovered backoff, the same login, and
+/// `--again`'s fresh session.
+///
+/// `None` means the run is over — the session was stopped (Ctrl-C), or Lich
+/// exited by itself while the game was away.  A failed login or dial is *not*
+/// the end: the next step of the recovered table is waited out and tried, so a
+/// game that is down for a minute is waited for, not given up on.
+#[allow(clippy::too_many_arguments)]
+fn reconnect(
+    options: &Options,
+    target: &login::Target,
+    password: &str,
+    resting: &mut lich::Resting,
+    wiring: &mut Wiring,
+    current: &typing::Current,
+    settings: &LichSettings,
+    out: &mut dyn Write,
+    attempt: &mut u32,
+) -> Option<TcpStream> {
+    loop {
+        if wiring.session.handle().stopping() {
+            return None;
+        }
+        // A Lich that exited by itself ends the session, exactly as it does
+        // inside the relay loop: waiting for a game it can no longer serve would
+        // leave a run that never ends.
+        match resting.alive(out) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                say(out, &format!("[hydra] Lich's output could not be read: {error}"));
+                return None;
+            }
+        }
+        let wait = supervisor::wait_before_retry(*attempt);
+        let _ = writeln!(
+            out,
+            "{}",
+            supervisor::reconnecting_line(wait, attempt.saturating_add(1))
+        );
+        let _ = out.flush();
+        *attempt = attempt.saturating_add(1);
+        if !sleep_while_waiting(wiring.session.handle(), wait) {
+            return None;
+        }
+        life(out, Lifecycle::LoggingIn);
+        let launch = match login::sign_in(target, password) {
+            Ok(login) => login.launch().clone(),
+            Err(message) => {
+                say(out, &format!("[hydra] the login did not go through: {message}"));
+                continue;
+            }
+        };
+        match login::open_game(&launch) {
+            Ok(socket) => {
+                // A connection that works resets the recovered table.
+                *attempt = 0;
+                if options.again {
+                    start_over(wiring, current, settings, target, out);
+                }
+                life(out, Lifecycle::Connected);
+                let _ = write!(out, "{}", typing::CONNECTED);
+                let _ = out.flush();
+                return Some(socket);
+            }
+            Err(message) => say(
+                out,
+                &format!("[hydra] the game socket could not be opened again: {message}"),
+            ),
+        }
+    }
+}
+
+/// `--again`: start over with a fresh session instead of reusing this one.
+///
+/// **INFERRED**: the recovered `--again` is "start over rather than continue",
+/// and this phase reads it as "a reconnected session is a new session" — the
+/// fresh `Headless` carries no typed log, no settings and no Lich door of its
+/// own, so `;status` and the `.lich` commands begin from nothing.  What is *not*
+/// restarted is the run: the Lich child, the input thread and the web page
+/// belong to the run, not to the session, and starting a second child would be a
+/// `.lich off`/`.lich on` the player never asked for.  Whether the reference
+/// build meant a session, a character or a captured recording by "start over" is
+/// **UNKNOWN** (`crates/hydra/NOTES.md` §9).
+fn start_over(
+    wiring: &mut Wiring,
+    current: &typing::Current,
+    settings: &LichSettings,
+    target: &login::Target,
+    out: &mut dyn Write,
+) {
+    let fresh = session::Headless::new(&target.character);
+    fresh.handle().set_lich_settings(settings.clone());
+    // The same taker, so what the player types still reaches the game socket.
+    fresh.handle().set_taker(wiring.taker.clone());
+    wiring.queues.to_lich = fresh.door().claim().typed;
+    wiring.events = fresh.subscribe();
+    current.replace(fresh.clone());
+    let old = std::mem::replace(&mut wiring.session, fresh);
+    // The replaced session is over; nothing reads it any more.
+    old.handle().stop("--again");
+    say(
+        out,
+        &format!(
+            "[hydra] serve: --again: started a new session for {}",
+            target.character
+        ),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydra_session::claimant::Desk;
 
     fn tokens(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    /// A temp folder, removed when the test ends.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "hydra-serve-unit-{tag}-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("cannot create the temp folder");
+            TempDir { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
@@ -388,12 +791,12 @@ mod tests {
         assert_eq!(options.web_port, Some(7788));
         assert_eq!(options.in_dir, Some(PathBuf::from("/synthetic/in")));
         assert_eq!(options.resumes, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(options.unwired().len(), 1, "{:?}", options.unwired());
-        assert!(options.unwired()[0].starts_with("--resume"));
-
-        // The recovered words are parsed, and the additions still say nothing.
+        // `--resume` and `--again` are wired now; `--open` is still reported
+        // rather than ignored.
+        assert!(options.unwired().is_empty(), "{:?}", options.unwired());
         let options = Options::parse(&tokens(&["--open", "--again", "Aelith"])).unwrap();
-        assert_eq!(options.unwired().len(), 2, "{:?}", options.unwired());
+        assert_eq!(options.unwired().len(), 1, "{:?}", options.unwired());
+        assert!(options.unwired()[0].starts_with("--open"));
     }
 
     #[test]
@@ -432,6 +835,52 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_file_names_the_character_when_the_command_line_names_none() {
+        let dir = TempDir::new("resume");
+        let file = dir.path.join("resume");
+        std::fs::write(&file, "  Aelith\n").unwrap();
+
+        // The recovered reader trims the file's content.
+        assert_eq!(
+            resume_character(&file.display().to_string()).unwrap(),
+            Some("Aelith".to_string())
+        );
+        // A file that is not there names nobody (and is not an error).
+        assert_eq!(
+            resume_character(&dir.path.join("missing").display().to_string()).unwrap(),
+            None
+        );
+        // A path with no file name is reported.
+        let message = resume_character("/").unwrap_err();
+        assert!(message.contains("not a resume file path"), "{message}");
+
+        // The character comes from the resume, and only when none was named.
+        let options = Options::parse(&tokens(&[
+            "--resume",
+            &file.display().to_string(),
+            "--account",
+            "main",
+        ]))
+        .unwrap();
+        let arguments = resume_arguments(&options);
+        assert_eq!(arguments.character, "Aelith");
+        assert_eq!(arguments.account, Some("main".to_string()));
+
+        // A named target wins over the resume file.
+        let options = Options::parse(&tokens(&["Bryn", "--resume", &file.display().to_string()]))
+            .unwrap();
+        assert_eq!(resume_arguments(&options).character, "Bryn");
+
+        // A resume that cannot be read keeps the target and says so.
+        let options = Options::parse(&tokens(&[
+            "--resume",
+            &dir.path.join("missing").display().to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(resume_arguments(&options).character, "");
+    }
+
+    #[test]
     fn lich_off_and_the_lich_refusals_are_said_before_any_login() {
         // Off: the same first branch (and sentence) as `play`, with no network.
         let message = run_with(&tokens(&["Aelith"]), Ok(LichSettings::default())).unwrap_err();
@@ -460,5 +909,24 @@ mod tests {
         let error = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         let message = run_with(&tokens(&["--wibble"]), Err(error)).unwrap_err();
         assert!(message.starts_with("hydra serve: --wibble is not an option"), "{message}");
+    }
+
+    #[test]
+    fn a_backoff_sleep_ends_at_once_when_the_session_stops() {
+        let session = SessionHandle::new(Desk::new(None, "Aelith"));
+        // Not stopped: the wait really takes its time.
+        let started = Instant::now();
+        assert!(sleep_while_waiting(&session, Duration::from_millis(120)));
+        assert!(started.elapsed() >= Duration::from_millis(110));
+
+        // Stopped: it answers at once rather than sleeping the backoff out.
+        session.stop("Ctrl-C");
+        let started = Instant::now();
+        assert!(!sleep_while_waiting(&session, Duration::from_secs(30)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

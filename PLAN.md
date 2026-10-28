@@ -107,9 +107,9 @@ been run against a real account, real Lich install or live game.
     `hydra_session::lookout_seed` summaries. Tests:
     `crates/hydra/tests/import_lookout.rs`.
 
-## Phase 9: the remaining session work (in progress)
+## Phase 9: the remaining session work (done)
 
-Two items, both loopback only and both `cargo --offline`; nothing here has been
+Three items, all loopback only and all `cargo --offline`; nothing here has been
 run against a real account, a real game server or a real display.
   * **item 1 (done, 2026-10-28)** — `.lich off`/`.lich on` typed mid-session.
     `play`/`serve` keep the session and its game socket while the Lich child
@@ -127,3 +127,38 @@ run against a real account, a real game server or a real display.
     display does (window creation, the winit loop, GPU painting, native
     keyboard/IME/focus, resizing) is untested and marked so in
     `crates/hydra_gui/NOTES.md` and `crates/hydra/NOTES.md` §5.4.
+  * **item 3 (done, 2026-10-28)** — `hydra serve` **rests**. A detached serve no
+    longer exits when the game socket reaches EOF: it prints the recovered
+    `\n\n[hydra] the connection dropped; reconnecting\n\n` notice, waits
+    `hydra_session::supervisor::wait_before_retry(attempt)` (the recovered
+    `[1, 2, 5, 10, 30]`-second table with 80–120 % jitter, so the first wait is
+    about a second), logs in again for the same resolved target and password
+    (never prompting), and dials again. Everything that belongs to the *run* is
+    made once and survives: the `Headless`/`SessionHandle` (same character,
+    settings, typed log, Lich door), the typed input thread
+    (`typing::Current`), the `--in` spool, the `--web` page and the Lich child.
+    The relay was split so a connection is one value: `lich::Resting` keeps the
+    `LichRun` for the whole run and each game connection is one `GameLink`, so
+    a drop closes only the connection. Only a deliberate end stops it — a typed
+    `quit`/`exit` (`hydra_session::actor::is_exit_intent`), Ctrl-C, or Lich
+    exiting — and it then says `\nsession stopped: {reason}` (the recovered
+    `SupervisedSession::finish` line), `[status] the session has ended`, and
+    exits 0. `--resume <path>` is read with
+    `hydra_table::table::Resume::read` and names the character when the command
+    line names none; `--again` starts a **fresh `Headless`** per reconnect
+    (INFERRED meaning of "start over rather than continue"), and the recovered
+    `startup::Serve::args` now gives a detached child `--again` too. A new
+    `src/rest.rs` holds the recovered `rest::doing` composition and a
+    `rest::Watch` that repeats `[hydra] memory: {doing}, …` every 5 s when it
+    changes and every 60 s otherwise, driven from the relay loop's own passes.
+    **Not reconstructed:** the memory figure (needs a `memory_stats`
+    dependency; the line says `RAM unknown`), the resting *window*
+    (`hydra::gui::run`), `--open`, mDNS. **INFERRED:** that the reference build
+    keeps one Lich across a game reconnect (the recovered supervisor reconnects
+    the connector, not the session), the `--again` and `--resume` readings, and
+    which moment gets which lifecycle state. Mock-tested only: a new
+    `MockGame::start_series` answers several connections in a row, so
+    `tests/serve.rs` proves a second handshake, one Lich boot, a typed line
+    reaching the *second* connection, and a spooled quit (or Ctrl-C) ending the
+    run — non-detached and detached, loopback only, nothing against a real
+    account or game.

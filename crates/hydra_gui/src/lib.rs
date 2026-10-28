@@ -22,6 +22,7 @@ pub mod chat;
 pub mod json;
 pub mod keys;
 pub mod layout;
+pub mod live;
 pub mod play;
 pub mod reports;
 pub mod seam;

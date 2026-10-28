@@ -106,3 +106,24 @@ been run against a real account, real Lich install or live game.
     (`hydra.lock`), reads the player logs and prints
     `hydra_session::lookout_seed` summaries. Tests:
     `crates/hydra/tests/import_lookout.rs`.
+
+## Phase 9: the remaining session work (in progress)
+
+Two items, both loopback only and both `cargo --offline`; nothing here has been
+run against a real account, a real game server or a real display.
+  * **item 1 (done, 2026-10-28)** — `.lich off`/`.lich on` typed mid-session.
+    `play`/`serve` keep the session and its game socket while the Lich child
+    behind it is swapped: `relay_game` holds a `LichRun` (child, stdin, accepted
+    socket, reader thread, printed-stdout cursor) and `switches` turns a pass of
+    typed `.lich` requests into stops and starts in the order typed. See
+    `crates/hydra/NOTES.md` §8.2-8.3.
+  * **item 2 (done, 2026-10-28)** — `hydra gui <character> [--account A] [--game
+    G]` is a game client: login → game socket → `hydra_protocol::Parser` →
+    `hydra_gui::live::LiveSession` (built on the real `hydra_ui::story::Story`,
+    `hydra_ui::view::PlayView`, `crate::bar::stack::Stack` and `hydra_model`'s
+    `Hand`) → one headless-testable `egui` frame. `hydra gui` with no character
+    still opens the hub window. Lich stays out of this path (it remains
+    `play`/`serve`). Mock-tested end to end through `hydra_mocks`; what a real
+    display does (window creation, the winit loop, GPU painting, native
+    keyboard/IME/focus, resizing) is untested and marked so in
+    `crates/hydra_gui/NOTES.md` and `crates/hydra/NOTES.md` §5.4.

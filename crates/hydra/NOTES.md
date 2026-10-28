@@ -31,11 +31,13 @@ depends on `hydra_protocol`, `hydra_session`, `hydra_lich`, `hydra_net`,
 path dependencies on `hydra_protocol`, `hydra_session` and `hydra_lich` plus the
 workspace-pinned `tokio`, and — since Phase 4 — on `hydra_gui` and `eframe`
 (see §5.1), and — since Phase 6 — on `hydra_net` and `hydra_table` (§8.1).
-`hydra gui …` now *builds and opens* the hub window, `hydra play`/`hydra serve`
-start this character's Lich when `.lich on` is set (§6.4), and `hydra login` /
-`hydra play` log in for real — the `hydra_net` eaccess handshake, then the game
-socket (§8.1-8.2). What is still *recognised and reported* rather than faked is
-the resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
+`hydra gui …` now *builds and opens* the hub window — and, since Phase 9, a
+**live** window for `hydra gui <character>`: login, game socket, parser and the
+`hydra_ui`/`hydra_gui` models (§5.4), `hydra play`/`hydra serve` start this
+character's Lich when `.lich on` is set (§6.4), and `hydra login` / `hydra play`
+log in for real — the `hydra_net` eaccess handshake, then the game socket
+(§8.1-8.2). What is still *recognised and reported* rather than faked is the
+resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
 [Wired vs not](#wired-vs-not).
 
 ---
@@ -45,7 +47,7 @@ the resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
 | original file (`__cstring`) | symbols | here |
 |---|---|---|
 | `src/main.rs` (`0x103e21ab6`) | `hydra::main`, `hydra::started::*`, `hydra::startup::*`, `hydra::replay::*`, `hydra::render::*`, `hydra::status::*`, `hydra::lookout_seed` | `src/main.rs`, `src/started.rs`, `src/startup.rs`, `src/replay.rs`, `src/render.rs`, `src/cli.rs` |
-| `src/gui.rs` (`0x103e21a91`) | `hydra::gui::{run, start_next, seat, game_runtime, stop_on_ctrl_c}` | — (the GUI boundary, §5) |
+| `src/gui.rs` (`0x103e21a91`) | `hydra::gui::{run, start_next, seat, game_runtime, stop_on_ctrl_c}` | `src/gui.rs` (Phase 9: the live window's login → game → parser → model chain, the reader/writer threads and the eframe launch; §5.4) |
 | `src/play.rs` (`0x103e21ad3`, `0x103e22b95`) | `hydra::play::{run, supervised}` | `src/session.rs` (the session half) + `src/typing.rs` (the stdin half, §8.3) + §6 |
 | `src/connect.rs` (`0x103e21b8d`) | `hydra::connect::{Target::*, game_and_name, run, send}` | `src/login.rs` (the command line, the roster, `hydra_net`'s login and the game socket; §8.1) |
 | `src/rest.rs` (`0x103e22bae`) | `hydra::rest::{doing, watch}` | — (needs `hydra_table`, the web UI) |
@@ -223,8 +225,12 @@ From `main`, `gui::run` is reached two ways: no arguments at all
   built plan (`"Hydra"`, 660 × 520, `Renderer::Wgpu`, 256 × 256 RGBA icon)
   **without** launching: `gui_launch` is split out of `gui` for exactly that.
   `serve` remains Lich-only and `play`/`login` are wired through the Phase 6
-  login, but none of them is the window's session plumbing yet (that needs the
-  connection and the board's `Sessions`, not the window).
+  login.
+* **Phase 9** added the window's session plumbing, in **§5.4**: `hydra gui
+  <character>` logs in, opens the game socket and paints the live model.  What
+  the binary's `gui::run` still does not do is the *rest* of its call table —
+  `instance::claim` (the single-instance lock), `started::stage` (the launch
+  timeline), the seven `Handle::spawn`s and `hydra_board::sessions::Sessions`.
 
 ### 5.3 `hydra::instance::claim` (`0x1001142d4`) — the single-instance protocol
 
@@ -242,6 +248,44 @@ Not needed headless, recorded because `lookout seed` depends on it:
 `hydra::lookout_seed` (`0x10021d088`) calls `hydra_table::account::data_dir` and
 then `instance::claim` purely to detect "Hydra is running on this data folder:
 shut it down, then seed the lookout." (`0x10206f84c`).
+
+### 5.4 `hydra gui <character>` (Phase 9): the window as a game client
+
+`hydra gui` is one word with two windows:
+
+* **no character** → the hub window, exactly as Phase 4 left it
+  (`gui_launch` → `hydra_gui::app::build` → `Hub::new`, the empty room model);
+* **a character** → `crate::gui::run`, which is
+  `login -> game socket -> hydra_protocol::Parser -> hydra_gui::live::LiveSession
+  -> hydra_ui + hydra_gui -> eframe`.
+
+`src/gui.rs` (the recovered file name, `0x103e21a91`) is new in Phase 9 and is
+split at the point the tests need:
+
+| item | what it does |
+|---|---|
+| `gui_connect_from(target, password)` | `login::sign_in` + `login::open_game`, i.e. everything up to the open game socket (same stage lines, same refusals as `login`/`play`), and returns `Live { live, socket }`.  No window, no thread. |
+| `Live::start` | two threads: a **reader** (`read_until(b'\n')` → `LiveSession::feed_bytes` → parser → model, then `closed()` at EOF) and a **writer** (`mpsc::Receiver<String>` → the socket, one `\n`-terminated line, flushed).  No lock is held while a socket operation blocks: the reader reads first and locks only to fold the finished line in. |
+| `launch(start, live, input)` | `hydra_gui::app::build_live`: the recovered `"Hydra"` window around a `Hub::with_live`. |
+| `run` / `run_with(label, tokens)` | `login::parse/resolve/password`, then the above, then `Launch::run` (eframe), then `shutdown(Both)` on the game socket.  A failure is `hydra gui: …` on stderr with status 1, and it happens **before** the window: a refusal never shows an empty one. |
+
+**Lich is deliberately not in this chain.**  `play` and `serve` keep the keyed
+accept (`docs/LICH_WIRE.md`, §6.4, §8.2-8.3); the window talks to the game
+socket itself, exactly as `login` does.  Hydra playing Lich's role is what makes
+`play`/`serve` need a relay at all, and a second relay between the window and the
+game would draw Lich's relabelled stream rather than the game's.
+
+What the window draws — the model, the tag mapping and the **inferred** play-area
+layout — is documented where it lives: `crates/hydra_gui/NOTES.md`, *Phase 9: the
+live play area*.
+
+**Not done, and marked `UNKNOWN`/`INFERRED` at the point of use:** the
+single-instance lock (`instance::claim`), the launch timeline
+(`started::stage`), placement persistence (`Placements`), the `hydra_board`
+panels/drawers/sessions, and every runtime fact of eframe/wgpu/winit (window
+creation, the event loop, GPU painting, native keyboard/IME/focus, resizing).
+The only testable half is `gui_connect_from` + the two threads, which the unit
+tests in `src/gui.rs` run against `MockEaccess` + `MockGame` on loopback.
 
 ## 6. What is wired: protocol, session, Lich
 
@@ -451,7 +495,8 @@ Facts, for a later pass:
 |---|---|---|
 | `hydra --replay FILE` / `hydra replay FILE` | **runs** | the phase gate; parser + report + footer |
 | `hydra --help`, `--version` | **runs** | additions (§4) |
-| `hydra gui …` | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe; §5.1 |
+| `hydra gui` (no character) | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe, drawing the empty room model; §5.1 |
+| `hydra gui <char> [--account A] [--game G]` | **runs** | logs in, opens the game socket, and paints the game in the same window: the parser feeds `hydra_gui::live::LiveSession`, which the real `hydra_ui` models render; typing goes back over the socket.  Lich is not started here (it stays `play`/`serve`); §5.4 |
 | `hydra` (bare hub) | recognised, exit 1 | the same `gui::run` in the binary; deliberately left reporting here (§5.1) |
 | `hydra login <char> [--account A] [--game G]` | **runs** | the real eaccess login (`hydra_net::eaccess::handshake`), then the game socket: the raw XML goes to stdout; §8.1 |
 | `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends, and reads what the player types on stdin; §8.1, §8.3 |
@@ -800,10 +845,22 @@ recovered summary templates are printed.
     is the bare `.lich` and `.lich status` is answered with the usage line —
     locally, never forwarded. Whether the reference build accepts a `status`
     word is UNKNOWN; it is not in the recovered table.
+12. **Phase 9, the live window (§5.4).** What is *established* is the chain
+    (login → game socket → `hydra_protocol::Parser` → `hydra_ui`/`hydra_model`
+    models → `hydra_gui`) and every model it draws.  What is **INFERRED** is the
+    play area's four-band layout inside the recovered chrome, the `> ` echo
+    prefix, the `[hydra] …` shape of the local notices, the 50 ms repaint
+    interval and the accepted tag spellings — all marked at the point of use in
+    `crates/hydra_gui/src/{app,live}.rs` and its `NOTES.md`.  Nothing about a
+    **real display** can be tested here: window creation, the winit event loop,
+    GPU painting, native keyboard/IME/focus and resizing are runtime facts, not
+    headless ones.  `gui::run`'s call table beyond the window — the
+    single-instance claim, `started::stage`, placement persistence and the
+    `hydra_board` panels — is still not reconstructed.
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **147 passing** (113 unit + 34 integration:
+`cargo test -p hydra --offline` → **153 passing** (119 unit + 34 integration:
 13 in `tests/cli.rs`, 4 in `tests/import_lookout.rs`, 3 in `tests/login.rs`,
 6 in `tests/lich_relay.rs`, 6 in `tests/play_stdin.rs`, 2 in `tests/serve.rs`).
 
@@ -837,8 +894,21 @@ Unit tests (in the modules):
   still-unwired command's text, `play`/`serve` with Lich off and with each
   refusal (`Where Lich is has not been said…`, `… has no lich.rbw in it`), the
   settings-path seam, the built hub window (`"Hydra"`, 660 × 520,
-  `Renderer::Wgpu`, 256 × 256 RGBA badge icon — built, not launched), and that
-  `enable_all()` really turned the time driver on;
+  `Renderer::Wgpu`, 256 × 256 RGBA badge icon — built, not launched), that
+  `enable_all()` really turned the time driver on, and (Phase 9) that
+  `hydra_gui::live::GAME_CLOSED` is `typing::GAME_CLOSED` without its newlines;
+* `gui` (Phase 9) — the live window's testable half, against `MockEaccess` +
+  `MockGame` on loopback with an explicit `login::Target` and password (no
+  process environment is read or written): the whole chain
+  `gui_connect_from` → the game's stream → `pump` → the model (room, description
+  and exits, `nav` number, vitals, hand, compass, prompt, the story line, then
+  `closed()` with the recovered sentence), the two handshake lines the mock
+  really received and the pinned certificate; a typed line handed to
+  `Running::input` arriving at the game as exactly `look`, and shutting the
+  socket down flipping the model to disconnected; the recovered window plan for
+  `launch`; the data folder being the pin's; and the labelled `hydra gui: …`
+  message a bad command line produces before any socket is touched.  Nothing in
+  these tests opens a window — `run`/`Launch::run` are not called anywhere;
 * `lich` (Phase 3) — the two environment seams (`HYDRA_DATA_DIR`,
   `HYDRA_LICH_SETTINGS`), a missing `lich.json` as the defaults, all three
   refusals with their exact sentences, a good plan's folder/script/ruby, the two
@@ -971,6 +1041,17 @@ cargo check --workspace --offline       # clean
 cargo test  --workspace --offline       # green
 ```
 
+And on `p9/2` (Phase 9, the live window), same rules — `--offline`, loopback
+only, no window anywhere:
+
+```sh
+cargo test  -p hydra_gui --offline      # 133 passing
+cargo test  -p hydra_ui --offline       # 244 passing
+cargo test  -p hydra --offline          # 119 + 13 + 4 + 3 + 6 + 6 + 2 passing
+cargo test  --workspace --offline       # green
+cargo check --workspace --offline       # clean
+```
+
 `cargo clippy -p hydra --all-targets` **cannot run on this branch**: it stops on
 `crates/hydra_net/src/sink/config.rs:54` (`clippy::erasing_op` is deny-by-default
 there, `local.rem_euclid(1) * 0`), which is untouched by this phase. Before it
@@ -1005,3 +1086,10 @@ did, it reported nothing for `hydra` itself.
 7. **`hydra_lich::relay::read_lines` is used from a binary test** (through
    `Lich::listen`), which spins the crate's shared runtime. That is already how
    `hydra_lich`'s own tests work; it adds no new requirement to that crate.
+8. **Phase 9 adds one module (`src/gui.rs`) and no new dependency.** It uses the
+   `hydra_gui`, `hydra_net` and `hydra_table` path dependencies the crate already
+   had, plus the `hydra_mocks` dev-dependency; `hydra_gui` itself gained
+   `hydra_ui`/`hydra_protocol`/`hydra_model` (path) and `hydra_mocks` as a
+   dev-dependency. No sibling crate's API changed: `Hub::new`, `app::plan`,
+   `app::build`, `app::run` and `gui_launch` keep their signatures, and the live
+   window is `Hub::with_live`/`app::build_live`.

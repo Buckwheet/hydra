@@ -33,8 +33,11 @@
 use crate::badge;
 use crate::keys::Keys;
 use crate::layout::drawers::{Drawers, Mode, Zone};
+use crate::live::LiveSession;
 use crate::play::titlebar::{Item, TitleBar};
 use crate::seam::{pos, rect_from_min_max, Rect, Vec2};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The window title: `"Hydra"`, from the 5-byte `String` built at
 /// `0x100513014` (`0x79 0x48` = `"Hy"`, `0x7264` = `"dr"`, `0x61` = `"a"`) and
@@ -206,8 +209,19 @@ pub struct Hub {
     pub drawers: Drawers,
     /// The key bindings (`keys::Keys::take` consumes this frame's events).
     pub keys: Keys,
-    /// The room text the play area shows.
+    /// The room text the play area shows when there is no live session.
     pub room: Room,
+    /// The live session (`hydra gui <character>`): `None` for the hub window,
+    /// which is `hydra gui` with no character and draws the empty room model.
+    ///
+    /// The model is behind a lock because a **reader thread** owns the game
+    /// socket and folds lines into it while the window paints.  Nothing here
+    /// ever holds that lock across a socket operation: see [`Hub::live_ui`].
+    pub live: Option<Arc<Mutex<LiveSession>>>,
+    /// Where a typed line goes: the writer thread's channel
+    /// (`hydra::gui`'s writer, which owns the game socket).  `None` for the hub
+    /// window.
+    pub input: Option<Sender<String>>,
 }
 
 impl Hub {
@@ -221,6 +235,30 @@ impl Hub {
     // UNKNOWN: likewise unrecovered; 8.0 is used.
     pub const PAD: f32 = 8.0;
 
+    /// The height of the live status strip (the character and the connection
+    /// indicator) at the top of the play area.
+    // UNKNOWN: a drawing decision; 18.0 is one body-text row.
+    pub const STATUS_HEIGHT: f32 = 18.0;
+
+    /// The height of the live input row at the bottom of the play area.
+    // UNKNOWN: a drawing decision; 24.0 fits one `TextEdit` and one button.
+    pub const INPUT_HEIGHT: f32 = 24.0;
+
+    /// The share of the play area's width the story gets when a session is
+    /// live; the room/vitals/hands/compass column gets the rest.
+    // UNKNOWN: the binary's hub splits are in `layout::drawers` (the four
+    // drawers); this two-column split is inferred for the live play area.
+    pub const STORY_FRACTION: f32 = 0.6;
+
+    /// The height of the vitals rings below their words.
+    // UNKNOWN: a drawing decision; the stack's geometry is in
+    // `bar::stack::Stack::square` and only needs a non-empty box.
+    pub const VITALS_HEIGHT: f32 = 64.0;
+
+    /// The id the live input line is given, so a test (or a future "focus the
+    /// input" shortcut) can name it without a click.
+    pub const INPUT_ID: &'static str = "hydra-live-input";
+
     pub fn new(start: Start, logged_on: bool) -> Hub {
         Hub {
             start,
@@ -231,7 +269,29 @@ impl Hub {
             drawers: Drawers::default(),
             keys: Keys::with_defaults(),
             room: Room::default(),
+            live: None,
+            input: None,
         }
+    }
+
+    /// A hub around a **live** session: the window `hydra gui <character>`
+    /// opens.
+    ///
+    /// `live` is shared with the reader thread that folds the game's lines into
+    /// it, and `input` is the channel to the writer thread that owns the game
+    /// socket.  Everything else is [`Hub::new`]'s state, so the chrome is the
+    /// same window either way — only the play area's contents differ
+    /// ([`Hub::live_ui`] instead of [`Hub::room_ui`]).
+    pub fn with_live(
+        start: Start,
+        logged_on: bool,
+        live: Arc<Mutex<LiveSession>>,
+        input: Sender<String>,
+    ) -> Hub {
+        let mut hub = Hub::new(start, logged_on);
+        hub.live = Some(live);
+        hub.input = Some(input);
+        hub
     }
 
     /// The rects the hub lays out inside `window`.
@@ -283,7 +343,16 @@ impl Hub {
         if chrome.play.width() > 0.0 && chrome.play.height() > 0.0 {
             ui.painter()
                 .rect_filled(chrome.play, egui::CornerRadius::ZERO, visuals.extreme_bg_color);
-            self.room_ui(ui, chrome.play, &visuals);
+            if self.live.is_some() {
+                self.live_ui(ui, chrome.play);
+                // A background reader thread is what makes new game lines
+                // arrive, and nothing in the window changes when it does: ask
+                // for a repaint so the story keeps up.  This is a repaint hint,
+                // never a poll of the socket (that is the reader thread's job).
+                ui.ctx().request_repaint_after(crate::live::REPAINT);
+            } else {
+                self.room_ui(ui, chrome.play, &visuals);
+            }
         }
 
         // 3. The title-bar strip: real widgets, one per recovered `Item`.
@@ -367,6 +436,207 @@ impl Hub {
             );
         }
     }
+
+    /// The live play area: story, room/vitals/hands/compass, status and input.
+    ///
+    /// **INFERRED layout.** The recovered chrome (`Chrome`) is untouched — the
+    /// title bar and the four drawers are the recovered ones — and this only
+    /// decides what goes inside the play rectangle, which the binary's hub draws
+    /// with the `hydra_board` panels that are not reconstructed.  Four bands:
+    ///
+    /// ```text
+    /// +----------------------------------------------+
+    /// | Aelith — connected                           |  STATUS_HEIGHT
+    /// +-------------------------------+--------------+
+    /// | story: the scrollback, the    | room title   |  the rest
+    /// | prompt as its last line       | description  |
+    /// |                               | exits        |
+    /// |                               | Compass: …   |
+    /// |                               | Left/Right   |
+    /// |                               | Sp … HP …    |
+    /// |                               | (rings)      |
+    /// +-------------------------------+--------------+
+    /// | [ type a command……………… ] [Send]             |  INPUT_HEIGHT
+    /// +----------------------------------------------+
+    /// ```
+    ///
+    /// The story gets [`Hub::STORY_FRACTION`] of the width and the side column
+    /// the rest.  The prompt is painted once, as the story's last line (that is
+    /// where the recovered `Story::paint_into` puts it), so the room pane is
+    /// drawn from a copy of the view with its prompt cleared.
+    ///
+    /// **The model lock is never held across a socket operation.** The typed
+    /// line is taken out of the model, validated, and only then handed to the
+    /// writer thread's channel — after the lock has been dropped.  The lock is
+    /// also never held twice: `std::sync::Mutex` is not reentrant, so each band
+    /// takes its own short lock.
+    fn live_ui(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let Some(model) = self.live.clone() else {
+            // No session: the empty room model is what the hub draws, and
+            // `ui_contents` never calls this then.
+            return;
+        };
+        let sender = self.input.clone();
+        let visuals = ui.visuals().clone();
+        let body = egui::TextStyle::Body.resolve(ui.style());
+
+        // The three bands.  A play area too short for them still gets the story.
+        let status_height = Hub::STATUS_HEIGHT.min(area.height() * 0.5);
+        let input_height = Hub::INPUT_HEIGHT.min((area.height() - status_height) * 0.5);
+        let status_rect = rect_from_min_max(
+            area.min.to_vec2(),
+            Vec2::new(area.max.x, area.min.y + status_height),
+        );
+        let input_rect = rect_from_min_max(
+            Vec2::new(area.min.x, area.max.y - input_height),
+            area.max.to_vec2(),
+        );
+        let body_rect = rect_from_min_max(
+            Vec2::new(area.min.x, status_rect.max.y),
+            Vec2::new(area.max.x, input_rect.min.y),
+        );
+        if body_rect.width() <= 0.0 || body_rect.height() <= 0.0 {
+            return;
+        }
+
+        // 1. The status strip: who this window is for, and whether the game is
+        //    still connected.
+        {
+            let live = locked(&model);
+            let colour = if live.connected {
+                visuals.strong_text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            ui.painter().with_clip_rect(status_rect).text(
+                pos(Vec2::new(status_rect.min.x + Hub::PAD, status_rect.center().y)),
+                egui::Align2::LEFT_CENTER,
+                format!("{} \u{2014} {}", live.character, live.status()),
+                body.clone(),
+                colour,
+            );
+        }
+
+        // 2. The input row: a real single-line `TextEdit` and a Send button.
+        //    Enter is the recovered `TextEdit` pattern — a single-line edit
+        //    loses focus when Enter is pressed.
+        let mut buffer = {
+            let mut live = locked(&model);
+            std::mem::take(&mut live.input)
+        };
+        let connected = locked(&model).connected;
+        let mut submitted = false;
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(input_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                let edit = ui.add_enabled(
+                    connected,
+                    egui::TextEdit::singleline(&mut buffer)
+                        .id(egui::Id::new(Hub::INPUT_ID))
+                        .hint_text("type a command"),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submitted = true;
+                    // A single-line edit gives focus up on Enter; the player
+                    // needs it back to type the next command, so ask for it
+                    // again in the same frame (the request is honoured at the
+                    // start of the next one).
+                    edit.request_focus();
+                }
+                if ui
+                    .add_enabled(connected, egui::Button::new("Send"))
+                    .clicked()
+                {
+                    submitted = true;
+                }
+            },
+        );
+        locked(&model).input = buffer;
+        if submitted {
+            let line = locked(&model).submit();
+            if let Some(line) = line {
+                if let Some(sender) = &sender {
+                    // The lock is gone by now: the writer thread owns the socket.
+                    let _ = sender.send(line);
+                }
+            }
+        }
+
+        // 3. The story: the scrollback with the prompt as its last line.
+        let split = body_rect.width() * Hub::STORY_FRACTION;
+        let story_rect = rect_from_min_max(
+            body_rect.min.to_vec2(),
+            Vec2::new(body_rect.min.x + split, body_rect.max.y),
+        );
+        let side_rect = rect_from_min_max(
+            Vec2::new(story_rect.max.x, body_rect.min.y),
+            body_rect.max.to_vec2(),
+        );
+        if story_rect.width() > 0.0 {
+            let live = locked(&model);
+            let painter = ui.painter().with_clip_rect(story_rect);
+            let ink = hydra_ui::story::Ink::of(&live.theme, ui).prompt(&live.view.prompt);
+            live.story.paint_into(&painter, story_rect, &ink);
+        }
+
+        // 4. The side column: the room, the compass, the hands and the vitals,
+        //    drawn with the real `hydra_ui`/`bar` widgets.
+        if side_rect.width() > 0.0 {
+            let live = locked(&model);
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(side_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    ui.set_clip_rect(side_rect);
+                    // The prompt is the story's last line; the pane skips it so
+                    // it is not said twice.
+                    let mut view = live.view.clone();
+                    view.prompt.clear();
+                    view.ui_with(ui, &live.theme);
+                    if !live.room_number.is_empty() {
+                        ui.label(format!("({})", live.room_number));
+                    }
+                    if !live.compass.is_empty() {
+                        ui.separator();
+                        ui.label(format!("Compass: {}", live.compass.join(", ")));
+                    }
+                    if live.hands.left().is_some() || live.hands.right().is_some() {
+                        ui.separator();
+                        if let Some(item) = live.hands.left() {
+                            ui.label(format!("Left hand: {item}"));
+                        }
+                        if let Some(item) = live.hands.right() {
+                            ui.label(format!("Right hand: {item}"));
+                        }
+                    }
+                    ui.separator();
+                    ui.label(live.vitals.words());
+                    let (rings, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), Hub::VITALS_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    live.vitals.paint(
+                        &ui.painter().with_clip_rect(rings),
+                        rings,
+                        ui.visuals().strong_text_color(),
+                    );
+                },
+            );
+        }
+    }
+}
+
+/// Lock a live session, surviving a poisoned lock.
+///
+/// A panicking reader thread must not turn every later frame into a second
+/// panic: the model is still the best one available.
+fn locked(model: &Arc<Mutex<LiveSession>>) -> MutexGuard<'_, LiveSession> {
+    model
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl eframe::App for Hub {
@@ -512,6 +782,24 @@ pub fn build(start: &Start, logged_on: bool) -> Launch {
 /// crate's test suite calls it.
 pub fn run(start: &Start, logged_on: bool) -> eframe::Result {
     build(start, logged_on).run()
+}
+
+/// [`build`], but the boxed app is a [`Hub`] around a **live** session.
+///
+/// Same recovered window (title, placement, size, icon, wgpu renderer); only
+/// the play area's contents differ.  `live` is shared with the reader thread and
+/// `input` is the writer thread's channel — see [`Hub::with_live`] and
+/// `hydra::gui`, which owns both threads.  This is still a pure value: no
+/// device, no event loop, no socket.
+pub fn build_live(
+    start: &Start,
+    logged_on: bool,
+    live: Arc<Mutex<LiveSession>>,
+    input: Sender<String>,
+) -> Launch {
+    let mut launch = build(start, logged_on);
+    launch.app = Box::new(Hub::with_live(start.clone(), logged_on, live, input));
+    launch
 }
 
 #[cfg(test)]
@@ -749,5 +1037,258 @@ mod tests {
         assert!(hub.drawers.right.open);
         assert!(hub.press(&Item::BottomDrawer));
         assert!(hub.drawers.bottom.open);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 9: the live play area.
+    // ----------------------------------------------------------------------
+
+    /// The synthetic XML stream the live tests play.
+    ///
+    /// Every value is invented for the test; no captured game text, name or key
+    /// appears here.  It carries each tag the live model reads — the
+    /// `component`/`nav` attributes, the `preset` room form, a plain story line,
+    /// the four `progressBar`s, both hands, a `compass` and a `prompt` — so one
+    /// frame proves the whole tag mapping reaches the window.
+    const LIVE_STREAM: &str = concat!(
+        "<settings/>\r\n",
+        "<component id=\"roomName\" value=\"A Synthetic Crossing\"/>\r\n",
+        "<component id=\"roomDesc\" value=\"A wide synthetic road.&#10;Obvious exits: north, southeast.\"/>\r\n",
+        "<nav rm=\"4242\"/>\r\n",
+        "<preset id=\"roomName\">A Synthetic Crossing</preset>\r\n",
+        "<preset id=\"roomDesc\">A wide synthetic road.</preset>\r\n",
+        "<preset id=\"roomDesc\">Obvious exits: north, southeast.</preset>\r\n",
+        "A synthetic breeze crosses the road.\r\n",
+        "<progressBar id=\"health\" value=\"80\"/>\r\n",
+        "<progressBar id=\"mana\" value=\"90\"/>\r\n",
+        "<progressBar id=\"spirit\" value=\"70\"/>\r\n",
+        "<progressBar id=\"stamina\" value=\"60\"/>\r\n",
+        "<left>a synthetic shield</left>\r\n",
+        "<right>a synthetic sword</right>\r\n",
+        "<compass><dir value=\"n\"/><dir value=\"se\"/></compass>\r\n",
+        "<prompt>synthetic&gt;</prompt>\r\n",
+    );
+
+    /// Play [`LIVE_STREAM`] into a fresh [`LiveSession`] over a **real**
+    /// loopback socket: `MockGame` on `127.0.0.1:0` → `TcpStream` → the
+    /// two-line handshake → the parser → the model.
+    ///
+    /// No window, no login and no real host: the mock's stream is written
+    /// verbatim and the mock closes, so the read ends at EOF.
+    fn played_session() -> LiveSession {
+        use std::io::{BufRead, BufReader, Write};
+
+        let game = hydra_mocks::MockGame::start(LIVE_STREAM).expect("the mock game server starts");
+        let mut socket =
+            std::net::TcpStream::connect(game.addr()).expect("the loopback game socket opens");
+        // The two handshake lines the game socket takes before any XML: the
+        // launch KEY, then the front-end identification (docs/LICH_WIRE.md §2).
+        let handshake = format!("synthetic-key\n{}\n", hydra_mocks::CLIENT_IDENTIFICATION);
+        socket
+            .write_all(handshake.as_bytes())
+            .expect("the handshake is written");
+        socket.flush().expect("the handshake is flushed");
+
+        let mut session = LiveSession::new("Aelith");
+        let mut reader = BufReader::new(socket);
+        let mut line = String::new();
+        while reader.read_line(&mut line).expect("the game stream reads") > 0 {
+            // `read_line` keeps the `\n`; the model strips it (and a `\r`).
+            session.feed_line(&line);
+            line.clear();
+        }
+        // The mock really saw the two handshake lines.
+        assert_eq!(
+            game.received(),
+            vec![
+                "synthetic-key".to_string(),
+                hydra_mocks::CLIENT_IDENTIFICATION.to_string()
+            ]
+        );
+        game.join().expect("the mock game server ends cleanly");
+        session
+    }
+
+    #[test]
+    fn a_live_session_is_painted_in_the_play_area() {
+        let session = played_session();
+        // The model itself first, so a painting failure is not mistaken for a
+        // parsing one.
+        assert_eq!(session.view.room, "A Synthetic Crossing");
+        assert_eq!(session.view.exits, vec!["n".to_string(), "se".to_string()]);
+        assert_eq!(session.vitals.words(), "Sp 70%, HP 80%, MP 90%, SP 60%");
+        assert_eq!(session.hands.left(), Some("a synthetic shield"));
+        assert_eq!(session.hands.right(), Some("a synthetic sword"));
+        assert_eq!(session.compass, vec!["n".to_string(), "se".to_string()]);
+        assert_eq!(session.view.prompt, "synthetic>");
+
+        let live = Arc::new(Mutex::new(session));
+        // The text the player has typed but not sent: it must be in the frame.
+        locked(&live).input = "inventory".to_string();
+        let (input, inbox) = std::sync::mpsc::channel::<String>();
+        let mut hub = Hub::with_live(start(), true, Arc::clone(&live), input);
+
+        let (_, out) = headless::one_frame(|ui| hub.ui_contents(ui));
+        let texts = headless::texts(&out);
+        let found = |needle: &str| texts.iter().any(|text| text.contains(needle));
+
+        // The story: the plain line and the raw/preset room text.
+        assert!(found("A synthetic breeze crosses the road."), "{texts:?}");
+        assert!(found("A Synthetic Crossing"), "{texts:?}");
+        assert!(found("A wide synthetic road."), "{texts:?}");
+        // The room pane does not repeat the exit caption as body text: the exits
+        // are a row of buttons (`n`, `se`) instead, which is what `exits_in` and
+        // `PlayView::described` are for.
+        assert_eq!(
+            live.lock().unwrap().view.described(),
+            vec!["A wide synthetic road."]
+        );
+        // The prompt, painted as the story's last line.
+        assert!(found("synthetic>"), "{texts:?}");
+        // The vitals: `HP 80%` is one of the four recovered words.
+        assert!(found("HP 80%"), "{texts:?}");
+        assert!(found("Sp 70%, HP 80%, MP 90%, SP 60%"), "{texts:?}");
+        // Both hands.
+        assert!(found("Left hand: a synthetic shield"), "{texts:?}");
+        assert!(found("Right hand: a synthetic sword"), "{texts:?}");
+        // A compass direction.
+        assert!(found("Compass: n, se"), "{texts:?}");
+        // The room number.
+        assert!(found("(4242)"), "{texts:?}");
+        // The status strip: the character and the connection indicator.
+        assert!(found("Aelith \u{2014} connected"), "{texts:?}");
+        // The input line's text.
+        assert!(found("inventory"), "{texts:?}");
+        // Nothing was sent: the frame only painted.
+        assert!(inbox.try_recv().is_err());
+        // The input line is still the model's buffer, unchanged by the frame.
+        assert_eq!(locked(&live).input, "inventory");
+    }
+
+    #[test]
+    fn enter_sends_the_input_line_out_of_the_window() {
+        let live = Arc::new(Mutex::new(LiveSession::new("Aelith")));
+        locked(&live).input = "look".to_string();
+        let (input, inbox) = std::sync::mpsc::channel::<String>();
+        let mut hub = Hub::with_live(start(), true, Arc::clone(&live), input);
+
+        // Frame 1: the input row is painted with its text and the Send button.
+        let ctx = egui::Context::default();
+        let (_, out) = headless::frame(&ctx, headless::SIZE, |ui| hub.ui_contents(ui));
+        assert!(headless::texts(&out).iter().any(|text| text == "look"));
+        assert!(headless::texts(&out).iter().any(|text| text == "Send"));
+
+        // Frame 2: the input has focus and the player pressed Enter — a
+        // single-line `TextEdit` loses focus on Enter, which is the send.
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(Hub::INPUT_ID)));
+        let mut raw = headless::input(headless::SIZE);
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(raw, |ui| hub.ui_contents(ui));
+
+        // The bare line went to the writer thread, the echo is in the story and
+        // the input line is empty again.
+        assert_eq!(inbox.try_recv().ok(), Some("look".to_string()));
+        {
+            let live = locked(&live);
+            assert_eq!(live.input, "");
+            assert_eq!(live.story.text(1), vec!["> look".to_string()]);
+            assert!(live.connected);
+        }
+
+        // The input line kept the focus, so the next command needs no click:
+        // a third frame types and sends without asking for focus again.
+        locked(&live).input = "north".to_string();
+        let mut raw = headless::input(headless::SIZE);
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(raw, |ui| hub.ui_contents(ui));
+        assert_eq!(inbox.try_recv().ok(), Some("north".to_string()));
+    }
+
+    #[test]
+    fn an_empty_input_line_is_not_sent() {
+        let live = Arc::new(Mutex::new(LiveSession::new("Aelith")));
+        let (input, inbox) = std::sync::mpsc::channel::<String>();
+        let mut hub = Hub::with_live(start(), true, Arc::clone(&live), input);
+
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(Hub::INPUT_ID)));
+        let mut raw = headless::input(headless::SIZE);
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(raw, |ui| hub.ui_contents(ui));
+
+        assert!(inbox.try_recv().is_err());
+        assert!(locked(&live).story.is_empty());
+    }
+
+    #[test]
+    fn a_disconnected_session_says_so() {
+        let live = Arc::new(Mutex::new(LiveSession::new("Aelith")));
+        locked(&live).closed();
+        let (input, _inbox) = std::sync::mpsc::channel::<String>();
+        let mut hub = Hub::with_live(start(), true, Arc::clone(&live), input);
+
+        let (_, out) = headless::one_frame(|ui| hub.ui_contents(ui));
+        let texts = headless::texts(&out);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Aelith \u{2014} disconnected")),
+            "{texts:?}"
+        );
+        // The recovered wording of the end of a session, in the story.
+        assert!(
+            texts.iter().any(|text| text == crate::live::GAME_CLOSED),
+            "{texts:?}"
+        );
+        // The input row is still painted (the window is not empty); it is
+        // disabled, which `add_enabled(false, …)` shows by greying the widgets.
+        assert!(texts.iter().any(|text| text == "Send"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_hub_window_still_draws_the_empty_room_model() {
+        // No session: the pre-Phase-9 play area, unchanged.
+        let mut hub = Hub::new(start(), false);
+        assert!(hub.live.is_none());
+        assert!(hub.input.is_none());
+        hub.room.title = "The Hub".into();
+        let (_, out) = headless::one_frame(|ui| hub.ui_contents(ui));
+        let texts = headless::texts(&out);
+        assert!(texts.iter().any(|text| text == "The Hub"));
+        // The live-only pieces are not drawn.
+        assert!(!texts.iter().any(|text| text.contains("connected")));
+        assert!(!texts.iter().any(|text| text == "Send"));
+    }
+
+    #[test]
+    fn build_live_is_the_same_window_around_a_live_model() {
+        let live = Arc::new(Mutex::new(LiveSession::new("Aelith")));
+        let (input, _inbox) = std::sync::mpsc::channel::<String>();
+        let launch = build_live(&start(), true, Arc::clone(&live), input);
+        assert_eq!(launch.title, "Hydra");
+        assert_eq!(launch.size(), (660.0, 520.0));
+        assert_eq!(launch.options.renderer, eframe::Renderer::Wgpu);
+        assert_eq!(launch.options.viewport.title.as_deref(), Some("Hydra"));
+        // The badge icon is still the window icon.
+        let icon = launch.options.viewport.icon.as_ref().expect("the icon");
+        assert_eq!((icon.width, icon.height), (256, 256));
     }
 }

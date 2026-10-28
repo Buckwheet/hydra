@@ -1430,6 +1430,10 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "epaint",
+ "hydra_mocks",
+ "hydra_model",
+ "hydra_protocol",
+ "hydra_ui",
 ]
 
 [[package]]

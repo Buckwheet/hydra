@@ -7,3 +7,16 @@ egui = { workspace = true }
 epaint = { workspace = true }
 eframe = { workspace = true }
 egui-wgpu = { workspace = true }
+# Phase 9: the live session (`live`) is built on the real UI models — the story
+# and the play view are `hydra_ui`'s, the frames are `hydra_protocol`'s and the
+# hands are `hydra_model`'s — so the window draws the same model the recovery
+# reconstructed instead of a second copy of it.
+hydra_ui = { path = "../hydra_ui" }
+hydra_protocol = { path = "../hydra_protocol" }
+hydra_model = { path = "../hydra_model" }
+
+[dev-dependencies]
+# The headless live test runs a real loopback game server
+# (`hydra_mocks::MockGame`), so the parser -> model -> painted frame chain is
+# exercised without a window.
+hydra_mocks = { path = "../hydra_mocks" }

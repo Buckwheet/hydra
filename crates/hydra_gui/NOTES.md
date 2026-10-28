@@ -6,7 +6,7 @@ Reconstructed from the arm64 Mach-O binary `/Users/cpmbpro/Code/hydra-inspect/hy
 `grep -Rn 'todo!\|unimplemented!' crates/hydra_gui/src` is empty — and
 
 * `cargo check -p hydra_gui` — clean, no warnings
-* `cargo test -p hydra_gui` — **108 tests pass**
+* `cargo test -p hydra_gui` — **133 tests pass**
 * `cargo check --workspace` — clean (no other crate was touched)
 
 Phase 4 replaced the `egui`/`eframe` seams with the real thing: the drawing goes
@@ -14,6 +14,11 @@ through the pinned `egui` (git `3da022d`) and the window is an `eframe` window.
 What that changed, what it pinned down and what is still a stand-in is in
 **Phase 4: real egui/eframe** below; `docs/EGUI.md` is the version research it
 builds on.
+
+Phase 9 made the window a game client: `hydra gui <character>` logs in, opens the
+game socket, and paints the real `hydra_ui`/`hydra_model` models through
+`live::LiveSession`.  That is **Phase 9: the live play area** at the end of this
+file; nothing above it changed.
 
 ---
 
@@ -527,7 +532,7 @@ instruction — the `UNKNOWN:` notes say where.
 
 ## Test inventory
 
-108 tests, all asserting recovered values rather than restating the code. Every
+133 tests, all asserting recovered values rather than restating the code. Every
 drawing test runs one headless `egui` frame (`crate::headless`) and asserts on the
 shapes that frame produced — a filled rect's exact geometry and colour, a
 circle's centre and radius, a text shape's string — never just "it drew
@@ -546,4 +551,162 @@ something".
 | `layout/drawers.rs` | 13 | the default 160/160/240/240 table, each field flipping `is_default`, extent floor 40, the 60/144 reserves, proportional scaling, the main rect, zone/mode names, JSON, the four `Zones::strip` rects in a 660×520 window, the painted strips, opacity → alpha, and the mode-filtered paint passes |
 | `layout.rs` | 2 | main rect with shut/open drawers |
 | `play/titlebar.rs` | 12 | the first-paint entries, `Default`, the label/key literals, `of_key` inversion, `From<Written>`'s `Menu` insertion and `tucked`, JSON defaults, `items()` order, the four real buttons (their labels as painted text, all inside the strip, `Zoom` flush right) |
-| `app.rs` | 11 | the title/placement/size constants, the run plan, `build`'s `Renderer::Wgpu` + 660×520 + `"Hydra"` + the 256×256 RGBA badge icon, `Hub::chrome` for shut and open drawers, `press`'s drawer toggles, the painted play area (`extreme_bg_color`) and title-bar strip + four items + room text, the four open strips in `panel_fill`, and `Clipping` painting last |
+| `app.rs` | 17 | the title/placement/size constants, the run plan, `build`'s `Renderer::Wgpu` + 660×520 + `"Hydra"` + the 256×256 RGBA badge icon, `Hub::chrome` for shut and open drawers, `press`'s drawer toggles, the painted play area (`extreme_bg_color`) and title-bar strip + four items + room text, the four open strips in `panel_fill`, `Clipping` painting last, and (Phase 9) the live play area: a real loopback `MockGame` → `TcpStream` → parser → model chain painted in one headless frame (story, room, vitals, hands, compass, prompt, status, input), Enter sending the input line out of the window, an empty line *not* being sent, the disconnected status, the hub window still drawing the empty room model, and `build_live`'s recovered options |
+| `live.rs` | 19 | the model itself: a `Frame::Text` line heard with the theme's palette, blank lines dropped, `<component id="roomName"/"roomDesc">`, `<nav rm>`, the four `<progressBar>`s (including `?` before any arrives, `80%`/`60/100` and the clamp), `<left>`/`<right>`/`<held>` (both on one line, `nothing` clearing a slot), `<compass><dir>`, the prompt as a frame *and* as its raw tag, the preset and element room forms, a room name starting a new description, the closed-`<preset>` style not leaking into the next line, the parser's state carrying across lines, `submit` (echo + send, empty dropped, too long reported), `closed`, and the quote-aware tag scanner |
+
+---
+
+## Phase 9: the live play area
+
+`hydra gui <character> [--account A] [--game G]` no longer opens an empty hub: it
+logs in, opens the game socket and paints what the game sends.  The chain is
+`login -> game socket -> hydra_protocol::Parser -> hydra_gui::live::LiveSession ->
+hydra_ui (Story/PlayView) + crate::bar::stack::Stack -> egui`.  **Lich is not in
+it** — the window talks to the game socket itself, exactly as `hydra login` does;
+`play`/`serve` keep the Lich path (`docs/LICH_WIRE.md`, `crates/hydra/NOTES.md`
+§8).  `hydra gui` with **no** character still opens the hub window unchanged
+(`app::build` around `Hub::new`, the empty room model).
+
+### What is wired
+
+* **`live::LiveSession`** — the model, socket-free and unit-tested: one
+  `hydra_protocol::Parser` kept across lines, the story fed through
+  `hydra_ui::story::Story::hear` with `Theme::default()`'s palette, the room
+  through `hydra_ui::view::PlayView` (+ `exits_in`), the vitals through
+  `crate::bar::stack::Stack`, the hands through `hydra_model`'s `Hand`, plus the
+  compass words, the room number, the prompt, the connection state and the input
+  buffer.  `feed_line` / `feed_bytes` / `feed_frames` / `submit` are the whole
+  surface.
+* **The raw-tag pass.**  The parser's dedicated element frames (`Component`,
+  `RoomId`, `ProgressBar`, `Compass`, `LeftHand`, `RightHand`, `Prompt`) are built
+  with an *empty body* (`Parser::element_frame`), so the attributes are
+  unreachable from the frame stream.  `LiveSession::read_tags` therefore scans the
+  raw line for the tags the game actually sends, in addition to the parser:
+  `<component id="roomName" value>`, `<component id="roomDesc" value>`,
+  `<nav rm>`, `<progressBar id="health|mana|spirit|stamina" value>`,
+  `<left>`/`<right>`/`<held>`, `<compass><dir value>`, `<prompt>`.  The
+  **preset/text** forms are read by the same pass
+  (`<preset id="roomName">…</preset>`, `<preset id="roomDesc">…</preset>`,
+  `<roomName>…</roomName>`, `<roomDesc>…</roomDesc>`), and every `Frame::Text`
+  line still goes into the story — so the raw/preset room text is visible in the
+  scrollback as well as in the room pane, while the exit caption is *not*
+  repeated in the room pane (`PlayView::described` filters it and the exits are a
+  button row).
+* **The input line** — a real `egui::TextEdit::singleline` (id
+  `Hub::INPUT_ID`) plus a `Send` button at the bottom of the play area.  Enter in
+  a single-line `TextEdit` surrenders focus, which is the send.  The line is
+  validated with `hydra_ui::input::validate_line`, echoed into the story as
+  `> line`, and handed to an `mpsc::Sender<String>`; an empty line is not sent and
+  not echoed.  The model lock is **dropped before the send**: the writer thread
+  owns the socket, the window never blocks on it.
+* **The status strip** — the character and `connected`/`disconnected`.  On EOF
+  the reader thread calls `LiveSession::closed`, which flips the indicator and
+  adds the recovered story line `[hydra] the game closed the connection`
+  (`crates/hydra/src/typing.rs`'s `GAME_CLOSED` without its newlines; the binary
+  has a test that the two constants agree).
+* **`app::Hub`** gained `live: Option<Arc<Mutex<LiveSession>>>` and
+  `input: Option<Sender<String>>`.  `Hub::new`, `app::plan`, `app::build`,
+  `app::run` and `hydra gui`'s `gui_launch` are unchanged; `Hub::with_live` and
+  `app::build_live` are the new constructors.  `ui_contents` paints the live play
+  area when a session is present and the old empty room model otherwise, and asks
+  for a repaint every `live::REPAINT` (50 ms) so the background reader becomes
+  visible.
+* The binary's half is `crates/hydra/src/gui.rs`: `gui_connect_from(target,
+  password)` is everything up to the open game socket (testable, no window);
+  `Live::start` spawns the reader (CRLF/bytes → parser → model) and writer
+  (channel → socket, `\n` + flush) threads; `run` builds the launch and calls
+  eframe.  Failures are `hydra gui: …` on stderr with status 1 — the window is
+  opened *after* the login, so a refusal never shows an empty one.
+
+### The inferred layout
+
+The recovered chrome is untouched (`Chrome`: title-bar strip + the four recovered
+drawer zones).  What goes inside the play rectangle is **inferred** — the
+binary's hub fills it with the `hydra_board` panels that are not reconstructed:
+
+```text
++----------------------------------------------+
+| Aelith — connected                           |  STATUS_HEIGHT  (18.0, UNKNOWN)
++-------------------------------+--------------+
+| story: scrollback, prompt as  | room title   |  the rest
+| its last line (Token colours) | description  |
+|                               | exits row    |
+|                               | (4242)       |
+|                               | Compass: n,se|
+|                               | Left/Right   |
+|                               | Sp/HP/MP/SP  |
+|                               | (rings)      |
++-------------------------------+--------------+
+| [ type a command………… ] [Send]              |  INPUT_HEIGHT (24.0, UNKNOWN)
++----------------------------------------------+
+```
+
+`Hub::STORY_FRACTION` (0.6) splits the two columns; `Hub::VITALS_HEIGHT` (64.0)
+is the box the rings get.  All three constants are marked `UNKNOWN` at their
+definition: they are drawing decisions, not recovered literals.  The prompt is
+painted **once**, as the story's last line (where `Story::paint_into` puts it), so
+the room pane is drawn from a copy of the view with the prompt cleared.
+
+### What is mock-tested
+
+* **No display, one frame.**  Every drawing assertion is a headless
+  `egui::Context` frame (`crate::headless`), never a window.  The big one starts
+  `hydra_mocks::MockGame` on `127.0.0.1:0` with a synthetic stream (component,
+  preset, `nav`, `progressBar` ×4, both hands, a compass, a prompt, a story line),
+  connects a real `TcpStream`, sends the two handshake lines
+  (`docs/LICH_WIRE.md` §2), reads the stream, feeds it through the parser into the
+  model, builds a `Hub` around it and asserts the painted galleys contain the
+  story, the room title and description, `HP 80%`, both hand items,
+  `Compass: n, se`, the prompt, `(4242)`, `Aelith — connected` and the input
+  line's text.
+* **Typing.**  A second headless test focuses the input id, delivers a real
+  `egui::Event::Key { key: Enter }` and asserts the bare line reached the channel
+  and `> look` reached the story; a third asserts an empty line sends nothing.
+* **The binary chain.**  `crates/hydra/src/gui.rs`'s tests run `MockEaccess` +
+  `MockGame` with an explicit `login::Target` and password (no process
+  environment), so the whole login → game → parser → model chain runs, and a
+  second test proves a line handed to `Running::input` arrives at the mock game
+  and that shutting the socket down flips the model to disconnected with the
+  recovered sentence.  The eight stage lines on stderr are the same ones
+  `tests/login.rs` asserts for the binary.
+* **Not weakened.**  Every pre-Phase-9 `hydra_gui`/`hydra_ui`/`hydra` test still
+  passes unchanged (108 → 133 in this crate, 133 vs `hydra_ui`'s 244 and
+  `hydra`'s 119 unaffected).
+
+### What could NOT be tested without a real display
+
+These are runtime facts of eframe/wgpu/winit that no headless `egui::Context`
+frame exercises.  None of them is asserted anywhere:
+
+* **actual window creation** — `eframe::run_native` + `egui_wgpu` device/adapter
+  setup, surface configuration, swapchain presentation;
+* **the winit event loop** — window events, `RedrawRequested` pacing, the
+  `request_repaint_after` timer actually firing;
+* **GPU painting** — the shapes this crate produces reaching the screen, font
+  rasterisation through `epaint`'s atlas and the wgpu render pass;
+* **native keyboard/IME/focus** — real key events reaching the `TextEdit`, IME
+  composition, and the loss of focus when the OS window does;
+* **resizing** — the live layout at sizes other than the recovered 660 × 520
+  (the headless tests only use that one size);
+* **the socket's real latency** — the reader thread's behaviour under a
+  back-pressured or very chatty game stream is only exercised by the mock's short
+  burst.
+
+### Guesses and residual risks
+
+* The tag set in the raw pass is the game's conventional one, not a recovered
+  table; an unknown spelling is ignored rather than guessed at (**UNKNOWN**).
+* "A room name starts a new description" is a heuristic
+  (**INFERRED**): the recovered `Room::component` replaces per component id, and
+  the description is kept as lines here only to support the preset form.
+* The `> ` echo prefix and the `[hydra] …` local-notice shape are **UNKNOWN**;
+  only the `GAME_CLOSED` sentence is a recovered literal.
+* `Parser::dispatch` records `<preset>`/bold markup state for opening tags only,
+  so a closed `<preset>` would leak its style into later runs.  The live model
+  closes the span itself with a neutral `<preset id=""/>` and never reads the
+  room pane from a run's preset; the parser is left alone because changing its
+  frame stream would change what `hydra replay` prints.
+* `hydra gui` keeps no single-instance lock (`hydra::instance::claim` is not
+  reconstructed) and does not persist placements (`Placements` is not
+  reconstructed), so two windows can be opened and the window size is the
+  recovered default every time.

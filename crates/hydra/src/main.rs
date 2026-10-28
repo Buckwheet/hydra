@@ -61,6 +61,7 @@
 #![allow(dead_code)]
 
 mod cli;
+mod gui;
 mod import;
 mod lich;
 mod lookout;
@@ -180,15 +181,27 @@ fn run(command: &Command) -> Option<String> {
     }
 }
 
-/// `hydra gui …` — build the recovered hub window and hand it to eframe.
+/// `hydra gui …` — hand a window to eframe.
 ///
-/// The build half ( [`gui_launch`] ) is a pure value: `NativeOptions` with the
-/// recovered `"Hydra"` title, the `"hub"` placement's 660 × 520 size, the
-/// 256 × 256 badge icon, `egui_wgpu::WgpuConfiguration::default()` and the
-/// wgpu renderer, plus the boxed [`hydra_gui::app::Hub`].  Only
-/// [`hydra_gui::app::Launch::run`] starts the platform event loop, and nothing
-/// in this crate's tests calls it.
+/// Two windows, one word:
+///
+/// * **`hydra gui` with no character** is the hub window, exactly as it was: the
+///   pure [`gui_launch`] value — `NativeOptions` with the recovered `"Hydra"`
+///   title, the `"hub"` placement's 660 × 520 size, the 256 × 256 badge icon,
+///   `egui_wgpu::WgpuConfiguration::default()` and the wgpu renderer, plus the
+///   boxed [`hydra_gui::app::Hub`] drawing the empty room model.
+/// * **`hydra gui <character> [--account A] [--game G]`** is the live window:
+///   [`crate::gui::run`] logs in, opens the game socket, starts the reader and
+///   writer threads and builds the same window around the live model.  A login
+///   or game-socket failure is a `hydra gui: …` line on stderr and status 1 —
+///   never an empty window.
+///
+/// Only [`hydra_gui::app::Launch::run`] starts the platform event loop, and
+/// nothing in this crate's tests calls it.
 fn gui(targets: &[String]) -> Option<String> {
+    if !targets.is_empty() {
+        return crate::gui::run(targets).err();
+    }
     let launch = gui_launch(targets);
     let (width, height) = launch.size();
     eprintln!(
@@ -346,6 +359,22 @@ mod tests {
         let icon = launch.options.viewport.icon.as_ref().expect("the badge icon");
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn the_live_window_says_the_recovered_sentence() {
+        // `hydra_gui` cannot depend on this crate (the binary depends on it), so
+        // the recovered `GAME_CLOSED` literal exists in both places: the story
+        // line the window adds is `typing::GAME_CLOSED` without the newlines the
+        // stdout literal carries.
+        assert_eq!(
+            hydra_gui::live::GAME_CLOSED,
+            crate::typing::GAME_CLOSED.trim()
+        );
+        assert_eq!(
+            hydra_gui::live::GAME_CLOSED,
+            "[hydra] the game closed the connection"
+        );
     }
 
     #[test]

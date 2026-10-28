@@ -1,0 +1,91 @@
+#!/bin/bash
+# A synthetic "ruby": the Lich stand-in for the `.lich off` / `.lich on` runs in
+# `tests/play_stdin.rs`.
+#
+# Nothing here is Ruby, Lich or game text — every name and line is invented.  It
+# plays the same Lich as `tests/fixtures/lich_typing/ruby` (it completes the
+# keyed handshake, then forwards every line typed at it to the game socket:
+# `docs/LICH_WIRE.md` §3), with one addition: it **counts its own boots** in
+# `$HYDRA_DATA_DIR/lich-boots` (one line per invocation) and says which boot it
+# is.  A `.lich on` typed mid-session must spawn a *second* child, and only a
+# counter can tell a second spawn from a first one that never died.
+#
+# Hydra starts Lich as (`docs/LICH_WIRE.md` §1):
+#
+#   ruby -e '<prelude>' -e '$0 = ARGV.shift; load $0' <folder>/lich.rbw \
+#        --pipe --stormfront --sentinel -g 127.0.0.1:<port>
+#
+# so the two `-e` snippets and the `lich.rbw` path are ignored, the child's
+# working directory (the Lich folder) and `HYDRA_DATA_DIR` are inherited, and
+# the script plays Lich's half of the observed handshake:
+#
+#   1. count this boot and read the two stdin handshake lines (token, client
+#      identification);
+#   2. connect to 127.0.0.1:<port> and send them back as the first two lines of
+#      the socket stream (bash's /dev/tcp built-in: loopback only, no helper
+#      program);
+#   3. say one line of its own and one 0x1F-prefixed forwarded chunk, each
+#      naming the boot, so a run can tell which Lich said what and prove the
+#      chunk byte was stripped;
+#   4. forward every line typed on stdin to the game socket, echoing it, until
+#      stdin closes or a read times out.  A read timeout is the end of the
+#      boot: the test never leaves this child parked.
+#
+# Exit codes: 1 when argv has no usable -g address, 2 when the connection is
+# refused.
+
+set -u
+
+read -r token || true
+read -r client || true
+
+port=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-g" ] && [ "$#" -ge 2 ]; then
+        port="${2##*:}"
+    fi
+    shift
+done
+
+if [ -z "$port" ]; then
+    echo "fake ruby: no -g address in argv" >&2
+    exit 1
+fi
+
+# Which boot this is: one line per invocation, in the data folder the run uses.
+#
+# Only shell builtins from here on: the run puts this fixture's folder on `PATH`
+# as its only entry, so `wc`, `tr` or `cat` would not be found.
+counts="${HYDRA_DATA_DIR:-.}/lich-boots"
+boot=0
+if [ -f "$counts" ]; then
+    while IFS= read -r _earlier; do
+        boot=$((boot + 1))
+    done <"$counts"
+fi
+boot=$((boot + 1))
+printf 'boot\n' >>"$counts" 2>/dev/null || true
+
+exec 3<>"/dev/tcp/127.0.0.1/$port" || {
+    echo "fake ruby: cannot connect to 127.0.0.1:$port" >&2
+    exit 2
+}
+
+printf '%s\n%s\n' "$token" "$client" >&3
+
+# Lich's own output carries no chunk byte (docs/LICH_WIRE.md §4)...
+printf '%s\n' '--- synthetic Lich is taking typing.'
+printf -- '--- synthetic Lich boot %s.\n' "$boot"
+# ...and a forwarded game chunk starts with 0x1F (037 in octal).
+printf '\037<synthetic-forwarded-boot-%s/>\n' "$boot"
+
+# Lich takes typing: every bare line on stdin goes on to the game as it came.
+while read -r -t 20 line; do
+    if [ -z "$line" ]; then
+        continue
+    fi
+    printf '%s\n' "$line" >&3
+    printf -- '--- synthetic Lich forwarded %s\n' "$line"
+done
+
+exit 0

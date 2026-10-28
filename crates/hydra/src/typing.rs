@@ -25,6 +25,13 @@
 //! writes one to Lich's stdin and the other to the game ([`crate::lich::relay_game`]).
 //! That keeps the bytes on one thread each and mirrors the recovered split.
 //!
+//! `.lich` commands that need a process are the exception: the session cannot
+//! spawn, so [`Handled`] carries the request (`.lich off`'s stop, `.lich on`'s
+//! start) out on the same [`Queues`] and the relay loop carries it out —
+//! [`crate::lich::switches`] turns the requests into the loop's own
+//! [`crate::lich::Switch`]es, and a `.lich on` really does start a second Lich
+//! on the running game socket (`crates/hydra/NOTES.md` §8.3).
+//!
 //! Ctrl-C sends `quit` and then cancels the session ([`spawn_ctrl_c`]).
 //!
 //! # The dispatch rules
@@ -93,14 +100,6 @@ pub fn not_a_command(line: &str, symbol: char) -> String {
     )
 }
 
-/// What a `.lich on` typed mid-session reports it cannot do.
-///
-/// **INFERRED**: the session records the setting and says the recovered
-/// `Lich is starting, from …` line, but this phase does not spawn a second Lich
-/// inside a running relay (see `crates/hydra/NOTES.md` §9).
-pub const START_MID_SESSION: &str =
-    "[hydra] Lich is not started mid-session in this phase; the next `hydra play` starts it";
-
 /// Where one typed line goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
@@ -155,7 +154,8 @@ pub struct Handled {
     pub to_lich: Option<String>,
     /// the line went to the session's taker, for the game socket
     pub to_game: Option<String>,
-    /// `.lich on` asked for a start from this folder
+    /// `.lich on` asked for a start; the folder and the rest of the settings
+    /// are the session's own (`SessionHandle::lich_settings`)
     pub start: Option<PathBuf>,
     /// `.lich off` asked for Lich to be stopped
     pub stop: bool,

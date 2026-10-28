@@ -338,7 +338,7 @@ fn session_run(options: &Options, settings: io::Result<LichSettings>) -> Result<
         requests,
     };
 
-    let outcome = lich::relay_game(&mut keyed, &mut socket, &mut out, session.handle(), queues);
+    let outcome = lich::relay_game(keyed, &mut socket, &mut out, session.handle(), queues);
 
     session.door().over();
     session.handle().stop(typing::SESSION_ENDED);

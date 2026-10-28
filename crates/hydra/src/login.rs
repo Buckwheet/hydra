@@ -373,7 +373,7 @@ pub fn play_with(
         requests,
     };
 
-    let outcome = lich::relay_game(&mut keyed, &mut socket, &mut out, session.handle(), queues);
+    let outcome = lich::relay_game(keyed, &mut socket, &mut out, session.handle(), queues);
 
     // Lich does not take typing any more, and the session is over: the recovered
     // `[status] the session has ended`.

@@ -15,6 +15,14 @@
 //! * `;status` is a local status line;
 //! * neither of the latter two is ever sent to the game.
 //!
+//! Since Phase 9 the same loop honours `.lich off` and `.lich on` while the
+//! session is running (`crate::lich::relay_game`): the last three tests use
+//! `tests/fixtures/lich_restart/ruby`, a second synthetic Lich that counts its
+//! own boots in `$HYDRA_DATA_DIR/lich-boots`, so "a *second* Lich was really
+//! spawned" is something a test can see.  The game socket is never replaced —
+//! the same `MockGame` connection carries every line, and its handshake is
+//! recorded once.
+//!
 //! Nothing real is involved: both servers bind `127.0.0.1`, the certificate is
 //! generated in-process, the account, password and every line of output are
 //! invented.  Every run is bounded ([`WAIT`]) and killed if it overruns.
@@ -43,6 +51,14 @@ fn fake_path() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("lich_typing")
+}
+
+/// The same, for the Lich that counts its boots (`.lich off` / `.lich on`).
+fn restart_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("lich_restart")
 }
 
 /// A temp folder, removed when the test ends.
@@ -417,7 +433,7 @@ fn ctrl_c_sends_quit_and_ends_the_run() {
 }
 
 #[test]
-fn a_lich_off_typed_mid_session_stops_lich_and_ends_the_run() {
+fn a_lich_off_typed_mid_session_stops_lich_and_sends_later_typing_to_the_game() {
     let data = TempDir::with_lich("lich-off");
     let (game, eaccess, envs) = start_mocks();
     let mut run = Run::start(
@@ -430,20 +446,197 @@ fn a_lich_off_typed_mid_session_stops_lich_and_ends_the_run() {
     run.wait_for_output("--- synthetic Lich is taking typing.");
 
     // `.lich off` is Hydra's, so it is answered locally with the recovered
-    // sentence and then stops the child: with Lich gone the relay loop is done,
-    // and the run ends as a clean exit rather than a hanging one.
+    // sentence, then the child is stopped and the door closed.  The session is
+    // *not* over: the game socket is still open (Phase 9).
     run.say(".lich off");
     run.wait_for_output("Lich is stopping, and stays off for this character.");
+
+    // The first line after it may still have been taken by the child (the
+    // request is carried out on the relay's thread), so the *second* one is the
+    // proof: by then the door is certainly shut and the line goes to the game
+    // directly, with no Lich in the way.
+    run.say("after-off");
+    run.wait_for_game(&game, "after-off");
+    run.say("direct");
+    run.wait_for_game(&game, "direct");
+    assert!(
+        !run.out().contains("--- synthetic Lich forwarded direct"),
+        "a stopped Lich received a typed line: {}",
+        run.out()
+    );
+
+    // The session is still here, and says so.
+    run.say(";status");
+    run.wait_for_output("[status] Aelith: Lich is not running");
+
+    // Nothing Hydra answered locally reached the game.
+    run.settle();
+    assert_eq!(
+        game.sent(),
+        vec!["after-off".to_string(), "direct".to_string()],
+        "stdout: {}\nstderr: {}",
+        run.out(),
+        run.err()
+    );
+
+    drop(run);
+    eaccess
+        .join()
+        .expect("the mock eaccess server ends cleanly");
+    game.join().expect("the mock game server ends cleanly");
+}
+
+#[test]
+fn a_lich_off_then_a_lich_on_starts_a_second_lich_on_the_same_game_socket() {
+    let data = TempDir::with_lich("lich-restart");
+    let (game, eaccess, envs) = start_mocks();
+    let mut run = Run::start(
+        &["play", "Aelith", "--account", "main", "--game", "GS3"],
+        &data,
+        &restart_path(),
+        &envs,
+    );
+
+    // The initial Lich: started with the session, boot number one.
+    run.wait_for_output("[hydra] connected; type commands, Ctrl-C to quit");
+    run.wait_for_output("--- synthetic Lich boot 1.");
+    // ... and it takes the typing: a bare line goes to it and on to the game.
+    run.say("look");
+    run.wait_for_game(&game, "look");
+    run.wait_for_output("--- synthetic Lich forwarded look");
+
+    // `.lich off`: the child stops and the door is closed.
+    run.say(".lich off");
+    run.wait_for_output("Lich is stopping, and stays off for this character.");
+    // Carried out on the relay's thread, so the door may still have been open
+    // when the next line arrived; once *any* line has reached the game the stop
+    // has certainly been taken (the loop drains the door before it acts on the
+    // request), and the line after that goes to the game directly.
+    run.say("after-off");
+    run.wait_for_game(&game, "after-off");
+    run.say("direct");
+    run.wait_for_game(&game, "direct");
+
+    // `.lich on`: a **second** Lich, spawned while this game socket stays open.
+    run.say(".lich on");
+    run.wait_for_output("--- synthetic Lich boot 2.");
+    // The fresh door claim: a typed line goes to the new child's stdin and on
+    // to the game, which the second boot echoes.
+    run.say("through-second");
+    run.wait_for_game(&game, "through-second");
+    run.wait_for_output("--- synthetic Lich forwarded through-second");
+
+    // `.lich on` again, while that second Lich runs: the recovered
+    // `Lich already runs for this character.` and **no** third child.
+    run.say(".lich on");
+    run.wait_for_output("Lich already runs for this character.");
+
+    run.settle();
+    assert!(
+        !run.out().contains("--- synthetic Lich boot 3."),
+        "a second `.lich on` spawned a duplicate: {}",
+        run.out()
+    );
+    // One game connection carried all four lines, in order — the socket was
+    // never dropped or replaced, and no second login happened.
+    assert_eq!(
+        game.sent(),
+        vec![
+            "look".to_string(),
+            "after-off".to_string(),
+            "direct".to_string(),
+            "through-second".to_string()
+        ],
+        "stdout: {}\nstderr: {}",
+        run.out(),
+        run.err()
+    );
+    assert_eq!(game.received().len(), 2, "{:?}", game.received());
+
+    // The recovered start lines were said twice — once per Lich — and both
+    // boots' forwarded chunks arrived without their 0x1F byte.
+    let printed = run.out();
+    assert_eq!(printed.matches("Lich is at ").count(), 2, "{printed}");
+    // Three times: the initial start, `.lich on`'s own recovered notice, and
+    // the second start's own line.
+    assert!(
+        printed.matches("Lich is starting, from ").count() >= 3,
+        "{printed}"
+    );
+    assert!(
+        printed.contains("<synthetic-forwarded-boot-1/>"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("<synthetic-forwarded-boot-2/>"),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains('\u{1f}'),
+        "a chunk byte reached stdout: {printed:?}"
+    );
+    // `direct` was typed while no Lich ran, so no Lich can have echoed it.
+    assert!(!printed.contains("forwarded direct"), "{printed}");
+
+    // The game closing still ends the session cleanly — with the second Lich
+    // running — so the teardown reaps it.
+    drop(game);
     let status = run.wait_for_exit();
     assert_eq!(status.code(), Some(0), "stderr: {}", run.err());
     run.wait_for_output("[status] the session has ended");
 
-    // Nothing was typed at the game, and the command did not reach it either.
-    assert!(
-        game.sent().is_empty(),
-        "a Hydra command reached the game: {:?}",
-        game.sent()
+    drop(run);
+    eaccess
+        .join()
+        .expect("the mock eaccess server ends cleanly");
+}
+
+#[test]
+fn a_lich_on_that_cannot_be_started_says_so_and_leaves_the_session_usable() {
+    let data = TempDir::with_lich("lich-refused");
+    let folder = data.path.join("lich");
+    let (game, eaccess, envs) = start_mocks();
+    let mut run = Run::start(
+        &["play", "Aelith", "--account", "main", "--game", "GS3"],
+        &data,
+        &restart_path(),
+        &envs,
     );
+    run.wait_for_output("--- synthetic Lich boot 1.");
+
+    // The folder the settings name is no longer a Lich: its `lich.rbw` is gone
+    // by the time `.lich on` is typed.
+    fs::remove_file(folder.join("lich.rbw")).expect("cannot remove lich.rbw");
+
+    run.say(".lich off");
+    run.wait_for_output("Lich is stopping, and stays off for this character.");
+    run.say("after-off");
+    run.wait_for_game(&game, "after-off");
+
+    // `.lich on` is refused with the recovered sentence, and nothing is spawned.
+    run.say(".lich on");
+    run.wait_for_output(&format!("{} has no lich.rbw in it", folder.display()));
+    run.settle();
+    assert!(
+        !run.out().contains("--- synthetic Lich boot 2."),
+        "a Lich was spawned after a refusal: {}",
+        run.out()
+    );
+
+    // The session is still here, and typing still reaches the game directly.
+    run.say("still-here");
+    run.wait_for_game(&game, "still-here");
+    run.say(";status");
+    run.wait_for_output("[status] Aelith: Lich is not running");
+    run.settle();
+    assert_eq!(
+        game.sent(),
+        vec!["after-off".to_string(), "still-here".to_string()],
+        "stdout: {}\nstderr: {}",
+        run.out(),
+        run.err()
+    );
+    assert!(!run.out().contains('\u{1f}'), "{}", run.out());
 
     drop(run);
     eaccess

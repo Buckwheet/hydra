@@ -124,8 +124,22 @@ records them, writes the synthetic XML stream it was started with **verbatim**
 EOF and closes.
 
 * `received()` — the two lines, in order.
+* `sent()` — the lines the client sent **after** the handshake, in order. They
+  are read (and recorded) by the drain loop either way; a client that types
+  nothing leaves it empty.
+* `start_lingering(stream)` — the same server with the half-close suppressed:
+  the connection stays open after the stream, so a live session can keep writing
+  to it, and `join()` (or the client's own close, or `LINGER_LIMIT` = 60 s) ends
+  it.  Phase 7 added it for `crates/hydra/tests/play_stdin.rs`: `hydra play`
+  ends when the game closes, so a test that types has to give it a game that
+  stays open.  `start()` still half-closes, which is what every Phase 6 test
+  expects.
 * A client that closes before both lines are in is an `UnexpectedEof` error from
   `join()`, not a hang: the mock reads with a 10 s timeout.
 * The drain after the half-close is what keeps the close orderly; a socket
   dropped with unread input can be reset, and a reset can lose the stream the
-  client is about to read.
+  client is about to read.  A lingering server polls that drain (500 ms
+  timeouts) so `join()` can stop it before the limit.
+* The lines after the handshake are recorded by `read_until` on `\n`, so a
+  client that writes without newlines shows up as one long entry — nothing here
+  tries to speak the game protocol.

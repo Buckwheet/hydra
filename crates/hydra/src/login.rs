@@ -18,7 +18,10 @@
 //! * `hydra play …` prints the same stage lines, then starts this character's
 //!   Lich ([`crate::lich`]), announces the two recovered start lines, opens the
 //!   game socket and relays until either side ends
-//!   ([`crate::lich::relay_game`]).
+//!   ([`crate::lich::relay_game`]).  What the player types on stdin is read on
+//!   its own thread ([`crate::typing`]): a bare line goes to Lich while it takes
+//!   typing and to the game otherwise, `;status` and the `.`-prefixed commands
+//!   are answered locally, and Ctrl-C sends `quit` and ends the run.
 //!
 //! # Where the values come from
 //!
@@ -49,10 +52,12 @@ use std::path::{Path, PathBuf};
 
 use hydra_net::eaccess::game;
 use hydra_net::eaccess::handshake::{self, Login, LoginConfig, Stage};
+use hydra_session::command::taker_pair;
 use hydra_session::lich_command::LichSettings;
 
 use crate::lich;
 use crate::session;
+use crate::typing;
 
 /// Where the login dials: `HYDRA_EACCESS_HOST` overrides
 /// [`handshake::EACCESS_HOST`].  Tests point it at `127.0.0.1`.
@@ -317,6 +322,11 @@ pub fn play_with(
     let launch = login.launch().clone();
 
     let session = session::Headless::new(&arguments.character);
+    // The session's own view of `lich.json`: `.lich status`, `.lich on` and
+    // `.lich off` answer for the file this run was started from rather than for
+    // the defaults (`hydra_session::lich_command` keeps the settings on the
+    // session).
+    session.handle().set_lich_settings(settings.clone());
     let mut keyed = lich::start(&plan)
         .map_err(|error| format!("{label}: Lich could not be started: {error}"))?;
     let mut out = io::stdout();
@@ -332,8 +342,41 @@ pub fn play_with(
             return Err(format!("{label}: {message}"));
         }
     };
-    lich::relay_game(&mut keyed, &mut socket, &mut out, session.handle())
-        .map_err(|error| format!("{label}: {error}"))
+
+    // The recovered connected notice (`hydra::play::run::{{closure}}`'s literal
+    // pool): the game socket is open, so typing is worth announcing.
+    let _ = write!(out, "{}", typing::CONNECTED);
+    let _ = out.flush();
+
+    // Typing.  Claiming the door is what makes `lich_takes_typing()` true, so
+    // from here until Lich stops a typed line goes to Lich (`docs/LICH_WIRE.md`
+    // §3); with no door claimed it goes to the game through the session's taker.
+    // The claim's own line channel is unused: Lich's lines are read off the
+    // keyed socket by `relay_game`, as before.
+    let claim = session.door().claim();
+    let (taker, to_game) = taker_pair();
+    session.handle().set_taker(taker);
+    let (requests, _stdin_thread) = typing::spawn_stdin(session.clone())
+        .map_err(|error| format!("{label}: stdin could not be read: {error}"))?;
+    // Ctrl-C sends `quit` and then cancels the session, which ends the relay.
+    // The watcher is never joined: it may be parked in a signal read when the
+    // run ends, and joining it would hold the exit.
+    let _ctrl_c = typing::spawn_ctrl_c(session.clone()).ok();
+    let queues = typing::Queues {
+        to_lich: claim.typed,
+        to_game,
+        requests,
+    };
+
+    let outcome = lich::relay_game(&mut keyed, &mut socket, &mut out, session.handle(), queues);
+
+    // Lich does not take typing any more, and the session is over: the recovered
+    // `[status] the session has ended`.
+    session.door().over();
+    session.handle().stop(typing::SESSION_ENDED);
+    let _ = writeln!(out, "[status] {}", typing::SESSION_ENDED);
+    let _ = out.flush();
+    outcome.map_err(|error| format!("{label}: {error}"))
 }
 
 #[cfg(test)]

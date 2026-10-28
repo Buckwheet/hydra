@@ -207,6 +207,15 @@ pub fn relay(
 /// has gone before it stops the child.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
 
+/// How long [`relay_game`] keeps carrying Lich's frames to the game after the
+/// session has stopped.
+///
+/// The recovered teardown sends `quit` and *then* cancels
+/// (`docs/LICH_WIRE.md` §5: a typed `quit` flows through Lich to the game, the
+/// game closes): the line Hydra handed to Lich on the way out has to reach the
+/// game before the sockets are dropped.
+const STOP_FLUSH: Duration = Duration::from_millis(400);
+
 /// Relay a real game connection and this session's Lich to each other until one
 /// of them ends.
 ///
@@ -222,6 +231,18 @@ const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
 /// * Lich → game: [`LichFrame::text`] (the `<c>` prefix stripped, a bare line
 ///   unchanged) + `\n`, flushed.
 ///
+/// Since Phase 7 it also carries what the player types: `queues` is the
+/// [`crate::typing::Queues`] the stdin thread fills.  A line the Lich door took
+/// (`SessionHandle::hand_to_lich`) is written to Lich's **stdin** — the observed
+/// "Lich takes typing" path of `docs/LICH_WIRE.md` §3 — and a line the session's
+/// taker took (`SessionHandle::to_game`) is written to the game socket, which is
+/// what typing does when Lich does not take it.  A `.lich off` typed mid-session
+/// arrives on the same queue and stops the child (closing the door so later
+/// typing goes to the game); a `.lich on` says
+/// [`crate::typing::START_MID_SESSION`], because this phase does not spawn a
+/// second Lich inside a running relay.  Both are **INFERRED** placements of
+/// recovered commands.
+///
 /// It stops when the child is gone, the game reaches EOF, or the session stops
 /// ([`SessionHandle::stopping`]); then it stops Lich, shuts both sockets down
 /// (which is what unblocks the reader threads) and joins them.  A write that
@@ -232,6 +253,7 @@ pub fn relay_game(
     game: &mut TcpStream,
     out: &mut dyn Write,
     session: &SessionHandle,
+    queues: crate::typing::Queues,
 ) -> io::Result<()> {
     // The keyed accept left a 60-second read timeout on Lich's socket, and this
     // loop reads for as long as the session lasts: clear it on both sockets.
@@ -255,6 +277,11 @@ pub fn relay_game(
     let mut lich_open = true;
     let outcome = loop {
         if session.stopping() {
+            // What was typed in the last instant still goes — the `quit` that
+            // Ctrl-C sends above all — and then Lich gets its bounded moment to
+            // carry that line on to the game.
+            carry_typed(keyed, game, &queues, out, session);
+            flush_to_game(keyed, game, &lich_frames, out, &mut printed, STOP_FLUSH);
             break Ok(());
         }
         let alive = match keyed.relay.pump() {
@@ -277,6 +304,7 @@ pub fn relay_game(
                 }
             }
         }
+        carry_typed(keyed, game, &queues, out, session);
         // Lich -> game.  A Lich that has closed its socket is not a reason to
         // stop on its own: the child's exit shows up in `pump`, and its stdout
         // may still be arriving.
@@ -296,6 +324,12 @@ pub fn relay_game(
             }
         }
         if !alive || !game_open {
+            if !game_open {
+                // The recovered literal `\n[hydra] the game closed the
+                // connection\n` (`hydra::play::run::{{closure}}`'s pool).
+                let _ = write!(out, "{}", crate::typing::GAME_CLOSED);
+                let _ = out.flush();
+            }
             break Ok(());
         }
     };
@@ -324,6 +358,75 @@ pub fn relay_game(
     let _ = game_reader.join();
     let _ = lich_reader.join();
     outcome
+}
+
+/// Move what the player typed this pass: to Lich, to the game, or into a `.lich`
+/// request only this loop can honour.
+///
+/// What the door took ([`crate::typing::Queues::to_lich`]) goes to Lich's
+/// **stdin** — the observed "Lich takes typing" path (`docs/LICH_WIRE.md` §3: a
+/// bare line, never `<c>`-prefixed, which Lich forwards to the game itself) —
+/// and what the session's taker took goes straight to the game socket, which is
+/// what typing does when Lich does not take it.
+fn carry_typed(
+    keyed: &mut KeyedRelay,
+    game: &mut TcpStream,
+    queues: &crate::typing::Queues,
+    out: &mut dyn Write,
+    session: &SessionHandle,
+) {
+    let (to_lich, to_game, asked) = queues.take();
+    for line in to_lich {
+        let _ = keyed.relay.send(&line);
+    }
+    for line in to_game {
+        let _ = write_text(game, &line);
+    }
+    for request in asked {
+        if request.stop {
+            // `.lich off` while Lich runs: stop the child and close the door,
+            // so later typing goes to the game.  The recovered `Lich is
+            // stopping, and stays off…` was already said by
+            // `hydra_session::lich_command`.
+            let _ = keyed.relay.stop();
+            session.lich_door().over();
+        }
+        if request.start.is_some() {
+            // **INFERRED**: the recovered `Lich is starting, from …` was said
+            // already; no second Lich is spawned inside a running relay.
+            let _ = writeln!(out, "{}", crate::typing::START_MID_SESSION);
+        }
+    }
+}
+
+/// Carry Lich's frames to the game for at most `grace`, then give up.
+///
+/// Used on the way out (the session has stopped): what Lich forwards in that
+/// last moment — the `quit` Hydra just handed it, above all — still has to
+/// reach the game, and nothing else will carry it once the loop is gone.
+fn flush_to_game(
+    keyed: &mut KeyedRelay,
+    game: &mut TcpStream,
+    frames: &mpsc::Receiver<LichFrame>,
+    out: &mut dyn Write,
+    printed: &mut usize,
+    grace: Duration,
+) {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        let _ = keyed.relay.pump();
+        let _ = drain(keyed, out, printed);
+        loop {
+            match frames.try_recv() {
+                Ok(frame) => {
+                    let _ = write_game_line(game, &frame);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Read CRLF-stripped lines from `socket` into `sender` until EOF, mapping each
@@ -357,7 +460,14 @@ fn read_into<T: Send + 'static>(
 /// Write one Lich frame to the game socket: the `<c>` prefix stripped, the bare
 /// line unchanged, then a newline and a flush.
 fn write_game_line(game: &mut TcpStream, frame: &LichFrame) -> io::Result<()> {
-    let text = frame.text();
+    write_text(game, frame.text())
+}
+
+/// Write one text line to the game socket, then a newline and a flush.
+///
+/// This is the path a typed line takes when Lich does not take typing: Hydra
+/// writes to the game itself (`docs/LICH_WIRE.md` §3).
+fn write_text(game: &mut TcpStream, text: &str) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
     }

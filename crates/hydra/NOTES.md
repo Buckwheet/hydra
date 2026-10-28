@@ -46,7 +46,7 @@ the resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
 |---|---|---|
 | `src/main.rs` (`0x103e21ab6`) | `hydra::main`, `hydra::started::*`, `hydra::startup::*`, `hydra::replay::*`, `hydra::render::*`, `hydra::status::*`, `hydra::lookout_seed` | `src/main.rs`, `src/started.rs`, `src/startup.rs`, `src/replay.rs`, `src/render.rs`, `src/cli.rs` |
 | `src/gui.rs` (`0x103e21a91`) | `hydra::gui::{run, start_next, seat, game_runtime, stop_on_ctrl_c}` | — (the GUI boundary, §5) |
-| `src/play.rs` (`0x103e21ad3`, `0x103e22b95`) | `hydra::play::{run, supervised}` | `src/session.rs` (the session half) + §6 |
+| `src/play.rs` (`0x103e21ad3`, `0x103e22b95`) | `hydra::play::{run, supervised}` | `src/session.rs` (the session half) + `src/typing.rs` (the stdin half, §8.3) + §6 |
 | `src/connect.rs` (`0x103e21b8d`) | `hydra::connect::{Target::*, game_and_name, run, send}` | `src/login.rs` (the command line, the roster, `hydra_net`'s login and the game socket; §8.1) |
 | `src/rest.rs` (`0x103e22bae`) | `hydra::rest::{doing, watch}` | — (needs `hydra_table`, the web UI) |
 | `src/update.rs` (`0x103e22c3b`) | `hydra::update::{said, keep, fetch}` | — (needs `hydra_update`) |
@@ -56,6 +56,11 @@ the resting/serve window and the ledger (`hydra_import`, `hydra_ledger`) — see
 `src/source.rs` is new in this phase: the seam between "bytes from a recording"
 and "lines from Lich" (§6). It has no symbol in the binary because the reference
 build inlines both feeds straight into `Parser::push_bytes` / the relay loop.
+
+`src/typing.rs` is new in Phase 7 and is the stdin half of the same
+`play::run::{{closure}}`: `tokio::io::stdin`'s line feed, the `select!`'s Ctrl-C
+arm and the per-line dispatch (§8.3). Like `src/source.rs` it has no symbol of
+its own — the reference build inlines it into the one 8136-byte closure.
 
 ## 2. Function table (crate-local symbols, `nm -a`)
 
@@ -442,7 +447,7 @@ Facts, for a later pass:
 | `hydra gui …` | **runs** | builds the `hydra_gui` hub window (`"Hydra"`, 660 × 520, wgpu) through eframe; §5.1 |
 | `hydra` (bare hub) | recognised, exit 1 | the same `gui::run` in the binary; deliberately left reporting here (§5.1) |
 | `hydra login <char> [--account A] [--game G]` | **runs** | the real eaccess login (`hydra_net::eaccess::handshake`), then the game socket: the raw XML goes to stdout; §8.1 |
-| `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends; §8.1 |
+| `hydra play …` with `.lich on` | **runs** | logs in, starts Lich with the observed semantics, prints the two recovered start lines, connects the game and relays both ways until either side ends, and reads what the player types on stdin; §8.1, §8.3 |
 | `hydra play …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` — said before anything is dialled |
 | `hydra serve …` with `.lich on` | **runs** (the Lich side only) | starts Lich, prints the two start lines, relays Lich's stdout until it exits; **no login, no game socket** (§8.2) |
 | `hydra serve …` with `.lich` off | recognised, exit 1 | `Lich is off for this character` (§6.4) |
@@ -516,6 +521,69 @@ both missing halves.
 `serve` is deliberately still Lich-only: it has no login, no game socket and no
 relay, and no test gives it one.
 
+### 8.3 Typing on stdin (Phase 7): `src/typing.rs`
+
+The last stdin gap. The recovered loop is `hydra::play::run::{{closure}}`
+(`0x100023b6c` … `0x100025b34`): tokio stdin lines, an `Event` broadcast
+receiver (`SessionHandle::subscribe`, `0x100023e84`), the supervisor's
+`JoinHandle` and Ctrl-C in one `tokio::select!`; a typed line goes through the
+session's inbox (`SessionHandle::send_as_typed`), and Ctrl-C sends `quit` and
+then cancels. This binary is synchronous, so the same four things are a stdin
+thread, the session's own queues, the relay loop and a Ctrl-C watcher.
+
+**What is wired.** `src/typing.rs` reads stdin line by line on its own thread
+(`std::io::stdin`, `pump`/`spawn_stdin`) and `dispatch`es each non-empty line.
+The routing is one pure function, `typing::route(line, symbol,
+lich_takes_typing)`:
+
+| a line | route | what happens |
+|---|---|---|
+| empty or whitespace only | `Route::Ignore` | nothing at all |
+| `;status` (as the **first word**, whitespace trimmed) | `Route::Status` | one local status line on stdout, never forwarded |
+| starts with the session's Hydra symbol (`.` unless the character chose another) | `Route::Hydra` | `SessionHandle::lich_command` → its notices printed; `lich.json` written back when the settings changed; `stop`/`start` requests returned to the relay loop. Never sent to the game or to Lich |
+| anything else, `lich_takes_typing()` true | `Route::Lich` | `SessionHandle::hand_to_lich` → the Lich door's typed queue → **Lich's stdin** (`docs/LICH_WIRE.md` §3), logged with `SessionHandle::log_typed` |
+| anything else, `lich_takes_typing()` false | `Route::Game` | `SessionHandle::to_game` → the session's taker → the game socket directly, logged the same way |
+
+* **Who takes the typing.** `play` claims the Lich door (`LichDoor::claim`)
+  right after `lich::start`, which is what makes `lich_takes_typing()` true; the
+  door is closed again at teardown, and a `.lich off` typed mid-session stops
+  the child and closes it, so later typing goes to the game. `Relay`/`KeyedRelay`
+  own the sockets, so the two ends travel to the relay loop as
+  `typing::Queues` (`to_lich`, `to_game`, `requests`) and `lich::relay_game`
+  drains them each pass: door lines to `Relay::send` (Lich's **stdin**, the
+  observed path), taker lines to the game socket.
+* **`quit`** is a plain line: it goes wherever typing goes, and the game closes
+  as it would (docs/LICH_WIRE.md §5). **Ctrl-C** (`typing::spawn_ctrl_c`) sends
+  `quit` the same way and then `SessionHandle::stop`, which is what the relay
+  watches; the relay gives Lich a bounded `STOP_FLUSH` (400 ms) to carry that
+  last line to the game before the sockets go.
+* **The recovered notices.** `\n[hydra] connected; type commands, Ctrl-C to
+  quit\n\n` is written once the game socket is open, `\n[hydra] the game closed
+  the connection\n` when the game reaches EOF, and `[status] the session has
+  ended` when the run ends (`typing::CONNECTED`, `GAME_CLOSED`, `SESSION_ENDED`).
+* **`;status`** composes one line from four session facts (character, whether
+  Lich runs and takes typing, how many typed lines wait, whether the session has
+  ended) — `[status] Aelith: Lich is running and takes typing; 0 typed line(s)
+  wait; the session is running`.
+
+**Not wired / departed (all marked in the code):**
+
+* Lich's stdin is the typed-input path this crate uses — the *observed* one
+  (`docs/LICH_WIRE.md` §3, and `hydra_lich::Relay::send`'s own documentation);
+  `KeyedRelay::send_game` would put the line on the game stream side of Lich's
+  socket instead, which the capture does not show.
+* A `.lich on` typed mid-session records the setting and says the recovered
+  `Lich is starting, from …`, but no second Lich is spawned inside a running
+  relay: it prints `typing::START_MID_SESSION` instead. Same UNKNOWN as
+  `hydra_session::lich_command`'s (whether the reference build spawns there).
+* There is no alias/step expansion of a bare typed line: `SessionHandle::run_steps`
+  exists and sends through the taker, but it does not consult the Lich door, so
+  the door/taker split above would be lost. A `.`-prefixed line that is not a
+  `.lich` command is answered locally (`typing::not_a_command`) rather than run
+  as a Hydra command chain: the other Hydra command families are not wired.
+* The status line's wording is **INFERRED**; only its `;status` trigger and the
+  `[status] the session has ended` literal are recovered.
+
 **Not claimed:** nothing here has been run against a real eaccess server or a
 real game. Every test is a loopback mock (`hydra_mocks`), and the protocol shape
 comes from `SPEC_P6.md` and
@@ -558,11 +626,28 @@ not from a capture this reconstruction made.
    stdout; the `view` setting is recorded and mirrored on the session
    (`SessionHandle::set_lich_view`) but changes nothing about what is printed,
    because there is no other pane to hold the game's text.
+10. **Phase 7, typing.** What is *recovered* is `;status`'s word (the usage
+    text), the three notices quoted in §8.3, and the shape of the loop (stdin +
+    Ctrl-C in one `select!`, `quit` then cancel). What is **INFERRED** is the
+    rest: the wording of the `;status` line, the sentence for a `.`-prefixed
+    line that is not a command, the order in which the status line's four facts
+    are put, where the three recovered notices are written, that `quit` on
+    Ctrl-C is routed like any other typed line, and that a typed line reaches
+    Lich on its **stdin** rather than on the accepted socket (§8.3). The
+    reference build's `status::line` (`0x100112c78`) is a periodic renderer with
+    a 1128-byte body that was not decoded, so its exact text is unknown; only
+    the `[status] the session has ended` literal is.
+11. **`.lich status` is not a command.** `hydra_session::lich_command` parses
+    the *recovered* usage table (`lich on|off|folder|view|help`), so the status
+    is the bare `.lich` and `.lich status` is answered with the usage line —
+    locally, never forwarded. Whether the reference build accepts a `status`
+    word is UNKNOWN; it is not in the recovered table.
 
 ## 10. Tests and gates
 
-`cargo test -p hydra --offline` → **89 passing** (70 unit + 19 integration:
-13 in `tests/cli.rs`, 6 in `tests/lich_relay.rs`).
+`cargo test -p hydra --offline` → **120 passing** (94 unit + 26 integration:
+13 in `tests/cli.rs`, 3 in `tests/login.rs`, 6 in `tests/lich_relay.rs`, 4 in
+`tests/play_stdin.rs`).
 
 Unit tests (in the modules):
 
@@ -601,7 +686,16 @@ Unit tests (in the modules):
   refusals with their exact sentences, a good plan's folder/script/ruby, the two
   start lines byte for byte, the Lich-off message, and `character_of`'s
   first-non-option-and-not-a-value rule. Nothing spawns and nothing looks at
-  `PATH`: the ruby is passed in.
+  `PATH`: the ruby is passed in;
+* `typing` (Phase 7) — the pure router (empty lines, `;status` as the first word
+  and `;statuses` not being it, the `.`-prefix with the default and a chosen
+  symbol, the Lich/game split), `dispatch` for each route (the door's queue
+  versus the taker's, the typed log, nothing said on a plain line), `.lich`
+  commands (the recovered status sentences, the start/stop request, the settings
+  written to the `HYDRA_LICH_SETTINGS` seam, `Lich stays off`), `.lich status`
+  as the recovered usage line, a non-command `.`-line, the status line's five
+  facts (and the ended clause), `pump` over a `Cursor`, `Queues::take` in order,
+  and the three recovered notice literals byte for byte.
 
 Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
 `crates/hydra/tests/fixtures/`):
@@ -630,21 +724,37 @@ Integration (`env!("CARGO_BIN_EXE_hydra")`, fixtures under
   lines, Lich's own line, the forwarded chunk **without** its 0x1F byte, exit 0
   and an empty stderr; plus Lich off (nothing spawned), no Ruby (the recovered
   Ruby sentence), a folder without `lich.rbw`, and a settings file with no
-  folder. Every run is capped at 30 s and killed on overrun.
+  folder. Every run is capped at 30 s and killed on overrun;
+* `tests/play_stdin.rs` (Phase 7) — `hydra play` with its **stdin piped**, a
+  `MockGame::start_lingering` (the game socket stays open so the session can
+  type at it) and `tests/fixtures/lich_typing/ruby`, a second synthetic Lich
+  that takes typing and forwards every line it is handed to the socket. Four
+  runs: a bare `look` reaches the game and `.lich`/`.lich status`/`;status` do
+  not (the game received exactly `look` and `quit`, in order, the recovered
+  status sentences and one `[status] Aelith: …` line were printed, the login
+  sent no SNI and named no host); a blank line goes nowhere and does not end the
+  run; Ctrl-C (`/bin/kill -INT`) sends `quit`, ends the run with status 0 and
+  prints `[status] the session has ended`; and a typed `.lich off` says the
+  recovered `Lich is stopping, and stays off for this character.`, stops Lich
+  (so the run ends by itself, status 0) and puts nothing on the game socket. Every wait and every run is
+  bounded by `WAIT` (30 s), and each child is killed and reaped when the test
+  ends.
 
-Gates run on `p3/3` (all `--offline`):
+Gates run on `p7/1` (all `--offline`):
 
 ```sh
-cargo test  -p hydra --offline        # 70 + 13 + 6 passing
-cargo test  -p hydra_session --offline # 217 passing
-cargo check --workspace --offline     # clean
-target/debug/hydra --help             # the recovered usage text, exit 0
+cargo test  -p hydra --offline          # 94 + 13 + 3 + 6 + 4 passing
+cargo test  -p hydra_session --offline  # 217 passing (crate untouched)
+cargo test  -p hydra_mocks --offline    # 22 passing (the lingering game)
+cargo check -p hydra --offline          # clean
+target/debug/hydra --help               # the recovered usage text, exit 0
 target/debug/hydra --replay crates/hydra/tests/fixtures/small_stream.xml
 ```
 
-`cargo clippy -p hydra --all-targets` reports nothing for this crate (the
-warnings it prints belong to `hydra_protocol`, `hydra_session` and
-`hydra_lich`, and pre-date this branch).
+`cargo clippy -p hydra --all-targets` **cannot run on this branch**: it stops on
+`crates/hydra_net/src/sink/config.rs:54` (`clippy::erasing_op` is deny-by-default
+there, `local.rem_euclid(1) * 0`), which is untouched by this phase. Before it
+did, it reported nothing for `hydra` itself.
 
 ## 11. Integration risk for the parent merge
 
